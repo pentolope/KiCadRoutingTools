@@ -33,6 +33,7 @@ CASES = [
     ('planes', ['python3', 'py_router/route_planes.py', BOARD, '{out}',
                 '--nets', 'GND', '--plane-layers', 'B.Cu']),
     ('place', ['python3', 'py_placer/place_optimize.py', BOARD, '{out}']),
+    ('chain', ['python3', 'tests/repro/toy_chain.py', '{out}']),
 ]
 
 
@@ -62,6 +63,20 @@ def main():
             report(name, proc.returncode == 0,
                    'probe exit %d: %s' % (proc.returncode, ' | '.join(tail))
                    if proc.returncode else ' '.join(tail[-1:]))
+
+        # A fixture that stopped routing clean would make the determinism
+        # verdicts above vacuous -- identical failure is still identical.
+        routed = os.path.join(tmp, 'chain', 'run0', 'board.kicad_pcb')
+        if os.path.isfile(routed):
+            for tool in ('check_drc.py', 'check_connected.py'):
+                g = subprocess.run(
+                    [sys.executable, os.path.join(ROOT, 'py_router', tool),
+                     routed], cwd=ROOT, capture_output=True, text=True)
+                last = [l for l in (g.stdout or '').splitlines() if l.strip()]
+                report('chain output %s' % tool, g.returncode == 0,
+                       ' '.join(last[-2:]))
+        else:
+            report('chain output graded', False, 'no chain board to grade')
 
     print('\n%s' % ('FAILURES: ' + ', '.join(FAILURES) if FAILURES else 'all pass'))
     return 1 if FAILURES else 0

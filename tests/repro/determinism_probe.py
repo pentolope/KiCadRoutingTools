@@ -2,8 +2,10 @@
 
 Each run gets its own output directory, because route.py reads back the
 sibling .kicad_pro it wrote last time. The comparison is on canonicalized
-copper -- segments, vias, zone outlines, footprint poses, rounded and sorted
--- so per-run UUIDs do not register as a difference.
+copper -- segments, vias, zone outlines, footprint poses and pad geometry,
+rounded and sorted -- so per-run UUIDs do not register as a difference. Every
+input file the command names is digested per run: a fixture edited mid-probe
+makes the comparison meaningless and is reported as INVALID, not as a verdict.
 
     python3 tests/repro/determinism_probe.py --runs 4 --out-dir /tmp/probe -- \
         python3 py_router/route.py tests/repro/toy_pcba.kicad_pcb {out}
@@ -14,6 +16,7 @@ failed run.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -43,13 +46,19 @@ def canonical(board_path: str):
     zones = sorted((z.net_name, z.layer, z.priority,
                     tuple((round(x, 6), round(y, 6)) for x, y in z.polygon))
                    for z in (pcb.zones or []))
-    return {'segments': segs, 'vias': vias, 'footprints': parts, 'zones': zones}
+    pads = sorted((p.component_ref, p.pad_number, round(p.global_x, 6),
+                   round(p.global_y, 6), round(p.size_x, 6), round(p.size_y, 6),
+                   p.shape, tuple(p.layers or ()), p.net_id, round(p.drill, 6),
+                   p.pad_type)
+                  for fp in (pcb.footprints or {}).values() for p in fp.pads)
+    return {'segments': segs, 'vias': vias, 'footprints': parts,
+            'zones': zones, 'pads': pads}
 
 
 def describe(a, b) -> list:
     """What changed between two canonical boards, as report lines."""
     lines = []
-    for key in ('segments', 'vias', 'footprints', 'zones'):
+    for key in ('segments', 'vias', 'footprints', 'zones', 'pads'):
         sa, sb = set(a[key]), set(b[key])
         only_a, only_b = sa - sb, sb - sa
         if not only_a and not only_b:
@@ -67,6 +76,22 @@ def describe(a, b) -> list:
         for item in sorted(only_b)[:3]:
             lines.append("             only in B: %s" % (item,))
     return lines
+
+
+def input_digests(cmd, cwd):
+    """sha256 of every existing file the command names.
+
+    A fixture edited between runs makes the comparison meaningless, and the
+    canonical form cannot always tell -- two boards can differ in pad geometry
+    while every footprint still sits at the same coordinate.
+    """
+    out = {}
+    for tok in cmd:
+        path = tok if os.path.isabs(tok) else os.path.join(cwd, tok)
+        if os.path.isfile(path):
+            with open(path, 'rb') as fh:
+                out[tok] = hashlib.sha256(fh.read()).hexdigest()[:16]
+    return out
 
 
 def run_once(cmd, out_board, env, ballast_n, cwd):
@@ -115,7 +140,7 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
     cwd = _ROOT
 
-    boards, failures = [], []
+    boards, failures, digests = [], [], []
     for i in range(args.runs):
         run_dir = os.path.join(out_dir, 'run%d' % i)
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -129,6 +154,7 @@ def main(argv=None):
         elif args.hash_seed is not None:
             env['PYTHONHASHSEED'] = str(args.hash_seed)
         ballast = (i * 400_000) if args.ballast else None
+        digests.append(input_digests(cmd, cwd))
         argv_used, proc = run_once(cmd, out_board, env, ballast, cwd)
         with open(os.path.join(run_dir, 'stdout.txt'), 'w') as fh:
             fh.write(proc.stdout or '')
@@ -152,6 +178,15 @@ def main(argv=None):
         print("\nnot enough successful runs to compare")
         return 2
 
+    moved = sorted({tok for d in digests[1:] for tok in set(d) | set(digests[0])
+                    if d.get(tok) != digests[0].get(tok)})
+    if moved:
+        print("\nINVALID: an input the command names changed between runs: %s"
+              % ', '.join(moved))
+        print("Nothing below is a determinism verdict -- the runs did not share "
+              "their inputs. Re-run with the inputs held still.")
+        return 2
+
     base_label, base = boards[0]
     differing = []
     for label, other in boards[1:]:
@@ -162,9 +197,9 @@ def main(argv=None):
     if not differing:
         counts = {k: len(v) for k, v in base.items()}
         print("IDENTICAL: every run produced the same %d segments, %d vias, "
-              "%d footprint positions, %d zones"
+              "%d footprint positions, %d zones, %d pads"
               % (counts['segments'], counts['vias'], counts['footprints'],
-                 counts['zones']))
+                 counts['zones'], counts['pads']))
         return 2 if failures else 0
 
     print("DIFFERENT: %d of %d run(s) disagreed with %s"

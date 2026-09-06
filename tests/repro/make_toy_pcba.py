@@ -109,10 +109,11 @@ def build(out_path: str) -> str:
     # ---- U1: TQFP-32, 0.8 mm pitch, 7x7 mm body, centred on the board -----
     ucx, ucy = BOARD_W / 2.0, BOARD_H / 2.0
     u1 = _new_fp(board, "U1", ucx, ucy, "TQFP-32")
-    _courtyard(u1, ucx, ucy, 9.4, 9.4)
+    _courtyard(u1, ucx, ucy, 10.4, 10.4)
     pitch = 0.8
     span = (8 - 1) * pitch / 2.0          # 8 pads per side
-    row = 3.7                             # pad-row offset from body centre
+    row = 4.0                             # pad-row offset; keeps the corner
+    #                                       pads of adjacent sides 0.225 mm apart
     u1_pads = {}
     n = 1
     # KiCad pin order: left side top->bottom, bottom left->right,

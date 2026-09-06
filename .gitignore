@@ -64,3 +64,7 @@ kicad_files/.history/
 
 # #411 perturbation working dirs -- boards and scoreboards, never committed
 wk/
+
+# repro fixture: pcbnew writes a .kicad_prl of local UI state beside the board
+/tests/repro/*.kicad_prl
+/tests/repro/toy_pcba_*.kicad_pcb
