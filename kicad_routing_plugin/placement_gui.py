@@ -948,6 +948,15 @@ class PlacementTab(wx.Panel):
             if len(moves) > 30:
                 refs += ", ..."
             lines.append(refs)
+        # #829: say what was NOT applied. A skip the dialog does not mention is
+        # a live board that silently disagrees with the result board.
+        _skipped = getattr(self, '_outline_skipped', None)
+        if _skipped:
+            lines.append(
+                f"NOT applied: {', '.join(_skipped)} -- these draw the board "
+                f"outline, so moving them would resize the board. Their poses "
+                f"in the result board are left alone here; edit part and "
+                f"outline together in KiCad if one really must move (#829).")
         if with_copper:
             lines.append("Place + Route additionally REPLACES ALL tracks and "
                          "vias on the live board with the run's routing. "
@@ -990,12 +999,51 @@ class PlacementTab(wx.Panel):
         self.append_log("Placement apply: " + msg + "\n")
 
     def _pose_moves(self, board, result_pcb, pcbnew):
-        """[(ref, live_fp, parsed_fp)] for every footprint whose pose differs."""
+        """[(ref, live_fp, parsed_fp)] for every footprint whose pose differs.
+
+        #829: a footprint that draws the board's own outline is skipped here.
+        This applier is a SECOND mover -- it writes poses onto the live board
+        with SetPosition/SetOrientationDegrees/Flip and never goes through
+        `placement.writer.write_placed_output`, so the CLI-side guard does not
+        reach it. And it cannot be assumed safe because the CLI already
+        refused: the move list is a diff of the RESULT board against the LIVE
+        board, not a replay of what the CLI decided, so a live board that has
+        drifted from the staged input (the user nudged something in KiCad while
+        the run was going) produces moves the CLI never proposed. `Flip` is the
+        worst of them -- it MIRRORS the owned geometry, which no amount of
+        inspection recovers.
+        """
         moves = []
+        # Resolve by the PCBData key, not by the bare reference (#726): two
+        # blocks sharing a reference are `TP4` and `TP4~2`, and
+        # FindFootprintByReference would hand both of them the first block.
+        from gui_utils import live_footprints_by_key
+        live = live_footprints_by_key(board)
+        unreachable = []
+        self._outline_skipped = []
         for ref, parsed in sorted(result_pcb.footprints.items()):
-            fp = board.FindFootprintByReference(ref)
+            if getattr(parsed, 'owns_board_outline', False):
+                # #829, and it goes BEFORE the lookup: an outline owner is not
+                # ours to move, so whether the live board can be made to find
+                # it is beside the point.
+                #
+                # DISCLOSED, not silent. The confirmation dialog is built from
+                # `moves`, so a footprint dropped here would otherwise appear
+                # nowhere at all and the live board would diverge from the
+                # result board the user can open beside it. The CLI writer
+                # raises for the same reason; this front cannot raise mid-apply
+                # without leaving the board half-updated, so it reports.
+                self._outline_skipped.append(ref)
+                continue
+            fp = live.get(ref) or board.FindFootprintByReference(ref)
             if fp is None:
-                continue  # part exists only in the result; never invent parts
+                # Part exists only in the result; never invent parts. Collected
+                # rather than dropped in silence, for the same reason the CLI
+                # writer reports an unapplied placement (#726): a pose the run
+                # produced and the board never received is the failure nobody
+                # looks at.
+                unreachable.append(ref)
+                continue
             pos = fp.GetPosition()
             live_x = pcbnew.ToMM(pos.x)
             live_y = pcbnew.ToMM(pos.y)
@@ -1006,6 +1054,10 @@ class PlacementTab(wx.Panel):
                     or abs((live_rot - (parsed.rotation or 0) % 360 + 180) % 360 - 180) > 1e-3
                     or live_back != parsed_back):
                 moves.append((ref, fp, parsed))
+        if unreachable:
+            print("WARNING: %d part(s) in the result are not on the live "
+                  "board, so their poses were not applied: %s"
+                  % (len(unreachable), ', '.join(sorted(unreachable)[:12])))
         return moves
 
     def _apply_pose(self, fp, parsed, pcbnew):
@@ -1187,6 +1239,8 @@ class PlacementTab(wx.Panel):
         if board is None:
             return 0
         from kicad_parser import mm_to_iu
+        from gui_utils import live_footprints_by_key
+        _live_labels = live_footprints_by_key(board)
         applied = 0
         for r in result.get("results", []):
             action = getattr(r, "action", None) or (
@@ -1195,7 +1249,10 @@ class PlacementTab(wx.Panel):
                 continue
             get = (lambda k, _r=r: getattr(_r, k, None)) \
                 if not isinstance(r, dict) else r.get
-            fp = board.FindFootprintByReference(get("reference"))
+            # Same #726 resolution as _pose_moves: a label result names a
+            # PCBData key, which for a duplicated reference is `TP4~2`.
+            _k = get("reference")
+            fp = _live_labels.get(_k) or board.FindFootprintByReference(_k)
             if fp is None:
                 continue
             ref = fp.Reference()

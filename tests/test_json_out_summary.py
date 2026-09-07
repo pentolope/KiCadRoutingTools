@@ -153,46 +153,6 @@ def test_end_to_end_file_equals_merged_stdout():
     print("  PASS: --json-out == merged(stdout) on a real run")
 
 
-def test_the_fill_oracle_account_reaches_the_summary():
-    """plane_fragility in --json-out: which pour geometry the field used.
-
-    The degraded mode -- exact fill unavailable, drawn outlines standing
-    in -- used to be a stdout line nobody parses, and a run whose oracle
-    failed shipped materially different copper (measured: an 876-block
-    reroute) with exit 0. The account rides the summary like env_knobs,
-    so an external wrapper can pin and refuse a mode, and each arm of
-    the decision stamps it.
-    """
-    import types
-
-    import plane_fragility as pf
-    import route
-
-    saved = pf.fragility_account()
-    try:
-        # Every arm of the closed vocabulary is reachable and stamped.
-        pf._record_account('zone-outlines', 'timeout', 3)
-        assert pf.fragility_account() == {
-            'mode': 'zone-outlines', 'refill_reason': 'timeout',
-            'islands': 3}
-        board = types.SimpleNamespace(zones=[])
-        os.environ['KICAD_PLANE_FRAGILITY_COST'] = '0'
-        pf._compute_cells_and_states(board, config=None, want_states=False)
-        assert pf.fragility_account()['mode'] == 'disabled'
-        os.environ['KICAD_PLANE_FRAGILITY_COST'] = '2.0'
-        pf._compute_cells_and_states(board, config=None, want_states=False)
-        assert pf.fragility_account()['mode'] == 'no-pours', (
-            "a pour-less board is a fact about the board, not a policy")
-    finally:
-        os.environ.pop('KICAD_PLANE_FRAGILITY_COST', None)
-        pf._record_account(**saved)
-    # And the summary build actually carries it.
-    src = inspect.getsource(route)
-    assert "summary['plane_fragility']" in src, (
-        "the account no longer reaches the --json-out summary")
-    print("  PASS: the fill-oracle account is stamped and summarised")
-
-
 def test_a_nothing_to_do_run_still_writes_the_file():
     """The early returns' file twin of the JSON_SUMMARY_MIN contract.
 

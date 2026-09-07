@@ -2773,17 +2773,19 @@ def stamp_locked(board_file: str, refs: Sequence[str]) -> int:
     KiCad itself) reads it from. The grade's must_lock rule demands the lock
     IN THE FILE, so writing the intent's locks here is what makes the emitted
     seed grade clean rather than merely hoped-correct."""
-    from kicad_parser import find_matching_paren
+    from kicad_parser import iter_footprint_blocks
     with open(board_file, 'r', encoding='utf-8') as f:
         content = f.read()
     want = set(refs)
     count = 0
-    starts = [m.start() for m in re.finditer(r'\(footprint\s+"', content)]
-    for start in reversed(starts):
-        end = find_matching_paren(content, start)
-        fp_text = content[start:end]
-        m = re.search(r'\(property\s+"Reference"\s+"([^"]+)"', fp_text)
-        if not m or m.group(1) not in want:
+    # Named by the parser's own resolver (#726), so locking `TP4` stamps the
+    # one block the parser calls `TP4`. It used to match the reference STRING,
+    # so on watchy it locked both test points from one name -- and the refs
+    # handed in here come from `pcb.footprints` keys, which now address the
+    # twins separately. Reverse order keeps the spans valid as text is inserted.
+    for start, end, fp_text, _raw_ref, key in reversed(
+            list(iter_footprint_blocks(content))):
+        if key not in want:
             continue
         if re.search(r'\(locked\s+yes\)', fp_text[:fp_text.find('(pad')
                                                   if '(pad' in fp_text else len(fp_text)]):
@@ -3893,7 +3895,19 @@ def reseat_scope(pcb_data, pcb_file: str, intent, *,
             # NAME THE SOURCE. This said "(locked yes) in the file"
             # unconditionally, which is false for a ref locked by --lock -- and
             # sends the reader hunting the board for a stamp that is not there.
-            if ref in _extra_locked:
+            if ref in getattr(state, 'outline_locked', ()):
+                # #829, and it belongs FIRST: an outline owner is locked by
+                # QuenchState, not by a stamp or a flag, so both arms below
+                # would name a source that is not there. That is the same
+                # defect this block's own comment records having fixed for
+                # --lock, recurring for a new lock source -- so the rule is
+                # not "special-case --lock", it is "every source names
+                # itself".
+                refused[ref] = ("draws the board outline -- moving it would "
+                                "resize the board, which is not this tool's "
+                                "to change (#829). Edit part and outline "
+                                "together in KiCad if it must move")
+            elif ref in _extra_locked:
                 refused[ref] = ("locked by --lock on this invocation -- not "
                                 "this tool's to move")
             else:

@@ -235,8 +235,9 @@ def test_the_summary_reports_what_did_not_run():
     # A hand-stated literal, deliberately: deriving it from `len(RULES)`
     # would make this arm agree with whatever the module currently says
     # and stop being a change detector. 9 before #794 added
-    # `decap_ungraded` and #705 added `decap_pin_distance`.
-    assert s['rules_skipped'] == 11, s['rules_skipped']
+    # `decap_ungraded` and #705 added `decap_pin_distance`; 11 before #837
+    # added `assembly_side`.
+    assert s['rules_skipped'] == 12, s['rules_skipped']
     print(f"  PASS: an empty intent passes with rules_run=0, "
           f"rules_skipped={s['rules_skipped']} -- visibly vacuous")
 
@@ -314,11 +315,22 @@ def test_a_placement_run_leaves_the_board_outline_untouched():
     """The invariant the whole outline rule rests on, asserted rather than
     assumed.
 
-    It is true today by construction -- no writer in the routing chain emits an
-    Edge.Cuts primitive, and `strip_zero_length_edge_cuts` removes only
-    degenerate segments that bound nothing. But "true by construction" is
-    exactly the kind of property that stops being true silently, so it gets a
-    test rather than a comment.
+    This used to justify itself with "true by construction -- no writer in the
+    routing chain emits an Edge.Cuts primitive". That reasoning was WRONG, and
+    #829 is what it missed: the outline moves through a MOVER, not a writer.
+    A footprint's `(at x y rot)` transforms any Edge.Cuts shape inside it
+    (`kicad_parser._footprint_edge_points`), and the movable set was gated on
+    pads alone -- so moving a pad-bearing footprint that owned outline geometry
+    resized the board while every writer behaved exactly as described.
+
+    watchy cannot see that: it draws its outline board-level, and 0 of the 27
+    tracked boards carry footprint-embedded Edge.Cuts at all. So this test is
+    live but blind to that path, and `tests/test_829_edge_cuts_owner.py` covers
+    it on a synthetic fixture that can actually fail.
+
+    What this one still pins is real and worth keeping: a full `place_optimize`
+    run on a board with two interior cutouts leaves bounds, rings and cutouts
+    identical.
 
     watchy is the right board for it: 2 real interior cutouts, and 81 of its 82
     parts seeded in courtyard violation, so the optimizer has every reason to
@@ -372,6 +384,9 @@ TESTS = [
     test_the_summary_carries_the_keys_a_caller_branches_on,
     test_the_full_json_carries_the_measured_numbers,
     test_emit_writes_no_board_and_touches_nothing,
+    # Defined but never registered, so never run (#876):
+    test_a_round_board_now_grades_normally,
+    test_grading_knobs_resolve_from_the_board_and_are_disclosed,
 ]
 
 

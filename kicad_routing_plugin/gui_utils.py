@@ -37,8 +37,16 @@ def save_board_via_ui_thread(path, board, timeout_s=None):
     ``kicad_parser.build_pcb_data_from_board``), so the guard cannot live only
     here. See that module for the py-spy evidence and the reasoning.
     """
-    from ui_thread import save_board_on_ui_thread, SAVE_BOARD_UI_TIMEOUT_S
-    return save_board_on_ui_thread(
+    return save_board_via_ui_thread_ex(path, board, timeout_s)[0]
+
+
+def save_board_via_ui_thread_ex(path, board, timeout_s=None):
+    """Plugin-side alias for :func:`ui_thread.save_board_on_ui_thread_ex`
+    (#828): ``(ok, SaveStatus)``, so a caller can tell the 120 s expiry
+    (this machine, this moment -- retryable) from a ``SaveBoard`` exception
+    (this board -- it will throw again) instead of one bare ``False``."""
+    from ui_thread import save_board_on_ui_thread_ex, SAVE_BOARD_UI_TIMEOUT_S
+    return save_board_on_ui_thread_ex(
         path, board,
         SAVE_BOARD_UI_TIMEOUT_S if timeout_s is None else timeout_s)
 
@@ -405,6 +413,38 @@ def refill_all_zones(board):
         return 0
 
 
+def live_footprints_by_key(board):
+    """{PCBData key: live pcbnew footprint} for a live board (#726).
+
+    `board.FindFootprintByReference(ref)` returns the FIRST footprint with that
+    reference, and `PCBData` keys duplicated references `TP4`, `TP4~2`, ... So
+    a bare lookup silently returns the WRONG twin for one of them and `None`
+    for the other -- and `None` is a `continue` at every call site, which is a
+    part the GUI quietly declines to apply.
+
+    Built with the same `disambiguate_references` over the same
+    `board.GetFootprints()` order that `build_pcb_data_from_board` uses, so the
+    keys are the ones the engine was handed. Returns `{}` if pcbnew is absent
+    or the board cannot be walked; callers fall back to their old lookup, which
+    is exactly today's behaviour.
+    """
+    try:
+        from kicad_parser import disambiguate_references
+        live = list(board.GetFootprints())
+        raw = []
+        for f in live:
+            r = f.GetReference()
+            if not r:
+                try:
+                    r = "#" + f.m_Uuid.AsString()
+                except Exception:
+                    r = "?"
+            raw.append(r)
+        return dict(zip(disambiguate_references(raw), live))
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
 def sync_footprint_positions_from_board(board, pcb_data):
     """Refresh footprint and pad POSITIONS in pcb_data from the live pcbnew board
     (#362).
@@ -432,9 +472,27 @@ def sync_footprint_positions_from_board(board, pcb_data):
     try:
         import math
         import pcbnew
+        from kicad_parser import disambiguate_references
         n = 0
-        for bfp in board.GetFootprints():
-            ref = bfp.GetReference()
+        # Names are resolved for the WHOLE board and zipped on, exactly as
+        # `build_pcb_data_from_board` does (#726). A bare `GetReference()`
+        # lookup was the footprint-level twin of the pad bug this function's
+        # docstring already describes: on a board with two `TP4` blocks both
+        # of them looked up the ONE `TP4` entry, so the second overwrote the
+        # first's pose and the parts moved onto each other in the cached model
+        # -- the same class of silent corruption, one level up.
+        _live = list(board.GetFootprints())
+        _raw = []
+        for _f in _live:
+            _r = _f.GetReference()
+            if not _r:
+                try:
+                    _r = "#" + _f.m_Uuid.AsString()
+                except Exception:
+                    _r = "?"
+            _raw.append(_r)
+        _keys = disambiguate_references(_raw)
+        for bfp, ref in zip(_live, _keys):
             pd_fp = pcb_data.footprints.get(ref)
             if pd_fp is None:
                 continue
@@ -587,7 +645,35 @@ def board_minima_from_live(board):
                         holes.append(d)
                 except Exception:
                     continue
+        # #530: the smallest pad / footprint clearance OVERRIDE on a copper
+        # pad -- KiCad floors an override at rules.min_clearance, so the
+        # writeback must not raise min_clearance above one the run honoured.
+        # Best-effort across SWIG shapes (std::optional on KiCad 9/10).
+        ovr = []
+        for fp in board.GetFootprints():
+            fp_v = None
+            try:
+                v = fp.GetLocalClearance()
+                fp_v = v.value() if hasattr(v, 'has_value') and v.has_value() else (
+                    None if hasattr(v, 'has_value') else v)
+            except Exception:
+                fp_v = None
+            for pad in fp.Pads():
+                try:
+                    if not any(str(l).endswith('.Cu') for l in
+                               [board.GetLayerName(i) for i in pad.GetLayerSet().Seq()]):
+                        continue
+                    v = pad.GetLocalClearance()
+                    pv = v.value() if hasattr(v, 'has_value') and v.has_value() else (
+                        None if hasattr(v, 'has_value') else v)
+                    eff = pv if pv else fp_v
+                    if eff and eff > 0:
+                        ovr.append(pcbnew.ToMM(int(eff)))
+                except Exception:
+                    continue
         out = {}
+        if ovr:
+            out['min_pad_clearance_override'] = min(ovr)
         if widths:
             out['min_track_width'] = min(widths)
         if via_sizes:
@@ -684,13 +770,18 @@ def update_live_drc_floors(board, *, clearance=None, track_width=None,
     try:
         from protected_nets import (consume_protection_candidates,
                                     consume_impedance_specs,
+                                    consume_pour_served_pads,
                                     persist_protected_nets,
-                                    persist_impedance_specs, pro_path_for_board)
+                                    persist_impedance_specs,
+                                    persist_pour_served_pads,
+                                    pro_path_for_board)
         _bf = board.GetFileName() if board is not None else ""
         if _bf:
             _pro = pro_path_for_board(_bf)
             persist_protected_nets(_pro, consume_protection_candidates())
             persist_impedance_specs(_pro, consume_impedance_specs())
+            # #678: the fanout tab's pour-served balls, same step boundary.
+            persist_pour_served_pads(_pro, consume_pour_served_pads())
     except Exception:
         pass
     _clamped = []
@@ -756,6 +847,14 @@ def update_live_drc_floors(board, *, clearance=None, track_width=None,
                 _clr_floor = _dru_min
         except Exception:
             pass
+        # #530: never above the smallest pad override the run honoured (KiCad
+        # floors an override at min_clearance) -- parity with compute_targets.
+        try:
+            _ovr = board_minima_from_live(board).get('min_pad_clearance_override')
+            if _ovr and _clr_floor is not None and float(_clr_floor) > _ovr:
+                _clr_floor = _ovr
+        except Exception:
+            pass
         lower('m_MinClearance', _clr_floor)
         lower('m_TrackMinWidth', track_width, min_w)
         lower('m_ViasMinSize', via_size, min_via)
@@ -787,13 +886,12 @@ def update_live_drc_floors(board, *, clearance=None, track_width=None,
                         iu = board_min_iu if iu is None else min(iu, board_min_iu)
                     if get() > iu:
                         set_(iu)
+                # Clearance only: the class track/via/drill are DRAW defaults
+                # (KiCad loads them SetOpt, not SetMin). Lowering them to the
+                # board's smallest object was the #842 ratchet -- one 0.127
+                # neck made the Default class 0.127 and every later run
+                # routed at it. Parity with fix_kicad_drc_settings.
                 _nc_lower(_nc.GetClearance, _nc.SetClearance, clearance)
-                _nc_lower(_nc.GetTrackWidth, _nc.SetTrackWidth,
-                          track_width, min_w)
-                _nc_lower(_nc.GetViaDiameter, _nc.SetViaDiameter,
-                          via_size, min_via)
-                _nc_lower(_nc.GetViaDrill, _nc.SetViaDrill,
-                          via_drill, min_drill)
         except Exception:
             pass
         # #782: the NON-Default classes. Delegated, never re-implemented -- this

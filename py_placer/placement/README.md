@@ -969,7 +969,7 @@ rather than scraping text.
 | state | why refusing beats trying | override |
 |---|---|---|
 | **unplaced** (parts stacked at one coordinate) | the quench REFINES a placement. On a pile every candidate pose is illegal, so the run prints "0 parts moved" plus a legality block that looks like a result, and a large `--max-displacement` yields a tiny scatter around the origin that looks like progress | `--allow-unplaced` |
-| **already routed** | the quench models no copper at all: legality is courtyard + outline, cost is pad-to-pad airwires, and `writer.write_placed_output` rewrites footprint positions only. Every track would be left behind, detached from its pad | `--allow-routed` |
+| **already routed** | the quench models no copper at all: legality is courtyard + outline, cost is pad-to-pad airwires, and `writer.write_placed_output` rewrites footprint poses and — since #714, on request — their board SIDE, but never copper. Every track would be left behind, detached from its pad | `--allow-routed` |
 
 `place_route_loop` gates BEFORE round 0, which routes the whole board -- refusing
 there saves minutes-to-hours of A* that would fail everything and then quench a
@@ -1221,7 +1221,7 @@ is followed by a settle beat, so the moves only play once the camera has arrived
 | `../render_placement.py` | Headless PNG stills of placement status (#431) |
 | `legality.py` | Hard constraints shared by both engines: board side, real Edge.Cuts containment, and the OO/OoB graders (#456) |
 | `parser.py` | Courtyard boundary and locked-footprint extraction |
-| `writer.py` | Writes new positions/rotations (rotates pad angles with the footprint, as KiCad stores pad angle = footprint + pad rotation) |
+| `writer.py` | Writes new positions/rotations (rotates pad angles with the footprint, as KiCad stores pad angle = footprint + pad rotation). Resolves blocks through `kicad_parser.iter_footprint_blocks`, so one placement moves ONE block even when two share a reference (#726) |
 | `board_grid.py` | The pitch a board was laid out on, inferred from its footprint origins (#708). Pure; no engine imports |
 | `utility.py` | Shared utilities (bbox from pads, grid snapping) |
 

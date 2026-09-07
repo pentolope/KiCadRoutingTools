@@ -51,6 +51,7 @@ from placement import legality
 from placement.legality import (CONTAINER_RATIO, CONTAINMENT_FRAC,
                                 BoardOutlineGate, containment_frac,
                                 footprint_has_through_pads,
+                                through_pad_bounds_local,
                                 footprint_side, pair_min_gap, rect_gap,
                                 rect_overlap_area,
                                 rotate_local_bounds, sides_occupied)
@@ -70,13 +71,21 @@ EPS_IMPROVE = 1e-6
 #: re-typing it: a rule added here enters the A/B signal automatically, and a
 #: rule removed to flatter a row trips a test rather than passing quietly.
 #:
-#: The other six floorplan rules are deliberately absent, each for its own
+#: The other NINE floorplan rules are deliberately absent, each for its own
 #: reason -- `must_lock` and `edge_connector` are enforced by FREEZING the ref
 #: (no pose satisfies or violates them), `zone_side` is invariant under every
-#: move this engine can make, `envelope` is a claim about the intent file,
+#: move this engine can make and `assembly_side` (#837) is invariant for the
+#: same reason one level up, `envelope` is a claim about the intent file,
 #: `decap_distance` is graded in a currency this engine does not carry (pad
-#: centroid to an inflated pad bbox, not courtyard to courtyard), and
-#: `legality` is a whole-board budget rather than a per-pose predicate.
+#: centroid to an inflated pad bbox, not courtyard to courtyard),
+#: `decap_ungraded` and `decap_pin_distance` are claims about what the GRADE
+#: covers rather than about any pose, and `legality` is a whole-board budget
+#: rather than a per-pose predicate.
+#:
+#: The count said "six" and named six while nine were absent: `decap_ungraded`
+#: (#794) and `decap_pin_distance` (#705) arrived without being added here, and
+#: #837 made it three. Stated as a number AND an enumeration so the next
+#: addition is visibly missing from both.
 INTENT_ENFORCED_RULES = ('zone_containment', 'zone_exclusive', 'keepout')
 
 
@@ -566,49 +575,6 @@ def _count_crossings_within(a: np.ndarray,
     return half, weighted / 2.0
 
 
-def _through_pad_bounds_local(fp):
-    """Local bbox over a footprint's DRILLED pads, or None if it has none.
-
-    This is the footprint's footprint on the OPPOSITE board side: its body and
-    courtyard live on its own side, but its leads pass through, so a part on the
-    far side may not sit inside this box (#456 item 1). Deliberately the drill
-    hole's own extent rather than the pad copper's -- the far side sees the
-    barrel and the lead, and the annular ring on that side is part of it.
-    """
-    # `local_x/local_y` is the pad ANCHOR in the footprint's frame, and for a
-    # drilled pad the anchor IS the hole: kicad_parser records hole_x/hole_y as
-    # the pre-offset position and only then shifts global_x/global_y to the
-    # copper centre. So the hole needs no offset correction at all -- an earlier
-    # version "corrected" local_* by (hole - global), which is minus the offset,
-    # landing the box one full offset on the WRONG side of the hole.
-    #
-    # size_x/size_y are BOARD-axis resolved (kicad_parser swaps them for a pad at
-    # ~90 degrees), so they cannot be used as local half-extents directly -- that
-    # transposed the box on every 90/270-degree footprint (kit-dev SW_ONOFF201
-    # modelled 2.54 x 13.97 where the truth is 3.81 x 12.70, under-blocking
-    # 1.27mm). Project them through the pad's local tilt exactly as
-    # placement/utility.compute_footprint_bbox_local does.
-    xs, ys = [], []
-    for p in (fp.pads or []):
-        d = getattr(p, 'drill', 0) or 0
-        if d <= 0:
-            continue
-        local_tilt = math.radians((getattr(p, 'rect_rotation', 0.0) or 0.0)
-                                  + (fp.rotation or 0.0))
-        c, s = abs(math.cos(local_tilt)), abs(math.sin(local_tilt))
-        hx, hy = (getattr(p, 'size_x', 0) or 0) / 2.0, (getattr(p, 'size_y', 0) or 0) / 2.0
-        # An oval/slotted hole is bounded by the pad extent it sits in; taking
-        # the larger of drill radius and half pad size keeps a slot covered.
-        r = d / 2.0
-        rx = max(r, hx * c + hy * s)
-        ry = max(r, hx * s + hy * c)
-        xs += [p.local_x - rx, p.local_x + rx]
-        ys += [p.local_y - ry, p.local_y + ry]
-    if not xs:
-        return None
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
 class _Part:
     __slots__ = ('ref', 'pads_local', 'pin_count', 'bounds_by_rot',
                  'seed_x', 'seed_y', 'x', 'y', 'rot', 'locked',
@@ -630,7 +596,7 @@ class _Part:
         if lb is None:
             lb = compute_footprint_bbox_local(fp)
         self.bounds_by_rot = {r: _rotate_local_bounds(*lb, r) for r in ROTATIONS}
-        tlb = _through_pad_bounds_local(fp) if self.has_tht else None
+        tlb = through_pad_bounds_local(fp) if self.has_tht else None
         self.tht_by_rot = ({r: _rotate_local_bounds(*tlb, r) for r in ROTATIONS}
                            if tlb is not None else None)
         # A non-90-degree seed rotation brings its WHOLE 90-degree lattice:
@@ -812,6 +778,7 @@ class QuenchState:
 
         self.parts: Dict[str, _Part] = {}
         no_courtyard = []
+        outline_locked = []   # #829, reported below
         for ref, fp in pcb_data.footprints.items():
             if not fp.pads:
                 # Zero-pad footprints (graphics-only mechanical parts, logos
@@ -823,8 +790,27 @@ class QuenchState:
                     self.parts[ref] = _Part(ref, fp, courtyards, True,
                                             halo_base, halo_coef)
                 continue
+            # #829: a footprint that draws part of the BOARD's own boundary is
+            # never this tool's to move -- its pose transforms that Edge.Cuts
+            # geometry, so moving it resizes the board, which is a mechanical
+            # decision the user owns. A fourth lock INPUT with the same
+            # property the other three have (see the union note in `quench()`):
+            # no un-lock operator, so it can never override what a caller
+            # asked for.
+            #
+            # `owns_board_outline`, NOT `owns_edge_cuts`. Geometry parented to
+            # a footprint is usually a relief the designer bound to the part so
+            # it travels with it -- crkbd draws 184 per-LED windows that way,
+            # and #628 exempts a part's own milled ring from the edge-margin
+            # test precisely to keep such a part placeable (without it run 20's
+            # SW2 had 0 legal poses of 14884). Only geometry lying outside the
+            # board-level outline is the board's.
+            owns_outline = getattr(fp, 'owns_board_outline', False)
             locked = (ref in locked_refs
+                      or owns_outline
                       or (move_refs is not None and ref not in move_refs))
+            if owns_outline:
+                outline_locked.append(ref)
             if ref not in courtyards:
                 no_courtyard.append(ref)
             self.parts[ref] = _Part(ref, fp, courtyards, locked,
@@ -838,6 +824,17 @@ class QuenchState:
             # Ignored nets (e.g. plane-routed power) don't contribute airwires
             self.parts[ref].nets = [n for n in self.parts[ref].nets
                                     if n not in ignore]
+        # #829. DISCLOSED, never silent: a freeze nobody is told about is
+        # the failure mode lock_advisor's 'advice, never action' rule
+        # exists to prevent. The reader needs the ref AND why, because
+        # the remedy is not in this toolchain -- part and outline have to
+        # move together, in KiCad.
+        self.outline_locked = sorted(outline_locked)
+        if self.outline_locked:
+            print(f"  Locked because they draw the board outline (#829): "
+                  f"{', '.join(self.outline_locked)} -- moving one would"
+                  f" resize the board. Edit the part and the outline"
+                  f" together in KiCad if it really must move.")
         warn_missing_courtyards(no_courtyard, 'quench')
 
         # #701 intent keep-outs, resolved ONCE per state rather than once per

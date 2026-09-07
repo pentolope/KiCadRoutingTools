@@ -178,16 +178,33 @@ def _floors(pcb_file):
 # shape of the answer is the problem: on a pile these come back in the exact
 # schema a placed board yields, so a reader has no way to tell them apart.
 # Measured placed -> piled, same brief, no marking anywhere: ulx3s escape
-# 19 -> 109 deficit lanes and locks.high 10 -> 0; kit-dev-coldfire 0 -> 82
+# 0 -> 101 deficit lanes and locks.high 10 -> 0; kit-dev-coldfire 0 -> 82
 # lanes on a board with no escape problem at all; splitflap_driver
 # locks.high 16 -> 2; watchy 25 -> 69 lanes, locks.high 7 -> 1, tethers 6 -> 4.
+# (ulx3s re-measured after #835: it was 19 -> 109, and its PLACED 19 was
+# itself an artifact -- every one of those lanes was charged to a neighbour on
+# the other side of the board. The pile artifact is larger than before, not
+# smaller, because the placed number is now honest.)
+#
+# STALE ON THE PLACED SIDE, and dated rather than quietly re-typed. #841
+# changed what a neighbour contributes from the bbox of its pad CENTRES to its
+# pad COPPER, so every PLACED number above moved: ulx3s 0 -> 5,
+# kit-dev-coldfire 0 -> 8, watchy 25 -> 55 (regenerate with
+# `tests/measure_834_835_side_awareness.py --table B`). The PILED halves are
+# from a recorded run against a staged pile that no committed script rebuilds,
+# so they are not re-derived here. The direction is unaffected -- a pile still
+# collapses every supply to 0 -- and it is the direction the block is about.
 #
 # Mechanisms, one per group:
-#   escape   `_blocked_span` charges every co-located neighbour against the
-#            band, so supply -> 0 and deficit == demand for every part but
-#            the largest. `deficit_lanes` becomes a netlist count wearing an
-#            escape verdict's clothes, and `blockers` names parts to move
-#            that are not anywhere.
+#   escape   `_blocked_span` charges every co-located neighbour that shares a
+#            face, is not a container (#835), its PAD COPPER (#841), against
+#            the band -- so on a PILE supply -> 0 and deficit == demand for
+#            every part but the largest.
+#            `deficit_lanes` becomes a netlist count wearing an escape
+#            verdict's clothes, and `blockers` names parts to move that are
+#            not anywhere. The side and container filters cut the charge on a
+#            real placement; they cannot help on a pile, where every part is
+#            co-located with every other on its own face.
 #   locks    the geometric rules (off_board, near_board_edge,
 #            family_orbit_seat) cannot fire at a centre pile, so the
 #            `geometric and lexical -> high` promotion is unreachable and the

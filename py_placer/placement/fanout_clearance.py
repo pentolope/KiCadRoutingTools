@@ -44,6 +44,7 @@ from bga_fanout.grid import analyze_bga_grid
 from placement.parser import extract_courtyard_bboxes, extract_locked_refs
 from placement.utility import compute_footprint_bbox_local, snap_to_grid
 from placement.legality import (BoardOutlineGate, PadClearanceModel, PadFloor,
+                                footprint_side, side_of_layer,
                                 _pad_carries_copper, format_required_clause,
                                 pad_half_extents, point_to_seg_dist,
                                 rect_gap, ring_is_rect,
@@ -594,7 +595,7 @@ class _Cap:
 
     def __init__(self, fp, courtyard_local, model=None, board_copper=None):
         self.ref = fp.reference
-        self.side = 'B' if (fp.layer or '').startswith('B') else 'F'
+        self.side = footprint_side(fp)
         self.seed_x, self.seed_y = fp.x, fp.y
         self.seed_rot = fp.rotation % 360
         self.x, self.y, self.rot = fp.x, fp.y, fp.rotation % 360
@@ -1178,15 +1179,22 @@ class _Repair:
             # test and wrongly exclude it from placement (#130).
             n_copper = sum(1 for p in fp.pads
                            if any(str(l).endswith('.Cu') for l in p.layers))
+            # #829: a cap that draws the board's own outline is not movable
+            # either. This gate is INDEPENDENT of free_refs and QuenchState --
+            # it is its own movable set, and its moves reach disk through
+            # place_fanout_clearance.py and the live board through
+            # fanout_gui.py -- so the rule has to be repeated here or it does
+            # not apply on this path at all.
             is_cap = (ref.startswith(self._cap_prefixes) and n_copper <= 2
-                      and ref not in locked)
+                      and ref not in locked
+                      and not getattr(fp, 'owns_board_outline', False))
             if is_cap:
                 cap = _Cap(fp, lb, self._floors, self._all_cu_ordered)
                 if self._near_any(cap.rect(), bga_bboxes, near_margin):
                     self.caps[ref] = cap
                     continue
             # everything else is a static obstacle
-            side = 'B' if (fp.layer or '').startswith('B') else 'F'
+            side = footprint_side(fp)
             b = _rotate_local_bounds(*lb, fp.rotation)
             self.static_rects.append(((fp.x + b[0], fp.y + b[1],
                                        fp.x + b[2], fp.y + b[3]), side))
@@ -1712,8 +1720,13 @@ class _Repair:
     def _seg_side(layer):
         """The 'F'/'B' collapse the track prune used to be keyed on, kept ONLY
         as the fallback for a cap whose real pad layers are unavailable.
-        Byte-identical to what __init__ computed before #731."""
-        return 'B' if (layer or '').startswith('B') else 'F'
+
+        Still the fallback, and still byte-identical to what __init__
+        computed before #731 -- but it now CALLS that rule instead of
+        spelling it again (#878), so the claim in the line above is
+        structural rather than a promise two copies have to keep.
+        """
+        return side_of_layer(layer)
 
     def _cap_seg_scope(self, cap):
         """(per-pad copper layer sets, their union) for the TRACK channel, or

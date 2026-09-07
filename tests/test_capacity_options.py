@@ -318,6 +318,105 @@ if os.path.isfile(OC):
           sum(sides.values()) > m['usable_area_mm2'],
           f"sum {sum(sides.values()):.1f} vs usable {m['usable_area_mm2']}")
 
+    # #837. The four checks above are the UNDECLARED path, and they keep their
+    # exact wording: the doctrine they pin is still the doctrine, it is now
+    # conditional rather than unconditional. These three arms pin the
+    # condition.
+    #
+    # `both` must be bit-identical to undeclared. A `both` that quietly sums
+    # is the likeliest bug in this feature, and it would fail a shipping
+    # two-sided board on a policy that says nothing.
+    gb = grow_board(ocb, OC, clearance=0.2, board_edge_clearance=0.5,
+                    assembly_sides='both')
+    check("declared `both` charges exactly what undeclared charges",
+          abs(gb['measured']['utilisation'] - m['utilisation']) < 1e-9
+          and gb['measured']['charged_area_is_sum'] is False
+          and gb['fits_by_area'] is True,
+          f"both {gb['measured']['utilisation']} vs undeclared "
+          f"{m['utilisation']}, is_sum "
+          f"{gb['measured']['charged_area_is_sum']}")
+    # Declared one-face: the parts all have to fit that face, so the sum is
+    # the demand -- and this is the arm that turns :317-319 from a hypothesis
+    # about the test's own arithmetic into a measurement of the code.
+    gf = grow_board(ocb, OC, clearance=0.2, board_edge_clearance=0.5,
+                    assembly_sides='F')
+    mf = gf['measured']
+    check("declared F charges the SUM of both sides",
+          mf['charged_area_is_sum'] is True
+          and abs(mf['charged_area_mm2'] - sum(sides.values())) < 0.02,
+          f"charged {mf['charged_area_mm2']} vs sum {sum(sides.values()):.2f}")
+    check("...so the same board now does NOT fit, and says which face",
+          gf['fits_by_area'] is False and 'F.Cu' in (gf.get('action') or ''),
+          f"fits {gf['fits_by_area']}, action {gf.get('action')!r}")
+    # `busiest_side_area_mm2` keeps its own meaning on both bases: it is still
+    # the busiest side's area, it has simply stopped being the number the
+    # verdict rests on. A key that changed meaning under a flag would be worse
+    # than a renamed one.
+    # #878: the busiest side is the busiest OBSTRUCTED face. On this fixture
+    # the two dicts pick the SAME face -- orangecrab's F.Cu leads its B.Cu on
+    # both -- so `max(part_area_by_side_mm2)` would still pass here while
+    # asserting nothing about which dict `busiest` reads. It is pinned against
+    # the obstruction dict, and the arm below is what makes the two differ on
+    # a board where they can.
+    check("busiest_side_area_mm2 is still the busiest side, not the charge",
+          abs(mf['busiest_side_area_mm2']
+              - max(mf['obstructed_area_by_side_mm2'].values())) < 0.02
+          and mf['busiest_side_area_mm2'] != mf['charged_area_mm2'],
+          f"busiest {mf['busiest_side_area_mm2']} max "
+          f"{max(mf['obstructed_area_by_side_mm2'].values()):.2f} "
+          f"charged {mf['charged_area_mm2']}")
+    # The far face IS charged now, and this fixture proves it without needing
+    # the verdict to move: without this arm nothing on this board would notice
+    # the charge going away, because its busiest face does not change either
+    # way.
+    #
+    # The `== far_face_area_mm2` identity is FIXTURE-SPECIFIC, not a general
+    # law, and saying otherwise would be a reason that is not the reason: it
+    # holds because all 8 of orangecrab's drilled parts sit on F.Cu, so the
+    # whole far charge lands on B.Cu and none on F. On a board with drilled
+    # parts on both faces the B-side delta is a subtotal and this equality
+    # fails for no good reason. Pinned here as a property of this fixture,
+    # asserted alongside the F-side condition that makes it true.
+    _pop_b = sides['B.Cu']
+    _obs_b = mf['obstructed_area_by_side_mm2']['B.Cu']
+    check("the far face is charged, and by the amount reported",
+          _obs_b > _pop_b
+          # the condition that makes the identity below hold on THIS board:
+          # nothing is charged far onto F, so the B delta is the whole charge
+          and abs(mf['obstructed_area_by_side_mm2']['F.Cu']
+                  - sides['F.Cu']) < 0.02
+          and abs((_obs_b - _pop_b) - mf['far_face_area_mm2']) < 0.02
+          and mf['far_face_parts'] == 8,
+          f"populated B {_pop_b}, obstructed B {_obs_b}, far "
+          f"{mf['far_face_area_mm2']} over {mf['far_face_parts']} part(s); "
+          f"F populated {sides['F.Cu']} obstructed "
+          f"{mf['obstructed_area_by_side_mm2']['F.Cu']}")
+    # And the POPULATION dict did not move: it is still each part once, and
+    # still sums to `part_area_mm2`. A far-face charge leaking into it would
+    # double the one-face demand, which is the regression #878's own
+    # measurement found in two of its three candidate currencies.
+    check("the population dict is untouched and still sums to part_area_mm2",
+          abs(sum(sides.values()) - m['part_area_mm2']) < 0.02
+          and abs(mf['charged_area_mm2'] - mf['part_area_mm2']) < 0.02,
+          f"sides {sum(sides.values()):.2f}, part_area {m['part_area_mm2']}, "
+          f"charged {mf['charged_area_mm2']}")
+    # The PROPOSAL has to hold the parts it is proposed for. The audit above
+    # runs undeclared, where `charged == busiest`, so it cannot tell the two
+    # apart -- and a proposal solved from `busiest` under a one-face policy is
+    # short by the whole far side. Measured on ulx3s at 0.2/0.5: 79.7mm from
+    # `charged`, 65.7mm from `busiest`, a 2007mm2 (32%) shortfall that
+    # nothing else fails on.
+    _side = mf['proposed_square_side_mm']
+    _usable = (_side - 2 * 0.5) ** 2
+    check("the proposed square holds the CHARGED area, not the busiest side",
+          _usable >= mf['charged_area_mm2'] - 1e-6,
+          f"a {_side}mm square gives {_usable:.2f}mm2 usable for a charge of "
+          f"{mf['charged_area_mm2']}mm2")
+    check("...and that is a stricter test than the busiest side would give",
+          _usable > mf['busiest_side_area_mm2'],
+          f"{_usable:.2f} vs busiest {mf['busiest_side_area_mm2']} -- if these "
+          f"do not differ the arm above cannot see the mistake")
+
 # The proposed square must actually hold the parts. It was
 # sqrt(outline_area + need) where `need` is a USABLE-area shortfall, so the
 # proposal's own usable area was still short -- 55.1mm square for parts
