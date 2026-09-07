@@ -3931,6 +3931,18 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         summary['env_knobs'] = _ek653.active_env_knobs()   # dirty baseline
     except Exception:          # without re-reading logs
         pass
+    try:
+        # The fill-oracle account: which pour geometry the fragility
+        # field was built from (disabled / no-pours / exact-fill /
+        # zone-outlines + the refill's own reason). The degraded mode
+        # used to be a stdout line nobody parses, and a run whose
+        # oracle failed shipped materially different copper with exit
+        # 0; an external wrapper can now pin and refuse the mode the
+        # same way it pins and refuses the env knobs.
+        from plane_fragility import fragility_account as _pfa
+        summary['plane_fragility'] = _pfa()
+    except Exception:
+        pass
     print(f"JSON_SUMMARY: {json.dumps(summary)}")
     _SUMMARY_SINK.append(summary)
 

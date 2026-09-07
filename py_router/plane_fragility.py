@@ -78,6 +78,36 @@ def fragility_cost_mm() -> float:
         return 2.0
 
 
+#: The LAST fragility-geometry decision this process made, for the run
+#: summary: which pour geometry the cost field was built from.
+#:
+#:   disabled       KICAD_PLANE_FRAGILITY_COST pinned <= 0; no fill call
+#:   no-pours       the field is on but the board has no filled zones
+#:   exact-fill     KiCad's own filled polygons (live board or refill)
+#:   zone-outlines  the DEGRADED mode: the exact fill was unavailable and
+#:                  the drawn outlines stood in; refill_reason carries the
+#:                  refill's own closed-vocabulary reason
+#:
+#: This exists because the degrade used to be a stdout line nobody
+#: parses: a run whose fill oracle failed shipped materially different
+#: copper (measured: an 876-block reroute) with exit 0 and no
+#: machine-readable trace. The summary is the account channel every
+#: other run fact already uses, and an external wrapper can now refuse a
+#: mode it did not pin for.
+_FRAGILITY_ACCOUNT = {"mode": "disabled", "refill_reason": None,
+                      "islands": 0}
+
+
+def fragility_account() -> Dict:
+    """A copy of the last fragility-geometry decision, summary-shaped."""
+    return dict(_FRAGILITY_ACCOUNT)
+
+
+def _record_account(mode, refill_reason=None, islands=0):
+    _FRAGILITY_ACCOUNT.update(mode=mode, refill_reason=refill_reason,
+                              islands=int(islands))
+
+
 _LAYER_SCALE_CACHE = None
 
 
@@ -388,6 +418,10 @@ def _compute_cells_and_states(pcb_data: PCBData, config: GridRouteConfig,
                               want_states: bool):
     cost_mm = fragility_cost_mm()
     if cost_mm <= 0 or not pcb_data.zones:
+        # The two silent arms are DIFFERENT facts and the account keeps
+        # them apart: a pinned-off field is a policy, a pour-less board
+        # is a property of the board.
+        _record_account("disabled" if cost_mm <= 0 else "no-pours")
         return np.empty((0, 4), dtype=np.int32), []
     try:
         width_mm = float(os.environ.get('KICAD_PLANE_FRAGILITY_WIDTH', '2.0') or 2.0)
@@ -405,6 +439,7 @@ def _compute_cells_and_states(pcb_data: PCBData, config: GridRouteConfig,
     # the drawn zone outlines as the last resort. Each entry: (layer, poly).
     name_to_id = {n.name: n.net_id for n in pcb_data.nets.values()}
     polys = []
+    _refill_reason = None   # RefillStatus reason, for the run account
     provider = getattr(pcb_data, 'exact_fill_provider', None)
     if provider is not None:
         try:
@@ -423,6 +458,7 @@ def _compute_cells_and_states(pcb_data: PCBData, config: GridRouteConfig,
         try:
             from kicad_exact_fill import refill_islands_ex
             fills, _st = refill_islands_ex(src)
+            _refill_reason = _st.reason
             if fills is None:
                 # None is refill_islands' DOCUMENTED "unavailable" return, not
                 # an error. Calling .items() on it raised an AttributeError
@@ -455,9 +491,13 @@ def _compute_cells_and_states(pcb_data: PCBData, config: GridRouteConfig,
         except Exception as e:
             print(f"Plane fragility: exact refill unavailable ({e}); "
                   f"using zone outlines")
+            _refill_reason = "error"
             polys = []
     if not polys:
         polys = [(z.net_id, z.layer, z.polygon) for z in pcb_data.zones]
+        _record_account("zone-outlines", _refill_reason, len(polys))
+    else:
+        _record_account("exact-fill", _refill_reason, len(polys))
 
     if os.environ.get('KICAD_FRAGILITY_DEBUG') == '1':
         # The field is a raster of the exact fill, so a GUI/CLI cell-count
