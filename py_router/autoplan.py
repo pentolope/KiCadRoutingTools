@@ -28,6 +28,10 @@ congestion before the router starts:
                    congested boards; up to two further passes on the result
                    while nets are left open, shipping the best pass
 
+--finish runs step 6 alone on a board another chain has already prepared and
+routed (an agent's chain, say): the poured planes are read from the board's
+zones, and route.py only touches the nets still unconnected.
+
 Every step runs as its own process in <output>.autoplan/, so a step that
 fails or does not improve is skipped and the chain continues from the last
 good board. The chain is written to <output>.autoplan/plan.json.
@@ -107,7 +111,7 @@ def fanout_parts(pcb):
     return sorted(out)
 
 
-def analyze(board):
+def analyze(board, finish=False):
     from kicad_parser import parse_kicad_pcb
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs,
@@ -143,7 +147,15 @@ def analyze(board):
     power_nets = plane_nets + [n for n, _ in rails if n not in plane_nets]
     power_nets += [n for n, _ in gnd[1:] if n not in power_nets]
 
-    solid = {l for _, l in planes}
+    if finish:
+        # The board's own pours: their nets are power nets, and an INNER
+        # layer carrying one is a plane the signals should keep off.
+        zones = [z for z in pcb.zones if not z.in_footprint and z.net_name]
+        planes = sorted({(z.net_name, z.layer) for z in zones})
+        plane_nets = sorted({n for n, _ in planes})
+        power_nets = plane_nets + [n for n, _ in rails if n not in plane_nets]
+        power_nets += [n for n, _ in gnd if n not in power_nets]
+    solid = {l for _, l in planes if l not in (layers[0], layers[-1])}
     if n_layers == 2:
         layer_costs = [1.0, 1.5]
     else:
@@ -227,10 +239,12 @@ def _open_count(summary_min):
             + int(ppo.get('count', 0) if isinstance(ppo, dict) else 0))
 
 
-def run_plan(board, output, a, work):
+def run_plan(board, output, a, work, finish=False):
     ch = Chain(board, work)
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
+    if finish:
+        return route_passes(ch, a, L, costs)
 
     # 2. planes, first
     if a['planes']:
@@ -304,7 +318,11 @@ def run_plan(board, output, a, work):
             '--grid-step', str(a['grid'])], 'diffpairs')
         ch.accept(out)
 
-    # 6. route every net; up to two more passes while nets are open
+    return route_passes(ch, a, L, costs)
+
+
+def route_passes(ch, a, L, costs):
+    """6. route every net; up to two more passes while nets are open."""
     args = ['{IN}', '{OUT}', '--nets', '*', '--no-bga-zones',
             '--clearance-ceiling', str(a['clearance']),
             '--track-width', str(a['track']),
@@ -336,9 +354,12 @@ def main():
     ap.add_argument('output_file')
     ap.add_argument('--dry-run', action='store_true',
                     help='print the analysis and exit')
+    ap.add_argument('--finish', action='store_true',
+                    help='only the final route passes, on a board already '
+                         'prepared and routed by another chain')
     args = ap.parse_args()
 
-    a = analyze(args.input_file)
+    a = analyze(args.input_file, finish=args.finish)
     print("AUTOPLAN_ANALYSIS: " + json.dumps(a, sort_keys=True), flush=True)
     if args.dry_run:
         return 0
@@ -350,7 +371,7 @@ def main():
     from copy_board import copy_board
     src = os.path.join(work, 'input.kicad_pcb')
     copy_board(os.path.abspath(args.input_file), src)
-    ch, final, n_open = run_plan(src, out, a, work)
+    ch, final, n_open = run_plan(src, out, a, work, finish=args.finish)
     with open(os.path.join(work, 'plan.json'), 'w') as fh:
         json.dump({'analysis': a, 'steps': ch.steps, 'final': final,
                    'open': n_open}, fh, indent=1)
