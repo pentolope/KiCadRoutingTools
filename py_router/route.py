@@ -2385,9 +2385,6 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                   f"rip churn: {', '.join(_names[:6])}"
                   f"{', ...' if len(_names) > 6 else ''})")
 
-    from hindsight import order_first
-    net_ids = order_first(net_ids, pcb_data, config, _direct_front_ids)
-
     # All nets are single-ended in this tool
     single_ended_nets = net_ids
     total_routes = len(single_ended_nets)
@@ -3110,8 +3107,6 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     failed += rq_failed
     total_time += rq_time
     total_iterations += rq_iterations
-    from hindsight import quick_exit
-    quick_exit('reroute', failed, total_iterations, final_reconcile)
 
     # Apply length matching if configured
     if length_match_groups and not _ckpt_stop:
@@ -3158,13 +3153,13 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         progress_callback=phase3_progress_callback,
         cancel_check=cancel_check,
     )
-    quick_exit('phase3', failed, total_iterations, final_reconcile,
-               routed_results, config)
     if _hs_restart_kwargs is not None:
         from hindsight import maybe_restart
         _hs_result = maybe_restart(
             final_reconcile, failed, total_iterations, config,
-            lambda: batch_route(**_hs_restart_kwargs))
+            lambda: batch_route(**_hs_restart_kwargs),
+            stopped=bool(_ckpt_stop or user_quit
+                         or (cancel_check is not None and cancel_check())))
         if _hs_result is not None:
             return _hs_result[1]
 
@@ -8043,9 +8038,6 @@ For differential pair routing, use route_diff.py:
             print(f"Output file: {args.output_file}")
 
     # Load PCB to expand wildcards
-    from hindsight import run_passes
-    run_passes(args.output_file)  # exits when KICAD_HINDSIGHT_PASSES > 1
-
     print(f"Loading {args.input_file} to expand net patterns...")
     pcb_data = parse_kicad_pcb(args.input_file)
 

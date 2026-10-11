@@ -278,7 +278,7 @@ def build_diff_pair_obstacles(
             # No extra clearance = build_diff_pair_leg_obstacles: the hybrid
             # pair's one-track legs, not the coupled centreline.
             single_track=not extra_clearance),
-            config, pcb_data, (p_net_id, n_net_id)),
+            config),
         config=config)
 
     # Add cross-layer track data
@@ -470,7 +470,7 @@ def build_single_ended_obstacles(
              **(_stub_surplus or {}),
              **({('congestion2',): _c2} if _c2 is not None else {})}, config),
             config, net_id, routed_net_ids), config, pcb_data, net_id),
-            config, pcb_data, net_id),
+            config),
         config=config)
     # Congestion v2 (#424): demand/capacity field, owner-exempt (no-op
     # unless KICAD_CONGESTION2_COST > 0 and the field was built).
@@ -585,7 +585,7 @@ def build_incremental_obstacles(
              **(_stub_surplus or {}),
              **({('congestion2',): _c2} if _c2 is not None else {})}, config),
             config, net_id, routed_net_ids), config, pcb_data, net_id),
-            config, pcb_data, net_id) or None,
+            config) or None,
         config=config)
 
     # Add cross-layer track data
@@ -762,7 +762,7 @@ def prepare_obstacles_inplace(
              **(_stub_surplus or {}),
              **({('congestion2',): _c2} if _c2 is not None else {})}, config),
             config, net_id, routed_net_ids), config, pcb_data, net_id),
-            config, pcb_data, net_id),
+            config),
         config=config)
 
 
