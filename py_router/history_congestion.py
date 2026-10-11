@@ -272,6 +272,8 @@ def reset_history(config: GridRouteConfig) -> Optional[HistoryField]:
         return None
     field = HistoryField()
     config._history_cong = field
+    from hindsight import register_field
+    register_field(field, config)
     k = history_knobs()
     print(f"History congestion (#590) armed: +{k['cost']}mm-equiv per contest"
           f", cap {k['cap'] if k['cap'] > 0 else 'none'}, escalate "
@@ -293,6 +295,8 @@ def _field(config) -> Optional[HistoryField]:
     if field is None:
         field = HistoryField()
         config._history_cong = field
+        from hindsight import register_field
+        register_field(field, config)
     return field
 
 

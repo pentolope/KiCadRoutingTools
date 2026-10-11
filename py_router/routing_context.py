@@ -267,16 +267,18 @@ def build_diff_pair_obstacles(
     # single-net).
     from history_congestion import add_history_source
     from keep_away import add_keepaway_source
+    from hindsight import add_hindsight_source
     merge_track_proximity_costs(
         obstacles, _per_net_cost_sources(track_proximity_cache,
                                          (p_net_id, n_net_id)),
-        ghost_costs=add_keepaway_source(add_history_source(
+        ghost_costs=add_hindsight_source(add_keepaway_source(add_history_source(
             {**filter_ripped_ghosts(ripped_route_layer_costs, config, routed_net_ids, (p_net_id, n_net_id)),
              **(_stub_surplus or {})}, config),
             config, pcb_data, (p_net_id, n_net_id),
             # No extra clearance = build_diff_pair_leg_obstacles: the hybrid
             # pair's one-track legs, not the coupled centreline.
             single_track=not extra_clearance),
+            config, pcb_data, (p_net_id, n_net_id)),
         config=config)
 
     # Add cross-layer track data
@@ -458,15 +460,17 @@ def build_single_ended_obstacles(
     from history_congestion import add_history_source
     from global_plan import add_plan_source
     from keep_away import add_keepaway_source
+    from hindsight import add_hindsight_source
     _c2 = congestion2_rows(config, net_id, routed_net_ids)
     merge_track_proximity_costs(
         obstacles,
         _per_net_cost_sources(track_proximity_cache, (net_id,), _sibs),
-        ghost_costs=add_keepaway_source(add_plan_source(add_history_source(
+        ghost_costs=add_hindsight_source(add_keepaway_source(add_plan_source(add_history_source(
             {**filter_ripped_ghosts(ripped_route_layer_costs, config, routed_net_ids, (net_id,)),
              **(_stub_surplus or {}),
              **({('congestion2',): _c2} if _c2 is not None else {})}, config),
             config, net_id, routed_net_ids), config, pcb_data, net_id),
+            config, pcb_data, net_id),
         config=config)
     # Congestion v2 (#424): demand/capacity field, owner-exempt (no-op
     # unless KICAD_CONGESTION2_COST > 0 and the field was built).
@@ -567,6 +571,7 @@ def build_incremental_obstacles(
     from history_congestion import add_history_source
     from global_plan import add_plan_source
     from keep_away import add_keepaway_source
+    from hindsight import add_hindsight_source
     # Phase 3 hands this builder routed_net_ids WITH net_id in it (its main
     # route is in); congestion2_rows already takes the owner out of its own
     # demand, so it gets the list without it, as the slow builder does.
@@ -575,11 +580,12 @@ def build_incremental_obstacles(
     merge_track_proximity_costs(
         obstacles,
         _per_net_cost_sources(track_proximity_cache, (net_id,), _sibs),
-        ghost_costs=add_keepaway_source(add_plan_source(add_history_source(
+        ghost_costs=add_hindsight_source(add_keepaway_source(add_plan_source(add_history_source(
             {**filter_ripped_ghosts(ripped_route_layer_costs, config, routed_net_ids, (net_id,)),
              **(_stub_surplus or {}),
              **({('congestion2',): _c2} if _c2 is not None else {})}, config),
-            config, net_id, routed_net_ids), config, pcb_data, net_id) or None,
+            config, net_id, routed_net_ids), config, pcb_data, net_id),
+            config, pcb_data, net_id) or None,
         config=config)
 
     # Add cross-layer track data
@@ -746,15 +752,17 @@ def prepare_obstacles_inplace(
     from history_congestion import add_history_source
     from global_plan import add_plan_source
     from keep_away import add_keepaway_source
+    from hindsight import add_hindsight_source
     _c2 = congestion2_rows(config, net_id, routed_net_ids)
     merge_track_proximity_costs(
         working_obstacles,
         _per_net_cost_sources(track_proximity_cache, (net_id,), _sibs),
-        ghost_costs=add_keepaway_source(add_plan_source(add_history_source(
+        ghost_costs=add_hindsight_source(add_keepaway_source(add_plan_source(add_history_source(
             {**filter_ripped_ghosts(ripped_route_layer_costs, config, routed_net_ids, (net_id,)),
              **(_stub_surplus or {}),
              **({('congestion2',): _c2} if _c2 is not None else {})}, config),
             config, net_id, routed_net_ids), config, pcb_data, net_id),
+            config, pcb_data, net_id),
         config=config)
 
 

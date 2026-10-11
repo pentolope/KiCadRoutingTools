@@ -1251,6 +1251,15 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     # forwarding a hand-picked subset silently dropped board_edge_clearance,
     # impedance, net_clearances, ordering and more (review finding).
     _reconcile_kwargs = dict(locals())
+    # KICAD_HINDSIGHT_RESTART: the outermost call keeps its own arguments, and
+    # an untouched copy of an in-memory board, to re-enter itself with.
+    from hindsight import restart_enabled as _hs_restart_enabled
+    _hs_restart_kwargs = None
+    if final_reconcile and _hs_restart_enabled():
+        import copy as _hs_copy
+        _hs_restart_kwargs = dict(_reconcile_kwargs)
+        if pcb_data is not None:
+            _hs_restart_kwargs['pcb_data'] = _hs_copy.deepcopy(pcb_data)
     # net_name_patterns must not forward either: the reconcile sub-run scopes
     # by exact retried-net names, which are then the correct override source.
     # json_out joins them: the sub-run must not write the parent's file. The
@@ -2376,6 +2385,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                   f"rip churn: {', '.join(_names[:6])}"
                   f"{', ...' if len(_names) > 6 else ''})")
 
+    from hindsight import order_first
+    net_ids = order_first(net_ids, pcb_data, config, _direct_front_ids)
+
     # All nets are single-ended in this tool
     single_ended_nets = net_ids
     total_routes = len(single_ended_nets)
@@ -3098,6 +3110,8 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     failed += rq_failed
     total_time += rq_time
     total_iterations += rq_iterations
+    from hindsight import quick_exit
+    quick_exit('reroute', failed, total_iterations, final_reconcile)
 
     # Apply length matching if configured
     if length_match_groups and not _ckpt_stop:
@@ -3144,6 +3158,15 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         progress_callback=phase3_progress_callback,
         cancel_check=cancel_check,
     )
+    quick_exit('phase3', failed, total_iterations, final_reconcile,
+               routed_results, config)
+    if _hs_restart_kwargs is not None:
+        from hindsight import maybe_restart
+        _hs_result = maybe_restart(
+            final_reconcile, failed, total_iterations, config,
+            lambda: batch_route(**_hs_restart_kwargs))
+        if _hs_result is not None:
+            return _hs_result[1]
 
     # Issue #134: nets whose stale copper would have shorted another net on
     # restore were left ripped instead of re-added (collision-safe restore).
@@ -8020,6 +8043,9 @@ For differential pair routing, use route_diff.py:
             print(f"Output file: {args.output_file}")
 
     # Load PCB to expand wildcards
+    from hindsight import run_passes
+    run_passes(args.output_file)  # exits when KICAD_HINDSIGHT_PASSES > 1
+
     print(f"Loading {args.input_file} to expand net patterns...")
     pcb_data = parse_kicad_pcb(args.input_file)
 
