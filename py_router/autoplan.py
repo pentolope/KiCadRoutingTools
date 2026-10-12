@@ -34,9 +34,12 @@ zones, and route.py only touches the nets still unconnected.
 
 Every step runs as its own process in <output>.autoplan/, so a step that
 fails or does not improve is skipped and the chain continues from the last
-good board. --max-seconds bounds the whole run: no route pass starts that the
-time left cannot hold, a pass that overruns is stopped, and the best board so
-far ships (with --finish, the input board itself if no pass finished). The chain is written to <output>.autoplan/plan.json.
+good board. Route passes stop once a pass closes no nets, and a further pass
+starts only while the router iterations spent, plus the last pass's again,
+stay within --effort-factor times the first pass's: a count the router
+reproduces exactly, so the same board always gets the same passes. If no
+route pass succeeds, the best board the chain has ships (with --finish, the
+input board itself). The chain is written to <output>.autoplan/plan.json.
 """
 from __future__ import annotations
 
@@ -47,7 +50,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -208,24 +210,18 @@ def analyze(board, finish=False):
 
 
 class Chain:
-    def __init__(self, board, work, max_seconds=0.0):
+    def __init__(self, board, work):
         self.work = work
         self.cur = os.path.abspath(board)
         self.n = 0
         self.steps = []
-        self.t0 = time.monotonic()
-        self.max_seconds = max_seconds
-        self.last_seconds = 0.0
+        self.last_iterations = 0
 
-    def left(self):
-        """Seconds left in the budget, or None when there is no budget."""
-        if not self.max_seconds:
-            return None
-        return self.max_seconds - (time.monotonic() - self.t0)
-
-    def run(self, kind, args, tag, timeout=None):
+    def run(self, kind, args, tag):
         """Run one tool from the current board to a fresh output; returns
-        (output path or None, JSON_SUMMARY dict or None, JSON_SUMMARY_MIN)."""
+        (output path or None, JSON_SUMMARY dict or None, JSON_SUMMARY_MIN).
+        ``last_iterations`` is the router iterations its JSON_SUMMARY lines
+        report, summed -- the same effort count the replay harness uses."""
         self.n += 1
         out = os.path.join(self.work, f'step{self.n:02d}_{tag}.kicad_pcb')
         argv = [sys.executable, '-u', '-X', 'utf8', TOOLS[kind]] + \
@@ -233,22 +229,18 @@ class Chain:
         log = out[:-len('.kicad_pcb')] + '.log'
         env = dict(os.environ)
         env.pop('REDO_MANIFEST', None)
-        t = time.monotonic()
         with open(log, 'w') as fh:
-            try:
-                rc = subprocess.run(argv, cwd=self.work, stdout=fh,
-                                    stderr=subprocess.STDOUT, env=env,
-                                    timeout=timeout).returncode
-            except subprocess.TimeoutExpired:
-                rc = 'timeout'
-        self.last_seconds = time.monotonic() - t
+            rc = subprocess.run(argv, cwd=self.work, stdout=fh,
+                                stderr=subprocess.STDOUT, env=env).returncode
         text = open(log, errors='replace').read()
         summary = summary_min = None
+        self.last_iterations = 0
         for m in re.finditer(r'^JSON_SUMMARY: (\{.*\})$', text, re.M):
             try:
                 summary = json.loads(m.group(1))
             except ValueError:
-                pass
+                continue
+            self.last_iterations += int(summary.get('total_iterations') or 0)
         m = re.search(r'^JSON_SUMMARY_MIN: (\{.*\})$', text, re.M)
         if m:
             try:
@@ -257,7 +249,7 @@ class Chain:
                 pass
         ok = rc == 0 and os.path.exists(out)
         self.steps.append({'tool': kind, 'tag': tag, 'rc': rc, 'ok': ok,
-                           'seconds': round(self.last_seconds, 1),
+                           'iterations': self.last_iterations,
                            'argv': argv[4:], 'log': os.path.basename(log)})
         print(f"  [{self.n:02d}] {tag}: rc={rc}{'' if ok else ' (skipped)'}",
               flush=True)
@@ -278,12 +270,12 @@ def _open_count(summary_min):
             + int(ppo.get('count', 0) if isinstance(ppo, dict) else 0))
 
 
-def run_plan(board, output, a, work, finish=False, max_seconds=0.0):
-    ch = Chain(board, work, max_seconds)
+def run_plan(board, output, a, work, finish=False, effort_factor=2.0):
+    ch = Chain(board, work)
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
     if finish:
-        return route_passes(ch, a, L, costs)
+        return route_passes(ch, a, L, costs, effort_factor)
 
     # 2. planes, first
     if a['planes']:
@@ -357,12 +349,12 @@ def run_plan(board, output, a, work, finish=False, max_seconds=0.0):
             '--grid-step', str(a['grid'])], 'diffpairs')
         ch.accept(out)
 
-    return route_passes(ch, a, L, costs)
+    return route_passes(ch, a, L, costs, effort_factor)
 
 
-def route_passes(ch, a, L, costs):
-    """6. route every net; up to two more passes while nets are open and
-    each pass still closes some, within the time budget."""
+def route_passes(ch, a, L, costs, effort_factor=2.0):
+    """6. route every net; up to two more passes while nets are open, each
+    pass still closes some, and the effort stays within budget."""
     args = ['{IN}', '{OUT}', '--nets', '*', '--no-bga-zones',
             '--clearance-ceiling', str(a['clearance']),
             '--track-width', str(a['track']),
@@ -376,16 +368,17 @@ def route_passes(ch, a, L, costs):
     if a['congested']:
         args += ['--max-ripup', '5']
     best = None                        # (open, out)
+    first = spent = 0
     for i in range(ROUTE_PASSES):
-        left = ch.left()
-        if left is not None and i and left < ch.last_seconds:
-            print(f"  route pass {i + 1} not started: {left:.0f}s left, the "
-                  f"last pass took {ch.last_seconds:.0f}s", flush=True)
+        if i and spent + ch.last_iterations > effort_factor * first:
+            print(f"  route pass {i + 1} not started: {spent} iterations "
+                  f"spent, the last pass took {ch.last_iterations}, budget "
+                  f"{effort_factor:g} x {first}", flush=True)
             break
-        if left is not None and left <= 0:
-            break
-        out, _, smin = ch.run('route', args, 'route' + (f'_p{i + 1}' if i else ''),
-                              timeout=left)
+        out, _, smin = ch.run('route', args, 'route' + (f'_p{i + 1}' if i else ''))
+        spent += ch.last_iterations
+        if not i:
+            first = ch.last_iterations
         if not out:
             break
         n_open = _open_count(smin)
@@ -407,10 +400,11 @@ def main():
     ap.add_argument('--finish', action='store_true',
                     help='only the final route passes, on a board already '
                          'prepared and routed by another chain')
-    ap.add_argument('--max-seconds', type=float, default=0.0,
-                    help='wall-clock budget for the whole run (0 = none): no '
-                         'route pass starts that the time left cannot hold, '
-                         'and one that overruns is stopped')
+    ap.add_argument('--effort-factor', type=float, default=2.0,
+                    help='a route pass after the first starts only while the '
+                         'router iterations spent, plus the last pass\'s '
+                         'again, stay within this many times the first '
+                         'pass\'s (default 2)')
     args = ap.parse_args()
 
     a = analyze(args.input_file, finish=args.finish)
@@ -426,7 +420,7 @@ def main():
     src = os.path.join(work, 'input.kicad_pcb')
     copy_board(os.path.abspath(args.input_file), src)
     ch, final, n_open = run_plan(src, out, a, work, finish=args.finish,
-                                 max_seconds=args.max_seconds)
+                                 effort_factor=args.effort_factor)
     if not final and (args.finish or ch.cur != src):
         # No route pass finished: ship the best board the chain has -- the
         # input itself for --finish, else the last step that succeeded.
