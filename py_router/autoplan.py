@@ -34,7 +34,9 @@ zones, and route.py only touches the nets still unconnected.
 
 Every step runs as its own process in <output>.autoplan/, so a step that
 fails or does not improve is skipped and the chain continues from the last
-good board. The chain is written to <output>.autoplan/plan.json.
+good board. --max-seconds bounds the whole run: no route pass starts that the
+time left cannot hold, a pass that overruns is stopped, and the best board so
+far ships (with --finish, the input board itself if no pass finished). The chain is written to <output>.autoplan/plan.json.
 """
 from __future__ import annotations
 
@@ -45,6 +47,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -67,6 +70,23 @@ ROUTE_PASSES = 3             # the first pass plus up to two on its result
 
 def _num(x):
     return round(float(x), 4)
+
+
+_DASH_DIGIT = re.compile(r'^-\d')
+
+
+def _exact_ok(name):
+    """A net name the tools' argparse accepts as an exact value: it may start
+    with '-' only before a digit (cli_nets.pin_dash_digit_values)."""
+    return not name.startswith('-') or bool(_DASH_DIGIT.match(name))
+
+
+def _glob(name):
+    """The fnmatch pattern matching exactly this net, safe to pass on the
+    command line: glob metacharacters are bracketed, and so is a leading '-'
+    that argparse would otherwise read as an option ('-BATT' -> '[-]BATT')."""
+    pat = ''.join(f'[{c}]' if c in '[]*?' else c for c in name)
+    return '[-]' + pat[1:] if not _exact_ok(pat) else pat
 
 
 # --------------------------------------------------------------------------
@@ -143,6 +163,9 @@ def analyze(board, finish=False):
                 planes.append((rails[0][0], layers[2]))
         else:
             planes.append((gnd[0][0], layers[-1]))
+    # route_planes takes EXACT names: a name argparse cannot carry stays a
+    # power net (passed as a pattern) instead of a plane.
+    planes = [(n, l) for n, l in planes if _exact_ok(n)]
     plane_nets = [n for n, _ in planes]
     power_nets = plane_nets + [n for n, _ in rails if n not in plane_nets]
     power_nets += [n for n, _ in gnd[1:] if n not in power_nets]
@@ -185,13 +208,22 @@ def analyze(board, finish=False):
 
 
 class Chain:
-    def __init__(self, board, work):
+    def __init__(self, board, work, max_seconds=0.0):
         self.work = work
         self.cur = os.path.abspath(board)
         self.n = 0
         self.steps = []
+        self.t0 = time.monotonic()
+        self.max_seconds = max_seconds
+        self.last_seconds = 0.0
 
-    def run(self, kind, args, tag):
+    def left(self):
+        """Seconds left in the budget, or None when there is no budget."""
+        if not self.max_seconds:
+            return None
+        return self.max_seconds - (time.monotonic() - self.t0)
+
+    def run(self, kind, args, tag, timeout=None):
         """Run one tool from the current board to a fresh output; returns
         (output path or None, JSON_SUMMARY dict or None, JSON_SUMMARY_MIN)."""
         self.n += 1
@@ -201,9 +233,15 @@ class Chain:
         log = out[:-len('.kicad_pcb')] + '.log'
         env = dict(os.environ)
         env.pop('REDO_MANIFEST', None)
+        t = time.monotonic()
         with open(log, 'w') as fh:
-            rc = subprocess.run(argv, cwd=self.work, stdout=fh,
-                                stderr=subprocess.STDOUT, env=env).returncode
+            try:
+                rc = subprocess.run(argv, cwd=self.work, stdout=fh,
+                                    stderr=subprocess.STDOUT, env=env,
+                                    timeout=timeout).returncode
+            except subprocess.TimeoutExpired:
+                rc = 'timeout'
+        self.last_seconds = time.monotonic() - t
         text = open(log, errors='replace').read()
         summary = summary_min = None
         for m in re.finditer(r'^JSON_SUMMARY: (\{.*\})$', text, re.M):
@@ -219,6 +257,7 @@ class Chain:
                 pass
         ok = rc == 0 and os.path.exists(out)
         self.steps.append({'tool': kind, 'tag': tag, 'rc': rc, 'ok': ok,
+                           'seconds': round(self.last_seconds, 1),
                            'argv': argv[4:], 'log': os.path.basename(log)})
         print(f"  [{self.n:02d}] {tag}: rc={rc}{'' if ok else ' (skipped)'}",
               flush=True)
@@ -239,8 +278,8 @@ def _open_count(summary_min):
             + int(ppo.get('count', 0) if isinstance(ppo, dict) else 0))
 
 
-def run_plan(board, output, a, work, finish=False):
-    ch = Chain(board, work)
+def run_plan(board, output, a, work, finish=False, max_seconds=0.0):
+    ch = Chain(board, work, max_seconds)
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
     if finish:
@@ -255,7 +294,7 @@ def run_plan(board, output, a, work, finish=False):
         ch.accept(out)
 
     # 3. fanout, each part, with a retry ladder keeping the best escape
-    excl = [f'!{n}' for n in a['plane_nets']]
+    excl = [f'!{_glob(n)}' for n in a['plane_nets']]
     fanned = False
     for ref, tool, pitch in a['parts']:
         fine = pitch <= 0.65
@@ -309,7 +348,7 @@ def run_plan(board, output, a, work, finish=False):
     # 5. diff pairs first
     if a['pair_nets']:
         out, s, _ = ch.run('diff', [
-            '{IN}', '{OUT}', '--nets', *a['pair_nets'],
+            '{IN}', '{OUT}', '--nets', *[_glob(n) for n in a['pair_nets']],
             '--track-width', str(max(0.1, a['track'])),
             '--diff-pair-gap', str(max(0.1, a['clearance'])),
             '--clearance-ceiling', str(a['clearance']),
@@ -322,7 +361,8 @@ def run_plan(board, output, a, work, finish=False):
 
 
 def route_passes(ch, a, L, costs):
-    """6. route every net; up to two more passes while nets are open."""
+    """6. route every net; up to two more passes while nets are open and
+    each pass still closes some, within the time budget."""
     args = ['{IN}', '{OUT}', '--nets', '*', '--no-bga-zones',
             '--clearance-ceiling', str(a['clearance']),
             '--track-width', str(a['track']),
@@ -330,20 +370,30 @@ def route_passes(ch, a, L, costs):
             '--layers', *L, '--layer-costs', *costs,
             '--grid-step', str(a['grid'])]
     if a['power_nets']:
-        args += ['--power-nets', *a['power_nets'], '--power-nets-widths',
+        args += ['--power-nets', *[_glob(n) for n in a['power_nets']],
+                 '--power-nets-widths',
                  *[str(RAIL_WIDTH)] * len(a['power_nets'])]
     if a['congested']:
         args += ['--max-ripup', '5']
     best = None                        # (open, out)
     for i in range(ROUTE_PASSES):
-        out, _, smin = ch.run('route', args, 'route' + (f'_p{i + 1}' if i else ''))
+        left = ch.left()
+        if left is not None and i and left < ch.last_seconds:
+            print(f"  route pass {i + 1} not started: {left:.0f}s left, the "
+                  f"last pass took {ch.last_seconds:.0f}s", flush=True)
+            break
+        if left is not None and left <= 0:
+            break
+        out, _, smin = ch.run('route', args, 'route' + (f'_p{i + 1}' if i else ''),
+                              timeout=left)
         if not out:
             break
         n_open = _open_count(smin)
+        progress = best is None or (n_open is not None and n_open < best[0])
         if best is None or (n_open is not None and n_open <= best[0]):
             best = (n_open if n_open is not None else 1 << 30, out)
         ch.accept(out)
-        if not n_open:
+        if not n_open or not progress:
             break
     return ch, (best[1] if best else None), (best[0] if best else None)
 
@@ -357,6 +407,10 @@ def main():
     ap.add_argument('--finish', action='store_true',
                     help='only the final route passes, on a board already '
                          'prepared and routed by another chain')
+    ap.add_argument('--max-seconds', type=float, default=0.0,
+                    help='wall-clock budget for the whole run (0 = none): no '
+                         'route pass starts that the time left cannot hold, '
+                         'and one that overruns is stopped')
     args = ap.parse_args()
 
     a = analyze(args.input_file, finish=args.finish)
@@ -371,7 +425,14 @@ def main():
     from copy_board import copy_board
     src = os.path.join(work, 'input.kicad_pcb')
     copy_board(os.path.abspath(args.input_file), src)
-    ch, final, n_open = run_plan(src, out, a, work, finish=args.finish)
+    ch, final, n_open = run_plan(src, out, a, work, finish=args.finish,
+                                 max_seconds=args.max_seconds)
+    if not final and (args.finish or ch.cur != src):
+        # No route pass finished: ship the best board the chain has -- the
+        # input itself for --finish, else the last step that succeeded.
+        final = ch.cur
+        print(f"AUTOPLAN: no route pass finished; shipping "
+              f"{os.path.basename(final)}", flush=True)
     with open(os.path.join(work, 'plan.json'), 'w') as fh:
         json.dump({'analysis': a, 'steps': ch.steps, 'final': final,
                    'open': n_open}, fh, indent=1)
