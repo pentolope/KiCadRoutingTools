@@ -67,6 +67,11 @@ a net they select, a rail included, routes at their width, and every other
 net keeps the choice above. One width per pattern, each finite and above 0,
 or the run is refused before any step runs (exit 2).
 
+--fab-tier, --fab-overrides and --escalation are the shared fab flags every
+routing CLI takes. autoroute's own floors (step 1) come from them, and it
+passes each one the caller gave to every step that takes them (planes,
+fanout, diff pairs, route) and to the check_drc that grades each step.
+
 Every step runs as its own process in <output>.autoroute/, so a step that
 fails is skipped and the chain continues from the last good board. Each route
 pass is graded: open nets as check_connected reports them (the KiCad
@@ -123,6 +128,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+
+#: The step tools that take the shared fab flags; the decap step does not.
+FAB_STEPS = ('planes', 'bga', 'qfn', 'diff', 'route')
 
 TOOLS = {
     'planes': os.path.join(HERE, 'route_planes.py'),
@@ -441,7 +449,7 @@ def plane_layers(n):
 
 
 def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
-            keep_pours=False):
+            keep_pours=False, fab_args=()):
     from kicad_parser import parse_kicad_pcb, pour_zones
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs,
@@ -571,6 +579,8 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         out['net_widths'] = widths
     if keep_pours:
         out['keep_pours'] = True
+    if fab_args:
+        out['fab_args'] = list(fab_args)
     return out
 
 
@@ -744,8 +754,9 @@ class ChainEvents:
 
 
 class Chain(ChainEvents):
-    def __init__(self, board, work, clearance=None, baseline=None):
+    def __init__(self, board, work, clearance=None, baseline=None, fab_args=()):
         self.work = work
+        self.fab_args = list(fab_args)
         self.cur = os.path.abspath(board)
         self.n = 0
         self.steps = []
@@ -790,6 +801,7 @@ class Chain(ChainEvents):
             argv += ['--clearance', str(self.clearance)]
         if self.baseline:
             argv += ['--baseline', self.baseline]
+        argv += self.fab_args
         subprocess.run(argv, capture_output=True, text=True, env=_child_env())
         try:
             with open(jpath) as fh:
@@ -832,7 +844,7 @@ class Chain(ChainEvents):
         js = out[:-len('.kicad_pcb')] + '.summary.json'
         argv = [sys.executable, '-u', '-X', 'utf8', TOOLS[kind]] + \
             [a.replace('{IN}', self.cur).replace('{OUT}', out).replace('{JSON}', js)
-             for a in args]
+             for a in args] + (self.fab_args if kind in FAB_STEPS else [])
         log = out[:-len('.kicad_pcb')] + '.log'
         ev = {'n': self.n, 'tag': tag, 'tool': kind, 'parent': parent,
               'cmd': [os.path.basename(TOOLS[kind])] + argv[5:], 'log': log,
@@ -955,7 +967,9 @@ def plan_steps(a, finish=False, effort_factor=2.0):
             'rules_why': ('the fab floor for every step: a net class above it is '
                           'aspirational, so the route steps cap every class at it; '
                           'read from ' + (a.get('rules_source') or
-                                          "the fab defaults (the board has no .kicad_pro)")),
+                                          "the fab defaults (the board has no .kicad_pro)")
+                          + (' under the caller\'s ' + ' '.join(a['fab_args'])
+                             if a.get('fab_args') else '')),
             'layers': a['layers'],
             'layer_costs': a['layer_costs'], 'planes': a['planes'],
             'power_nets': a['power_nets'], 'pair_nets': a['pair_nets'],
@@ -966,7 +980,8 @@ def plan_steps(a, finish=False, effort_factor=2.0):
 
 
 def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json=False):
-    ch = Chain(board, work, clearance=a['clearance'], baseline=os.path.abspath(board))
+    ch = Chain(board, work, clearance=a['clearance'], baseline=os.path.abspath(board),
+               fab_args=a.get('fab_args') or ())
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
     if finish:
@@ -1502,6 +1517,13 @@ def main():
                          '--json-out summary, the step that produced the shipped '
                          'board, and the chain as in plan.json; when no route pass '
                          'shipped, its status says so and its summary is null')
+    from fab_tiers import (add_fab_floor_args, fab_tier_from_args,
+                           set_default_fab_tier, set_policy_from_args)
+    add_fab_floor_args(ap)
+    # A flag the caller gives is passed on even at its default value; the
+    # defaults are read back for the ones it does not give.
+    defaults = {d: ap.get_default(d) for d in ('fab_tier', 'escalation')}
+    ap.set_defaults(**dict.fromkeys(defaults))
     from cli_nets import pin_dash_digit_values
     args = pin_dash_digit_values(ap).parse_args()
     json_out = args.json_out and os.path.abspath(args.json_out)
@@ -1509,6 +1531,22 @@ def main():
         os.remove(json_out)          # a stale file must not read as this run's
 
     t_start = time.time()
+    fab_args = []
+    for flag, dest in (('--fab-tier', 'fab_tier'), ('--escalation', 'escalation')):
+        if getattr(args, dest) is None:
+            setattr(args, dest, defaults[dest])
+        else:
+            fab_args += [flag, getattr(args, dest)]
+    if args.fab_overrides:
+        if not os.path.isfile(args.fab_overrides):
+            print(f"AUTOROUTE: refused: --fab-overrides {args.fab_overrides} is no file",
+                  flush=True)
+            return 2
+        args.fab_overrides = os.path.abspath(args.fab_overrides)
+        fab_args += ['--fab-overrides', args.fab_overrides]
+    set_default_fab_tier(*fab_tier_from_args(args))
+    set_policy_from_args(args, args.input_file)
+
     try:
         if len(args.power_nets) != len(args.power_nets_widths):
             raise Refused(f"--power-nets gives {len(args.power_nets)} pattern(s) and "
@@ -1516,7 +1554,7 @@ def main():
                           f"width(s); give one width per pattern")
         a = analyze(args.input_file, finish=args.finish, plane_cost=args.plane_layer_cost,
                     caller_power=list(zip(args.power_nets, args.power_nets_widths)),
-                    keep_pours=args.keep_pours)
+                    keep_pours=args.keep_pours, fab_args=fab_args)
     except Refused as exc:
         print(f"AUTOROUTE: refused: {exc}", flush=True)
         return 2
