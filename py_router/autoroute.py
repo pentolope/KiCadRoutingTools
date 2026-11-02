@@ -79,7 +79,10 @@ stay within --effort-factor times the first pass's -- a forecast from counts
 the router reproduces exactly, not a cap on the pass itself -- and not at all
 when a pass reported no iterations. If no route pass succeeds, the best board
 the chain has ships (with --finish, the input board itself). The chain and
-every grade are written to <output>.autoroute/plan.json.
+every grade are written to <output>.autoroute/plan.json. --json-out FILE also
+writes the chain, the step that produced the shipped board and, when that is
+a route pass, the summary route.py's own --json-out wrote for it; when no
+route pass shipped, its `status` says so and the summary is null.
 
 Besides its prose the run prints machine-readable lines, one JSON object
 each, which the plugin's Autorouter tab reads (and a script may):
@@ -816,7 +819,8 @@ class Chain(ChainEvents):
         (output path or None, JSON_SUMMARY dict or None, JSON_SUMMARY_MIN).
         ``last_iterations`` is the router iterations its JSON_SUMMARY lines
         report, summed -- the same effort count the replay harness uses --
-        or None when the run printed no JSON_SUMMARY at all.
+        or None when the run printed no JSON_SUMMARY at all. '{JSON}' in
+        ARGS is <output stem>.summary.json.
 
         Emits the step's `running` event, and its ending -- unless HOLD and
         the step produced a board, when the caller ends it with end_step
@@ -825,8 +829,10 @@ class Chain(ChainEvents):
         self.end_step()
         self.n += 1
         out = os.path.join(self.work, f'step{self.n:02d}_{tag}.kicad_pcb')
+        js = out[:-len('.kicad_pcb')] + '.summary.json'
         argv = [sys.executable, '-u', '-X', 'utf8', TOOLS[kind]] + \
-            [a.replace('{IN}', self.cur).replace('{OUT}', out) for a in args]
+            [a.replace('{IN}', self.cur).replace('{OUT}', out).replace('{JSON}', js)
+             for a in args]
         log = out[:-len('.kicad_pcb')] + '.log'
         ev = {'n': self.n, 'tag': tag, 'tool': kind, 'parent': parent,
               'cmd': [os.path.basename(TOOLS[kind])] + argv[5:], 'log': log,
@@ -959,12 +965,13 @@ def plan_steps(a, finish=False, effort_factor=2.0):
             'effort_factor': effort_factor, 'steps': rows}
 
 
-def run_plan(board, output, a, work, finish=False, effort_factor=2.0):
+def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json=False):
     ch = Chain(board, work, clearance=a['clearance'], baseline=os.path.abspath(board))
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
     if finish:
-        return route_passes(ch, a, L, costs, effort_factor, finish=True)
+        return route_passes(ch, a, L, costs, effort_factor, finish=True,
+                            route_json=route_json)
 
     # 2. planes, first -- unless the board's own pours are the planes
     if a['planes'] and not a.get('keep_pours'):
@@ -1077,7 +1084,8 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0):
                           if reroute else '') if x) or 'every pair kept as routed',
                       rip=rip, reroute=reroute)
 
-    return route_passes(ch, a, L, costs, effort_factor, rip=rip, reroute=reroute)
+    return route_passes(ch, a, L, costs, effort_factor, rip=rip, reroute=reroute,
+                        route_json=route_json)
 
 
 def rung_grazes(summary):
@@ -1248,7 +1256,8 @@ def _improves(g, best):
     return (g['open'], g['drc']) < (best['open'], best['drc'])
 
 
-def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), reroute=()):
+def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), reroute=(),
+                 route_json=False):
     """6. route every net; up to two more passes while nets are open, each
     pass improves on the best board so far, and the effort stays within
     budget. Only the first pass keeps signals off the solid planes; the later
@@ -1256,9 +1265,12 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     could not route without it. The REROUTE nets are first ripped and routed
     again on their own. Every step routes the power nets at RAIL_WIDTH, with
     the caller's --power-nets ahead of them, so a net those select routes at
-    their width. Returns (chain, best board or None, its grade or None)."""
+    their width. With
+    ROUTE_JSON each pass writes route.py's --json-out beside its board.
+    Returns (chain, best board or None, its grade or None)."""
     def route_args(costs):
-        return base + ['--layers', *L, '--layer-costs', *costs]
+        return (base + ['--layers', *L, '--layer-costs', *costs]
+                + (['--json-out', '{JSON}'] if route_json else []))
     base = ['{IN}', '{OUT}', '--nets', '*', '--no-bga-zones',
             '--clearance-ceiling', str(a['clearance']),
             '--track-width', str(a['track']),
@@ -1373,6 +1385,43 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     return ch, (best[1] if best else None), (best[0] if best else None)
 
 
+#: The tags route_passes gives its passes; the diff-pair reroute is a route
+#: step but not a pass.
+_PASS_TAG = re.compile(r'route(_p\d+)?')
+
+
+def shipped_record(ch, final):
+    """The head of the --json-out document for FINAL, the board that ships
+    (None when none does): the step that produced it and, when that step is
+    a route pass, the summary route.py wrote for that pass with its own
+    --json-out, as written. `status` says which: 'route_pass',
+    'route_pass_without_summary', 'no_route_pass' or 'no_board', each but
+    the first with `why`."""
+    stem = final and os.path.basename(final)[:-len('.kicad_pcb')]
+    step = next((s for s in ch.steps if stem and s.get('log') == stem + '.log'), None)
+    doc = {'status': None, 'shipped_board': final and os.path.basename(final),
+           'shipped_step': step['tag'] if step else (final and 'input'),
+           'route_summary': None}
+    if step and step['tool'] == 'route' and _PASS_TAG.fullmatch(step['tag']):
+        try:
+            with open(final[:-len('.kicad_pcb')] + '.summary.json') as fh:
+                doc['route_summary'] = json.load(fh)
+            doc['status'] = 'route_pass'
+        except (OSError, ValueError):
+            doc['status'] = 'route_pass_without_summary'
+            doc['why'] = (f"route.py wrote no readable --json-out for "
+                          f"{step['tag']}, the pass that shipped")
+    elif final:
+        doc['status'] = 'no_route_pass'
+        doc['why'] = ('no route pass shipped: the board is ' +
+                      (f"from {step['tag']}, the last step that succeeded" if step
+                       else 'the input, which no route pass improved on'))
+    else:
+        doc['status'] = 'no_board'
+        doc['why'] = 'no step produced a board'
+    return doc
+
+
 def _effort_factor(text):
     v = float(text)
     if not math.isfinite(v) or v < 0:
@@ -1448,8 +1497,16 @@ def main():
                          'does, and pour none: the planes step does not run, so '
                          'every pour keeps its outline, clearance, pad connection '
                          'and priority')
+    ap.add_argument('--json-out', metavar='FILE',
+                    help='also write FILE: the shipped route pass\'s route.py '
+                         '--json-out summary, the step that produced the shipped '
+                         'board, and the chain as in plan.json; when no route pass '
+                         'shipped, its status says so and its summary is null')
     from cli_nets import pin_dash_digit_values
     args = pin_dash_digit_values(ap).parse_args()
+    json_out = args.json_out and os.path.abspath(args.json_out)
+    if json_out and os.path.isfile(json_out):
+        os.remove(json_out)          # a stale file must not read as this run's
 
     t_start = time.time()
     try:
@@ -1485,7 +1542,8 @@ def main():
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     ch, final, grade = run_plan(src, out, a, work, finish=args.finish,
-                                effort_factor=args.effort_factor)
+                                effort_factor=args.effort_factor,
+                                route_json=bool(json_out))
     ch.end_step()
     note = None
     if not final and (args.finish or ch.cur != src):
@@ -1521,12 +1579,22 @@ def main():
                'steps': len(ch.steps),
                'seconds': round(time.time() - t_start, 1),
                'skipped': [s['tag'] for s in ch.steps if not s.get('ok', True)]}
+
+    def write_json_out():
+        if json_out:
+            from route_summary import write_summary_file
+            write_summary_file(json_out, {**shipped_record(ch, final), 'analysis': a,
+                                          'plan': plan, 'steps': ch.steps,
+                                          'decisions': ch.decisions, 'final': final,
+                                          'grade': grade})
     if not final:
         print("AUTOROUTE: no route pass produced a board", flush=True)
         summary['error'] = 'no route pass produced a board'
+        write_json_out()
         print("AUTOROUTE_SUMMARY: " + json.dumps(summary), flush=True)
         return 1
     _ship(final, out)
+    write_json_out()
     print("AUTOROUTE_SUMMARY: " + json.dumps(summary), flush=True)
     return 0
 
