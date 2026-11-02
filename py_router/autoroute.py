@@ -41,8 +41,9 @@ congestion before the router starts:
                    net it leaves in a DRC violation is ripped and routed
                    again single-ended
   6. route         route.py over every net with the poured nets and rails as
-                   power nets, a first pass that keeps signals off the planes,
-                   a finer grid around fine-pitch parts, deeper rip-up on
+                   power nets at RAIL_WIDTH (a net the caller's --power-nets
+                   select at its width), a first pass that keeps signals off
+                   the planes, a finer grid around fine-pitch parts, deeper rip-up on
                    congested boards, and leave to rip the stubs of any pair
                    route_diff could not couple; up to two further passes on the result
                    while nets are left open, which may cross the planes at
@@ -53,6 +54,13 @@ routed (an agent's chain, say): the poured planes are read from the board's
 pours, and the input board is itself a candidate, so a pass ships only if it
 beats it. route.py works on the nets still open, but like any route step it
 may rip and reroute existing copper and runs its plane finalize.
+
+--power-nets PATTERN [...] with --power-nets-widths MM [...] are route.py's
+own flags, given to every route step ahead of autoroute's rails: route.py
+routes a net at the width of the first pattern that selects it (fnmatch), so
+a net they select, a rail included, routes at their width, and every other
+net keeps the choice above. One width per pattern, each finite and above 0,
+or the run is refused before any step runs (exit 2).
 
 Every step runs as its own process in <output>.autoroute/, so a step that
 fails is skipped and the chain continues from the last good board. Each route
@@ -178,6 +186,10 @@ def _selects_exactly(pattern, name, names):
         return False
     return all(net_pattern_matches(n, pattern) == (n == name)
                and fnmatch.fnmatchcase(n, pattern) == (n == name) for n in names)
+
+
+class Refused(ValueError):
+    """A caller setting the board cannot take; refused before any step runs."""
 
 
 # --------------------------------------------------------------------------
@@ -420,7 +432,7 @@ def plane_layers(n):
     return list(range(1, n - 1))
 
 
-def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST):
+def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=()):
     from kicad_parser import parse_kicad_pcb, pour_zones
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs,
@@ -521,21 +533,33 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST):
     power_nets = [n for n in power_nets if n in globs]
     pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
              if pairs[i] in globs and pairs[i + 1] in globs]
+    widths = None
+    if caller_power:
+        # Each net the caller's --power-nets give a width, as route.py's own
+        # selector reads them (first matching pattern).
+        from net_queries import identify_power_nets
+        ids = identify_power_nets(pcb, [p for p, _ in caller_power],
+                                  [w for _, w in caller_power])
+        widths = {pcb.nets[i].name: w for i, w in ids.items()}
 
-    return dict(layers=layers, clearance=clearance, track=track, via=via,
-                drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
-                plane_nets=plane_nets, power_nets=power_nets,
-                layer_costs=layer_costs, parts=parts, grid=grid,
-                congested=congested, n_nets=n_nets, pair_nets=pairs,
-                globs=globs,
-                # Why, for a reader (AUTOROUTE_PLAN, the plugin's tab): where
-                # the rules came from, why each part is fanned out or not,
-                # and the grounds and rails found by name and power pins.
-                rules_source=(os.path.basename(rules['source']) if rules.get('source')
-                              else None),
-                fanout_why=fanout_why, not_fanned=not_fanned,
-                grounds=[n for n, _ in gnd], rails=[n for n, _ in rails],
-                unselectable=unnamed)
+    out = dict(layers=layers, clearance=clearance, track=track, via=via,
+               drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
+               plane_nets=plane_nets, power_nets=power_nets,
+               layer_costs=layer_costs, parts=parts, grid=grid,
+               congested=congested, n_nets=n_nets, pair_nets=pairs,
+               globs=globs,
+               # Why, for a reader (AUTOROUTE_PLAN, the plugin's tab): where
+               # the rules came from, why each part is fanned out or not,
+               # and the grounds and rails found by name and power pins.
+               rules_source=(os.path.basename(rules['source']) if rules.get('source')
+                             else None),
+               fanout_why=fanout_why, not_fanned=not_fanned,
+               grounds=[n for n, _ in gnd], rails=[n for n, _ in rails],
+               unselectable=unnamed)
+    if widths is not None:
+        out['caller_power_nets'] = [[p, w] for p, w in caller_power]
+        out['net_widths'] = widths
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -899,6 +923,8 @@ def plan_steps(a, finish=False, effort_factor=2.0):
         + (', power nets ' + ', '.join(a['power_nets'][:6])
            + (' ...' if len(a['power_nets']) > 6 else '') + f' at {RAIL_WIDTH:g} mm'
            if a['power_nets'] else '')
+        + (', ' + ', '.join(f'{p} at {w:g} mm' for p, w in a['caller_power_nets'])
+           + ' (--power-nets, ahead of the rails)' if a.get('caller_power_nets') else '')
         + (', deeper rip-up (congested)' if a['congested'] else '')
         + ('; signals kept off the inner planes' if any(
             float(c) < 0 for c in a['layer_costs']) else ''))
@@ -1219,8 +1245,9 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     budget. Only the first pass keeps signals off the solid planes; the later
     ones may cross them at PLANE_FALLBACK_COST, so a plane carries only what
     could not route without it. The REROUTE nets are first ripped and routed
-    again on their own. Returns (chain, best board or None,
-    its grade or None)."""
+    again on their own. Every step routes the power nets at RAIL_WIDTH, with
+    the caller's --power-nets ahead of them, so a net those select routes at
+    their width. Returns (chain, best board or None, its grade or None)."""
     def route_args(costs):
         return base + ['--layers', *L, '--layer-costs', *costs]
     base = ['{IN}', '{OUT}', '--nets', '*', '--no-bga-zones',
@@ -1228,9 +1255,11 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
             '--track-width', str(a['track']),
             '--via-size', str(a['via']), '--via-drill', str(a['drill']),
             '--grid-step', str(a['grid'])]
-    if a['power_nets']:
-        base += ['--power-nets', *[a['globs'][n] for n in a['power_nets']],
-                 '--power-nets-widths',
+    caller = a.get('caller_power_nets') or []
+    if caller or a['power_nets']:
+        base += ['--power-nets', *[p for p, _ in caller],
+                 *[a['globs'][n] for n in a['power_nets']],
+                 '--power-nets-widths', *[str(w) for _, w in caller],
                  *[str(RAIL_WIDTH)] * len(a['power_nets'])]
     if a['congested']:
         base += ['--max-ripup', '5']
@@ -1349,6 +1378,16 @@ def _plane_layer_cost(text):
     return v
 
 
+def _width(text):
+    try:
+        v = float(text)
+    except ValueError:
+        v = math.nan
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f'must be a finite width > 0, not {text}')
+    return v
+
+
 def _ship(src, dst):
     """Copy board SRC and its siblings to DST, removing any sibling DST has
     that SRC does not, so the shipped set is exactly SRC's."""
@@ -1385,10 +1424,30 @@ def main():
                          'at 3.0; a positive price lets every step cross them '
                          '(the skill\'s route step uses 3.0), trading reference '
                          'integrity for routability')
-    args = ap.parse_args()
+    ap.add_argument('--power-nets', nargs='+', default=[], metavar='PATTERN',
+                    help='route.py\'s --power-nets, given to every route step ahead '
+                         'of autoroute\'s rails: a net routes at the width of the '
+                         'first pattern that selects it (fnmatch), a rail included '
+                         f'(in place of the rail width {RAIL_WIDTH:g}); the other '
+                         'nets keep autoroute\'s choice')
+    ap.add_argument('--power-nets-widths', nargs='+', type=_width, default=[],
+                    metavar='MM',
+                    help='the width of each --power-nets pattern, in order: one '
+                         'per pattern, or the run is refused before any step runs')
+    from cli_nets import pin_dash_digit_values
+    args = pin_dash_digit_values(ap).parse_args()
 
     t_start = time.time()
-    a = analyze(args.input_file, finish=args.finish, plane_cost=args.plane_layer_cost)
+    try:
+        if len(args.power_nets) != len(args.power_nets_widths):
+            raise Refused(f"--power-nets gives {len(args.power_nets)} pattern(s) and "
+                          f"--power-nets-widths {len(args.power_nets_widths)} "
+                          f"width(s); give one width per pattern")
+        a = analyze(args.input_file, finish=args.finish, plane_cost=args.plane_layer_cost,
+                    caller_power=list(zip(args.power_nets, args.power_nets_widths)))
+    except Refused as exc:
+        print(f"AUTOROUTE: refused: {exc}", flush=True)
+        return 2
     print("AUTOROUTE_ANALYSIS: " + json.dumps(a, sort_keys=True), flush=True)
     plan = plan_steps(a, finish=args.finish, effort_factor=args.effort_factor)
     emit('AUTOROUTE_PLAN', plan)
