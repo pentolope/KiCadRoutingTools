@@ -67,6 +67,21 @@ a net they select, a rail included, routes at their width, and every other
 net keeps the choice above. One width per pattern, each finite and above 0,
 or the run is refused before any step runs (exit 2).
 
+--nets PATTERN [...] routes only the nets the patterns select, read as
+route.py reads its own --nets (wildcards, a sheet's last component, a leading
+'!' excluding): every fanout and route step is given the patterns in place
+of '*', the diff-pair and planes steps only the pairs and planes among those
+nets, and a pour, power net or pair outside them is left as the board has
+it. The layer costs still keep signals off every plane layer. Patterns that
+together select no net are refused before any step runs (exit 2).
+
+--track-width MM is route.py's own --track-width for every route step, in
+place of the chain's track floor; the fanouts and diff pairs keep the floor,
+which their escapes need.
+
+--quick LEVEL passes route.py's --quick LEVEL to every route step: the chain
+judges a placement and is not shipped.
+
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
 routing CLI takes. autoroute's own floors (step 1) come from them, and it
 passes each one the caller gave to every step that takes them (planes,
@@ -449,7 +464,7 @@ def plane_layers(n):
 
 
 def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
-            keep_pours=False, fab_args=()):
+            keep_pours=False, fab_args=(), only=(), route_track=None):
     from kicad_parser import parse_kicad_pcb, pour_zones
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs,
@@ -538,6 +553,30 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     # alone on this board. A net no pattern isolates is left out of the
     # lists that name it (a diff pair goes as a pair) and reported.
     names = sorted({n.name for n in pcb.nets.values() if n.name})
+    scope = None
+    if only:
+        # The nets the caller's patterns select, as route.py's own --nets
+        # selects them, are the only ones any step routes: a pour, a power
+        # net and a pair outside them are left as the board has them. The
+        # layer costs above still keep signals off every plane layer.
+        from net_queries import expand_net_patterns
+        scope = sorted(set(expand_net_patterns(pcb, list(only), quiet=True)) & set(names))
+        if not scope:
+            raise Refused('--nets: the patterns select no net on this board')
+        planes = [(n, l) for n, l in planes if n in scope]
+        plane_nets = [n for n in plane_nets if n in scope]
+        power_nets = [n for n in power_nets if n in scope]
+        pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
+                 if pairs[i] in scope and pairs[i + 1] in scope]
+    widths = None
+    if caller_power:
+        # Each net the caller's --power-nets give a width, as route.py's own
+        # selector reads them (first matching pattern), among the routed nets.
+        from net_queries import identify_power_nets
+        ids = identify_power_nets(pcb, [p for p, _ in caller_power],
+                                  [w for _, w in caller_power])
+        widths = {pcb.nets[i].name: w for i, w in ids.items()
+                  if scope is None or pcb.nets[i].name in scope}
     globs, unnamed = {}, []
     for n in dict.fromkeys(plane_nets + power_nets + pairs):
         g = _glob(n)
@@ -551,14 +590,6 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     power_nets = [n for n in power_nets if n in globs]
     pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
              if pairs[i] in globs and pairs[i + 1] in globs]
-    widths = None
-    if caller_power:
-        # Each net the caller's --power-nets give a width, as route.py's own
-        # selector reads them (first matching pattern).
-        from net_queries import identify_power_nets
-        ids = identify_power_nets(pcb, [p for p, _ in caller_power],
-                                  [w for _, w in caller_power])
-        widths = {pcb.nets[i].name: w for i, w in ids.items()}
 
     out = dict(layers=layers, clearance=clearance, track=track, via=via,
                drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
@@ -577,6 +608,11 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     if widths is not None:
         out['caller_power_nets'] = [[p, w] for p, w in caller_power]
         out['net_widths'] = widths
+    if scope is not None:
+        out['nets'] = scope
+        out['net_patterns'] = list(only)
+    if route_track is not None:
+        out['route_track'] = route_track
     if keep_pours:
         out['keep_pours'] = True
     if fab_args:
@@ -906,7 +942,7 @@ class Chain(ChainEvents):
             self.cur = out
 
 
-def plan_steps(a, finish=False, effort_factor=2.0):
+def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
     """AUTOROUTE_PLAN's payload: the design rules the chain routes at and the
     steps it means to run, in order, as {tag, tool, what, why, optional}. A
     step marked optional runs only if what comes before it calls for it;
@@ -945,8 +981,12 @@ def plan_steps(a, finish=False, effort_factor=2.0):
                 f"route {len(a['pair_nets']) // 2} differential pair(s) with route_diff",
                 'pairs found by name, routed before the single nets; a pair net '
                 'left in a DRC violation is routed again single-ended')
-    row('route', 'route', 'route every net' + (' still open' if finish else ''),
+    row('route', 'route', ('route the nets --nets selects' if a.get('nets') else
+                           'route every net') + (' still open' if finish else ''),
         f"grid {a['grid']:g} mm"
+        + (f", tracks at {a['route_track']:g} mm (--track-width)"
+           if a.get('route_track') is not None else '')
+        + (f', route.py --quick {quick}' if quick else '')
         + (', power nets ' + ', '.join(a['power_nets'][:6])
            + (' ...' if len(a['power_nets']) > 6 else '') + f' at {RAIL_WIDTH:g} mm'
            if a['power_nets'] else '')
@@ -979,14 +1019,15 @@ def plan_steps(a, finish=False, effort_factor=2.0):
             'effort_factor': effort_factor, 'steps': rows}
 
 
-def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json=False):
+def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json=False,
+             quick=0):
     ch = Chain(board, work, clearance=a['clearance'], baseline=os.path.abspath(board),
                fab_args=a.get('fab_args') or ())
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
     if finish:
         return route_passes(ch, a, L, costs, effort_factor, finish=True,
-                            route_json=route_json)
+                            route_json=route_json, quick=quick)
 
     # 2. planes, first -- unless the board's own pours are the planes
     if a['planes'] and not a.get('keep_pours'):
@@ -998,6 +1039,7 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
 
     # 3. fanout, each part, with a retry ladder keeping the best escape
     excl = [f"!{a['globs'][n]}" for n in a['plane_nets'] if n in a['globs']]
+    scope = _scope_args(a)
     fanned = False
     fans = []
     for ref, tool, pitch in a['parts']:
@@ -1006,7 +1048,7 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
         tw = str(a['track'])
         if tool == 'bga':
             base = ['{IN}', '--output', '{OUT}', '--component', ref,
-                    '--nets', '*', *excl, '--layers', *L, '--layer-costs', *costs,
+                    '--nets', *scope, *excl, '--layers', *L, '--layer-costs', *costs,
                     '--track-width', tw, '--grid-step', str(a['grid']),
                     '--clearance', str(a['clearance']),
                     # the ceiling too, as on the route steps: bga_fanout honours
@@ -1022,7 +1064,7 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
             names.append(names[-1] + ', dogbone')
         else:
             base = ['{IN}', '--output', '{OUT}', '--component', ref,
-                    '--nets', '*', *excl, '--width', tw,
+                    '--nets', *scope, *excl, '--width', tw,
                     '--grid-step', str(a['grid']), '--clearance', str(a['clearance']),
                     # the ceiling too, as on the route steps: qfn_fanout honours
                     # and keeps the net classes without one (#1529)
@@ -1100,7 +1142,7 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
                       rip=rip, reroute=reroute)
 
     return route_passes(ch, a, L, costs, effort_factor, rip=rip, reroute=reroute,
-                        route_json=route_json)
+                        route_json=route_json, quick=quick)
 
 
 def rung_grazes(summary):
@@ -1264,6 +1306,12 @@ def refan(ch, fans, decap):
               held=held, board=out if after and after < before else kept)
 
 
+def _scope_args(a):
+    """The --nets values of a step that may route any of the chain's nets:
+    the caller's --nets patterns as given, else every net."""
+    return list(a.get('net_patterns') or ['*'])
+
+
 def _improves(g, best):
     """G ranks above BEST completion first: fewer open nets, then, at the same
     open count, fewer DRC violations. A pass that closes nets at the cost of
@@ -1272,7 +1320,7 @@ def _improves(g, best):
 
 
 def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), reroute=(),
-                 route_json=False):
+                 route_json=False, quick=0):
     """6. route every net; up to two more passes while nets are open, each
     pass improves on the best board so far, and the effort stays within
     budget. Only the first pass keeps signals off the solid planes; the later
@@ -1286,21 +1334,24 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     def route_args(costs):
         return (base + ['--layers', *L, '--layer-costs', *costs]
                 + (['--json-out', '{JSON}'] if route_json else []))
-    base = ['{IN}', '{OUT}', '--nets', '*', '--no-bga-zones',
-            '--clearance-ceiling', str(a['clearance']),
-            '--track-width', str(a['track']),
-            '--via-size', str(a['via']), '--via-drill', str(a['drill']),
-            '--grid-step', str(a['grid'])]
+    shared = ['--no-bga-zones',
+              '--clearance-ceiling', str(a['clearance']),
+              '--track-width', str(a.get('route_track', a['track'])),
+              '--via-size', str(a['via']), '--via-drill', str(a['drill']),
+              '--grid-step', str(a['grid'])]
     caller = a.get('caller_power_nets') or []
     if caller or a['power_nets']:
-        base += ['--power-nets', *[p for p, _ in caller],
-                 *[a['globs'][n] for n in a['power_nets']],
-                 '--power-nets-widths', *[str(w) for _, w in caller],
-                 *[str(RAIL_WIDTH)] * len(a['power_nets'])]
+        shared += ['--power-nets', *[p for p, _ in caller],
+                   *[a['globs'][n] for n in a['power_nets']],
+                   '--power-nets-widths', *[str(w) for _, w in caller],
+                   *[str(RAIL_WIDTH)] * len(a['power_nets'])]
     if a['congested']:
-        base += ['--max-ripup', '5']
+        shared += ['--max-ripup', '5']
     if rip:
-        base += ['--rip-existing-nets', *rip]
+        shared += ['--rip-existing-nets', *rip]
+    if quick:
+        shared += ['--quick', str(quick)]
+    base = ['{IN}', '{OUT}', '--nets', *_scope_args(a)] + shared
     best = None                        # (grade, board)
     passes = ['route' + (f'_p{i + 1}' if i else '') for i in range(ROUTE_PASSES)]
 
@@ -1335,7 +1386,7 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
         # A net whose new route lays no copper gets its old copper back, and
         # the passes below route whatever is left open.
         out, _, _ = ch.run('route', ['{IN}', '{OUT}', '--nets', *[a['globs'][n] for n in reroute],
-                                     '--force-reroute', *base[4:], '--layers', *L,
+                                     '--force-reroute', *shared, '--layers', *L,
                                      '--layer-costs', *costs], 'reroute_pairs',
                            parent='diffpairs')
         ch.accept(out)
@@ -1512,6 +1563,19 @@ def main():
                          'does, and pour none: the planes step does not run, so '
                          'every pour keeps its outline, clearance, pad connection '
                          'and priority')
+    ap.add_argument('--nets', nargs='+', default=[], metavar='PATTERN',
+                    help='route only the nets these patterns select, read as '
+                         'route.py reads its --nets (wildcards; a leading ! '
+                         'excludes), in every step: a pour, power net or pair '
+                         'outside them is left as the board has it. Patterns that '
+                         'together select no net are refused before any step runs')
+    ap.add_argument('--track-width', type=_width, default=None, metavar='MM',
+                    help='route.py\'s --track-width for every route step, in place '
+                         'of the chain\'s track floor; the fanout and diff-pair '
+                         'steps keep the floor')
+    ap.add_argument('--quick', type=int, choices=(1, 2), default=0, metavar='LEVEL',
+                    help='every route step runs at route.py\'s --quick LEVEL: a '
+                         'chain to judge a placement by, not to ship')
     ap.add_argument('--json-out', metavar='FILE',
                     help='also write FILE: the shipped route pass\'s route.py '
                          '--json-out summary, the step that produced the shipped '
@@ -1554,12 +1618,14 @@ def main():
                           f"width(s); give one width per pattern")
         a = analyze(args.input_file, finish=args.finish, plane_cost=args.plane_layer_cost,
                     caller_power=list(zip(args.power_nets, args.power_nets_widths)),
-                    keep_pours=args.keep_pours, fab_args=fab_args)
+                    keep_pours=args.keep_pours, fab_args=fab_args, only=args.nets,
+                    route_track=args.track_width)
     except Refused as exc:
         print(f"AUTOROUTE: refused: {exc}", flush=True)
         return 2
     print("AUTOROUTE_ANALYSIS: " + json.dumps(a, sort_keys=True), flush=True)
-    plan = plan_steps(a, finish=args.finish, effort_factor=args.effort_factor)
+    plan = plan_steps(a, finish=args.finish, effort_factor=args.effort_factor,
+                      quick=args.quick)
     emit('AUTOROUTE_PLAN', plan)
     if args.dry_run:
         return 0
@@ -1581,7 +1647,7 @@ def main():
         shutil.rmtree(stage, ignore_errors=True)
     ch, final, grade = run_plan(src, out, a, work, finish=args.finish,
                                 effort_factor=args.effort_factor,
-                                route_json=bool(json_out))
+                                route_json=bool(json_out), quick=args.quick)
     ch.end_step()
     note = None
     if not final and (args.finish or ch.cur != src):
