@@ -2261,10 +2261,21 @@ _PAREN_OR_QUOTE = re.compile(r'["()]')
 AT_NUM = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
 AT_NODE_RE = re.compile(r'\(\s*at\s+(' + AT_NUM + r')\s+(' + AT_NUM + r')'
                         r'(?:\s+(' + AT_NUM + r'))?\s*\)')
+#: The footprint pose KiCad writes from board format 20260616 on:
+#: `(transform (translate x y) (rotate r) (scale sx sy))`, with the same
+#: groups as AT_NODE_RE. A scale other than 1 also scales the footprint's
+#: children, which is not modelled, so such a pose does not match.
+_UNIT = r'1(?:\.0*)?'
+TRANSFORM_NODE_RE = re.compile(
+    r'\(\s*transform\s*\(\s*translate\s+(' + AT_NUM + r')\s+(' + AT_NUM + r')\s*\)'
+    r'(?:\s*\(\s*rotate\s+(' + AT_NUM + r')\s*\))?'
+    r'(?:\s*\(\s*scale\s+' + _UNIT + r'\s+' + _UNIT + r'\s*\))?\s*\)')
+_POSE_TOKENS = ('at', 'transform')
 
 
 def _footprint_at_start(fp_text: str) -> int:
-    """Index of the footprint's OWN `(at` -- its direct child -- or -1.
+    """Index of the footprint's OWN `(at` or `(transform` -- its direct
+    child -- or -1.
 
     String-aware (a `(descr "(at 9 9)")` is not markup) and depth-scoped (a
     property's or pad's `(at ...)` is not the footprint's, whatever order the
@@ -2287,9 +2298,11 @@ def _footprint_at_start(fp_text: str) -> int:
                 k = j + 1
                 while fp_text[k:k + 1] in (' ', '\t', '\n', '\r'):
                     k += 1
-                if (fp_text.startswith('at', k)
-                        and fp_text[k + 2:k + 3] in (' ', '\t', '\n', '\r')):
-                    return j
+                for token in _POSE_TOKENS:
+                    end = k + len(token)
+                    if (fp_text.startswith(token, k)
+                            and fp_text[end:end + 1] in (' ', '\t', '\n', '\r', '(')):
+                        return j
             i = j + 1
         elif c == ')':
             depth -= 1
@@ -2311,7 +2324,8 @@ def _footprint_at_start(fp_text: str) -> int:
 
 
 def footprint_at_match(fp_text: str):
-    """The footprint's OWN `(at ...)` as a re.Match, or None.
+    """The footprint's OWN `(at ...)` or `(transform ...)` as a re.Match, or
+    None. `.re` tells the two spellings apart.
 
     Groups 1..3 are x, y and the optional angle; `.start()`/`.end()` are the
     node's span inside `fp_text`, which is what a writer needs to rewrite it.
@@ -2325,7 +2339,9 @@ def footprint_at_match(fp_text: str):
     -- or the footprint was dropped with its pads.
     """
     j = _footprint_at_start(fp_text)
-    return None if j < 0 else AT_NODE_RE.match(fp_text, j)
+    if j < 0:
+        return None
+    return AT_NODE_RE.match(fp_text, j) or TRANSFORM_NODE_RE.match(fp_text, j)
 
 
 def find_matching_paren(content: str, open_idx: int) -> int:
@@ -2548,6 +2564,18 @@ def extract_stackup(content: str) -> List[StackupLayer]:
         ))
 
     return stackup
+
+
+#: Chord sag at which `board_bounds` reads an Edge.Cuts arc, on both parse paths
+#: (#1700). Coarser than the rings (`EDGE_CHORD_EPS`), so a ring may stand this
+#: far past the bounds where the bounds' chords miss an arc's apex. It stays
+#: coarse because the bounds are what copper and poses are laid out from (a grid
+#: column at a rounding, a plane zone's corner, the placement's raster origin):
+#: moved by micrometres they move copper on a board nothing is wrong with, and
+#: the rings cannot come down to this, since #1404 clears copper against them.
+#: What asks whether a ring fits the bounds reads the bounds at the ring's sag
+#: (`floorplan.outline_state`).
+BOUNDS_CHORD_EPS = 0.005
 
 
 def _arc_to_segments(start: Tuple[float, float], mid: Tuple[float, float],
@@ -2988,7 +3016,7 @@ def footprint_pose(fp_text: str):
         # KiCad's own reader leaves a footprint with no `(at ...)` at its
         # default pose, the origin; taking a child's instead was the bug.
         return (0.0, 0.0, 0.0)
-    m = AT_NODE_RE.match(fp_text, j)
+    m = AT_NODE_RE.match(fp_text, j) or TRANSFORM_NODE_RE.match(fp_text, j)
     if m is None:
         return None
     return (float(m.group(1)), float(m.group(2)),
@@ -3085,7 +3113,8 @@ def footprint_copper_is_functional(pad_count: int) -> bool:
     return pad_count > 0
 
 
-def _footprint_edge_points(content: str) -> List[Tuple[float, float]]:
+def _footprint_edge_points(content: str, chord_eps: float = BOUNDS_CHORD_EPS
+                           ) -> List[Tuple[float, float]]:
     """GLOBAL points of footprint-embedded Edge.Cuts shapes (fp_line/fp_rect/
     fp_arc/fp_circle/fp_poly), transformed by each footprint's (at x y rot).
 
@@ -3094,17 +3123,18 @@ def _footprint_edge_points(content: str) -> List[Tuple[float, float]]:
     board-level gr_* scan alone reports no bounds, which silently disables
     the routing edge keep-out. KiCad's own edges bounding box includes
     footprint shapes, so these points belong in board_bounds."""
-    return [p for pts in _footprint_edge_points_by_ref(content).values()
+    return [p for pts in _footprint_edge_points_by_ref(content, chord_eps).values()
             for p in pts]
 
 
 @functools.lru_cache(maxsize=2)
-def _footprint_edge_points_by_ref_cached(content: str):
-    return _footprint_edge_points_by_ref_uncached(content)
+def _footprint_edge_points_by_ref_cached(content: str, chord_eps: float):
+    return _footprint_edge_points_by_ref_uncached(content, chord_eps)
 
 
 def _footprint_edge_points_by_ref(
-        content: str) -> Dict[str, List[Tuple[float, float]]]:
+        content: str, chord_eps: float = BOUNDS_CHORD_EPS
+        ) -> Dict[str, List[Tuple[float, float]]]:
     """Memoised wrapper. See `_footprint_edge_points_by_ref_uncached`.
 
     A single `parse_kicad_pcb` asks this question TWICE -- once through
@@ -3120,13 +3150,14 @@ def _footprint_edge_points_by_ref(
     board texts is not worth the memory.
     """
     try:
-        return _footprint_edge_points_by_ref_cached(content)
+        return _footprint_edge_points_by_ref_cached(content, chord_eps)
     except TypeError:                                            # unhashable
-        return _footprint_edge_points_by_ref_uncached(content)
+        return _footprint_edge_points_by_ref_uncached(content, chord_eps)
 
 
 def _footprint_edge_points_by_ref_uncached(
-        content: str) -> Dict[str, List[Tuple[float, float]]]:
+        content: str, chord_eps: float = BOUNDS_CHORD_EPS
+        ) -> Dict[str, List[Tuple[float, float]]]:
     """The SAME scan as `_footprint_edge_points`, keyed by owning ref (#829).
 
     The scan always had the reference in hand and threw it away, so nothing
@@ -3170,7 +3201,8 @@ def _footprint_edge_points_by_ref_uncached(
                 r'\(end\s+([\d.-]+)\s+([\d.-]+)\)' + _GR_ELEMENT_GAP +
                 r'\(layer\s+"Edge\.Cuts"\)', fp_text, re.DOTALL):
             sx, sy, mx, my, ex, ey = (float(sm.group(i)) for i in range(1, 7))
-            for seg in _arc_to_segments((sx, sy), (mx, my), (ex, ey)):
+            for seg in _arc_to_segments((sx, sy), (mx, my), (ex, ey),
+                                        chord_eps=chord_eps):
                 local += list(seg)
         # fp_curve: a footprint-embedded bezier edge. Linearize in LOCAL coords
         # (the control points do not bound the curve) and let the shared
@@ -3545,8 +3577,10 @@ def classify_outline_owners(owners, board_only_bounds, board_only_outers,
     return out
 
 
-def extract_board_bounds(content: str) -> Optional[Tuple[float, float, float, float]]:
-    """Extract board outline bounds from Edge.Cuts layer."""
+def extract_board_bounds(content: str, chord_eps: float = BOUNDS_CHORD_EPS
+                         ) -> Optional[Tuple[float, float, float, float]]:
+    """Extract board outline bounds from Edge.Cuts layer, reading an arc at the
+    chord sag `chord_eps` (`BOUNDS_CHORD_EPS`, which is what `board_bounds` is)."""
     content = _mask_pad_primitives(content)  # pad primitives are not board graphics
     min_x = min_y = float('inf')
     max_x = max_y = float('-inf')
@@ -3579,7 +3613,7 @@ def extract_board_bounds(content: str) -> Optional[Tuple[float, float, float, fl
         mx, my = float(m.group(3)), float(m.group(4))
         ex, ey = float(m.group(5)), float(m.group(6))
         # Use linearized arc points for accurate bounds
-        for seg in _arc_to_segments((sx, sy), (mx, my), (ex, ey)):
+        for seg in _arc_to_segments((sx, sy), (mx, my), (ex, ey), chord_eps=chord_eps):
             for px, py in seg:
                 min_x = min(min_x, px)
                 max_x = max(max_x, px)
@@ -3629,7 +3663,7 @@ def extract_board_bounds(content: str) -> Optional[Tuple[float, float, float, fl
     # Footprint-embedded Edge.Cuts (fp_* shapes, transformed to global):
     # boards whose outline lives in a footprint otherwise report no bounds
     # and route with no edge keep-out. Mirrored in build_pcb_data_from_board.
-    for px, py in _footprint_edge_points(content):
+    for px, py in _footprint_edge_points(content, chord_eps):
         min_x = min(min_x, px)
         max_x = max(max_x, px)
         min_y = min(min_y, py)
@@ -4303,6 +4337,16 @@ def _pt_in_ring(x: float, y: float, ring) -> bool:
     return inside
 
 
+def _pad_carries_copper_layer(pad) -> bool:
+    """An NPTH pad never carries copper, whatever layers it lists; any other
+    pad does when it names a copper layer (`check_drc._pad_has_no_copper`'s
+    rule, negated; this module cannot import check_drc)."""
+    if getattr(pad, 'pad_type', '') == 'np_thru_hole':
+        return False
+    return any(ln == '*.Cu' or ln.endswith('.Cu')
+               for ln in (getattr(pad, 'layers', None) or ()))
+
+
 def drop_pad_containing_cutouts(board_info, pads_by_net):
     """Drop bogus board cutouts -- a genuine cutout is a HOLE in the copper and
     contains no pads.
@@ -4322,18 +4366,27 @@ def drop_pad_containing_cutouts(board_info, pads_by_net):
     KiCad mills the board along it and grades copper against it -- so dropping
     it outright blinded BOTH the router's edge keep-out and check_drc's edge
     measurement, and copper landed ON the milled line (kicad-cli "actual 0.0000
-    mm"). crkbd is a panelized split keyboard: its REAL 64-point outline nests
-    inside the panel frame, so containment called it a cutout and this rule then
-    deleted it -- the router laid 85 items of copper across the milled gap
-    between the two halves, none of which check_drc could see. Moving it to
+    mm"): crkbd's router laid 85 items of copper across the milled gap between
+    its two halves, none of which check_drc could see. Moving it to
     board_edge_contours keeps the #291 rescue (no pad is marked off-board) while
     restoring the edge clearance the geometry actually demands.
+
+    Only pads that CARRY COPPER are counted (#1607). An NPTH hole is itself a
+    hole, and nothing #291 protects (a routing endpoint) is lost when one
+    reads off-board. crkbd's 64-point ring is that milled gap -- the slot
+    between its two halves and the panel rails, enclosing no copper pad --
+    and it was dropped above, then reclassified, only because two NPTH
+    mouse-bite holes of its breakaway tabs (BT2, BT4) sit on its edge. So the
+    board's interior depended on where other parts sat: piled, the tabs left,
+    the gap became a hole again, and the locked USB-C J1 at an unchanged pose
+    read a 4.63 mm overhang into it there and 0.0 on the placed board.
     """
     cutouts = getattr(board_info, 'board_cutouts', None)
     if not cutouts or not pads_by_net:
         return
     pad_xy = [(p.global_x, p.global_y)
-              for pads in pads_by_net.values() for p in pads]
+              for pads in pads_by_net.values() for p in pads
+              if _pad_carries_copper_layer(p)]
     if not pad_xy:
         return
     kept, dropped = [], []
@@ -4799,10 +4852,12 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
         # the first one in the block, in any number spelling KiCad writes.
         _pose = footprint_pose(fp_text)
         if _pose is None:
-            # KiCad refuses to load such a file; the part is dropped with its
+            # KiCad refuses to load a malformed pose, and a scaled
+            # (transform ...) is not modelled; the part is dropped with its
             # pads, and that must not happen in silence.
             print("WARNING: footprint %s has an (at ...) that does not parse; "
-                  "the footprint and its pads are skipped" % _block_key,
+                  "the footprint and its pads are skipped (a scaled "
+                  "(transform ...) pose reads as one)" % _block_key,
                   file=sys.stderr)
             continue
         fp_x, fp_y, fp_rotation = _pose
@@ -6864,8 +6919,11 @@ def _iter_zone_spans(content: str):
     # footprint keep-outs; fill model over-credited across them). Yields
     # (body, in_footprint): >= 2 tabs (or a deep space indent in legacy
     # space-indented files) marks a footprint-nested zone. Footprint-zone
-    # polygon points are stored in BOARD coordinates, so no transform applies.
+    # polygon points are stored in BOARD coordinates, except under a
+    # `(transform ...)` pose, where they are in the footprint's own frame and
+    # are carried to the board here.
     zone_start_pattern = r'\r?\n([\t ]*)\(zone(?=[\s(])'
+    own_frame = None
     for start_match in re.finditer(zone_start_pattern, content):
         indent = start_match.group(1)
         in_footprint = indent.count('\t') >= 2 or \
@@ -6878,7 +6936,47 @@ def _iter_zone_spans(content: str):
         body_start = open_idx + len('(zone')
         if zone_end <= body_start:
             continue
-        yield open_idx, content[body_start:zone_end], in_footprint
+        body = content[body_start:zone_end]
+        if in_footprint and '(transform' in content:
+            if own_frame is None:
+                own_frame = _own_frame_footprints(content)
+            pose = next((p for s0, e0, p in own_frame if s0 <= open_idx < e0), None)
+            if pose is not None:
+                body = _zone_outline_to_board(body, pose)
+        yield open_idx, body, in_footprint
+
+
+def _own_frame_footprints(content: str):
+    """`[(start, end, pose)]` of the footprints with a `(transform ...)` pose,
+    whose zones KiCad stores in the footprint's own frame."""
+    out = []
+    for s, e, fp_text, _raw, _key in iter_footprint_blocks(content):
+        m = footprint_at_match(fp_text)
+        if m is not None and m.re is TRANSFORM_NODE_RE:
+            out.append((s, e, (float(m.group(1)), float(m.group(2)),
+                               float(m.group(3)) if m.group(3) else 0.0)))
+    return out
+
+
+_OUTLINE_POINT_RE = re.compile(
+    r'\((xy|start|mid|end)\s+(' + AT_NUM + r')\s+(' + AT_NUM + r')\s*\)')
+
+
+def _zone_outline_to_board(body: str, pose) -> str:
+    """`body` with its `(polygon ...)` points carried from the footprint frame
+    to the board. A `(filled_polygon ...)` is already in board coordinates."""
+    def to_board(p):
+        x, y = local_to_global(*pose, float(p.group(2)), float(p.group(3)))
+        return f"({p.group(1)} {_fmt_mm(x)} {_fmt_mm(y)})"
+
+    pieces = []
+    prev = 0
+    for m in re.finditer(r'\(polygon\b', body):
+        end = find_matching_paren(body, m.start())
+        pieces += [body[prev:m.start()],
+                   _OUTLINE_POINT_RE.sub(to_board, body[m.start():end])]
+        prev = end
+    return ''.join(pieces) + body[prev:]
 
 
 # --- Zone outlines as pcbnew loads them ---------------------------------------
@@ -8911,6 +9009,7 @@ def build_pcb_data_from_board(board, guide_layer: str = "User.1",
             # FP_SHAPE is the KiCad 6/7 footprint-shape class.
             fp_items = [item for fp in board.GetFootprints()
                         for item in fp.GraphicalItems()]
+            arc_shape = getattr(pcbnew, 'SHAPE_T_ARC', getattr(pcbnew, 'S_ARC', -1))
             for drawing in list(board.GetDrawings()) + fp_items:
                 if drawing.GetLayer() != edge_cuts_id:
                     continue
@@ -8921,6 +9020,21 @@ def build_pcb_data_from_board(board, guide_layer: str = "User.1",
                     bbox = drawing.GetBoundingBox()
                     w, h = bbox.GetWidth(), bbox.GetHeight()
                     if w <= 0 and h <= 0:
+                        continue
+                    if drawing.GetShape() == arc_shape:
+                        # #1700: the text parser's reading, chords and all, not
+                        # KiCad's exact extreme: the two fronts lay copper out
+                        # from these bounds. A chord end is on the centreline,
+                        # so there is no stroke to deflate.
+                        for seg in _arc_to_segments(
+                                (to_mm(drawing.GetStart().x), to_mm(drawing.GetStart().y)),
+                                (to_mm(drawing.GetArcMid().x), to_mm(drawing.GetArcMid().y)),
+                                (to_mm(drawing.GetEnd().x), to_mm(drawing.GetEnd().y)),
+                                chord_eps=BOUNDS_CHORD_EPS):
+                            for px, py in seg:
+                                bmin_x, bmax_x = min(bmin_x, px), max(bmax_x, px)
+                                bmin_y, bmax_y = min(bmin_y, py), max(bmax_y, py)
+                        found_edge = True
                         continue
                     x0, y0 = to_mm(bbox.GetX()), to_mm(bbox.GetY())
                     x1, y1 = to_mm(bbox.GetX() + w), to_mm(bbox.GetY() + h)
@@ -9876,8 +9990,9 @@ def _live_records(board):
 
 def _live_design_rules(board):
     """What PCBData.live_rules_provider answers for a live pcbnew board
-    (#1187, #1038): the design-settings rules the connection-width floor and
-    the obstacle map's copper-to-hole floor read, in mm -- the ones the board
+    (#1187, #1038): the design-settings rules the connection-width floor,
+    the obstacle map's copper-to-hole floor and the fill model's board-edge
+    gap (plane_fill_model.board_edge_rule) read, in mm -- the ones the board
     DECLARES (fix_kicad_drc_settings.live_declared_rules), so a project-less
     board at pcbnew's factory values answers what its file answers: nothing.
     None when the board declares none of them or has no design settings,
@@ -9885,7 +10000,8 @@ def _live_design_rules(board):
     try:
         from fix_kicad_drc_settings import live_declared_rules
         out = live_declared_rules(
-            board, ('min_track_width', 'min_connection', 'min_hole_clearance'))
+            board, ('min_track_width', 'min_connection', 'min_hole_clearance',
+                    'min_copper_edge_clearance'))
     except Exception:
         return None
     return out or None
@@ -9966,8 +10082,11 @@ def resync_live_copper(pcb_data, board) -> None:
     session (optimize_caps, the placement Apply, the user) carries its tab or
     antenna with it. Kept as built, they stayed where the part had been: a
     phantom obstacle there and nothing where the copper is.
-    Every memo derived from the old copper is dropped. Call
-    resolve_live_sense_branches afterwards, once pads and zones are current.
+    Every memo derived from the old copper is dropped, and so is the class map
+    a plane step published to the fill model: it belongs to that step's run, as
+    it does on the CLI, where the next step is a fresh process that holds none.
+    Call resolve_live_sense_branches afterwards, once pads and zones are
+    current.
     """
     import pcbnew
     get_layer_name = pcbnew_layer_maps(board)[2]
@@ -9985,6 +10104,8 @@ def resync_live_copper(pcb_data, board) -> None:
     # engine run marks the board it is handed.
     from rip_up_reroute import forget_input_copper
     forget_input_copper(pcb_data)
+    from plane_fill_model import set_board_net_clearances
+    set_board_net_clearances(pcb_data, None)
     for attr in LIVE_COPPER_MEMOS:
         vars(pcb_data).pop(attr, None)
 

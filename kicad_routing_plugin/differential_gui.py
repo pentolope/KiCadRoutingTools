@@ -529,6 +529,19 @@ class DifferentialTab(wx.Panel):
             "Gap as spacing, overriding Pair Width. 0 = off (use Pair Width).")
         param_grid.Add(self.diff_impedance, 0, wx.EXPAND)
 
+        # #1630: declare the ohms without changing the pair geometry; named
+        # after the engine param, so a plan step reaches it
+        param_grid.Add(wx.StaticText(self, label="Declare Only:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.impedance_declare_only = wx.CheckBox(self, label="")
+        self.impedance_declare_only.SetValue(False)
+        self.impedance_declare_only.SetToolTip(
+            "#1630: with Diff Impedance > 0, RECORD the target ohms for these nets and "
+            "change nothing else -- they route at the project's own pair width and gap, as "
+            "without Diff Impedance, and check_impedance.py grades the copper against "
+            "the ohms. For a pair class the project sized itself; a later step never "
+            "recomputes widths from the record. (CLI: --impedance-declare-only)")
+        param_grid.Add(self.impedance_declare_only, 0, wx.EXPAND)
+
         # Min turning radius
         param_grid.Add(wx.StaticText(self, label="Min Turn Radius (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
         r = defaults.PARAM_RANGES['diff_pair_min_turning_radius']
@@ -975,9 +988,9 @@ class DifferentialTab(wx.Panel):
             # cross-class max(A,B)) -- mirrors the single-ended route tab
             # (swig_gui). Passing an explicit map STOPS the engine's internal
             # always-cap auto-read, so honoring classes (Min Clearance override
-            # unchecked) actually reaches the router. Checking Min Clearance
-            # (== the CLI passing --clearance) caps each class at
-            # min(class, clearance); unchecked routes each class in full.
+            # unchecked) actually reaches the router. The Clearance ceiling box
+            # (== the CLI passing --clearance-ceiling) caps each class at
+            # min(class, ceiling), #1698; unchecked routes each class in full.
             # #755: the fallback is routing_defaults.CLEARANCE, not a bare
             # literal -- this seeds EVERY net's priced clearance and the
             # Min-Clearance cap below, so a 0.1 here under-prices the whole
@@ -1006,7 +1019,7 @@ class DifferentialTab(wx.Panel):
                 if config.get('clamp_netclasses', False):
                     from fab_tiers import cap_net_clearances  # #1561 discloses
                     net_clearances = cap_net_clearances(
-                        net_clearances, _diff_clearance,
+                        net_clearances, config['clearance_ceiling'],
                         net_names={n.net_id: n.name for n in self.pcb_data.nets.values()},
                         class_of=all_net_to_class)
             except Exception as e:
@@ -1030,6 +1043,7 @@ class DifferentialTab(wx.Panel):
                 layer_costs=config.get('layer_costs') or None,  # per-layer bias (#193); None -> all 1.0
                 track_width=config.get('diff_pair_width', defaults.DIFF_PAIR_WIDTH),
                 impedance=config.get('impedance'),  # when set, overrides per-layer width
+                impedance_declare_only=config.get('impedance_declare_only', False),
                 # #486: CPW-over-ground vs microstrip. route_diff.py passes
                 # args.coplanar_gap here; without it the shared Coplanar Gap
                 # control is honoured for single-ended routing but silently
@@ -1053,6 +1067,7 @@ class DifferentialTab(wx.Panel):
                 clearance=config.get('clearance', defaults.CLEARANCE),
                 via_size=config.get('via_size', defaults.VIA_SIZE),
                 via_drill=config.get('via_drill', defaults.VIA_DRILL),
+                via_from_class=config.get('via_from_class', False),
                 hole_to_hole_clearance=config.get('hole_to_hole_clearance',
                                                   defaults.HOLE_TO_HOLE_CLEARANCE),
                 board_edge_clearance=config.get('board_edge_clearance',
@@ -1367,36 +1382,9 @@ class DifferentialTab(wx.Panel):
         # from a prior routing pass stays on the live board.
         segs_to_remove = results_data.get('segments_to_remove') or []
         if segs_to_remove:
-            # Counted and width-preferring, as the CLI writer's strip
-            # (kicad_writer.match_stack_members, #1556): a set of span keys
-            # removed EVERY member of a same-span stack, the keeper too.
-            from kicad_writer import match_stack_members
-
-            def _span(a, b, layer, net):
-                return (frozenset((a, b)), layer, net)
-            targets = [(_span((round(s.start_x, POSITION_DECIMALS),
-                               round(s.start_y, POSITION_DECIMALS)),
-                              (round(s.end_x, POSITION_DECIMALS),
-                               round(s.end_y, POSITION_DECIMALS)),
-                              s.layer, s.net_id), s.width)
-                       for s in segs_to_remove]
-            tracks = [t for t in board.GetTracks()
-                      if t.Type() == pcbnew.PCB_TRACE_T]  # not vias / arcs
-            items = []
-            for track in tracks:
-                a = (round(pcbnew.ToMM(track.GetStart().x), POSITION_DECIMALS),
-                     round(pcbnew.ToMM(track.GetStart().y), POSITION_DECIMALS))
-                b = (round(pcbnew.ToMM(track.GetEnd().x), POSITION_DECIMALS),
-                     round(pcbnew.ToMM(track.GetEnd().y), POSITION_DECIMALS))
-                # Canonical layer name, as s.layer is: a renamed layer's
-                # display name matched no key and left ripped copper (#1056).
-                items.append((_span(a, b, id_to_name.get(track.GetLayer()),
-                                    track.GetNetCode()),
-                              pcbnew.ToMM(track.GetWidth())))
-            gone, _unmatched = match_stack_members(targets, items)
-            for i in sorted(gone):
-                board.RemoveNative(tracks[i])
-                tracks_removed += 1
+            # Counted and width-preferring, as the CLI writer's strip (#1556).
+            from .gui_utils import remove_listed_segments
+            tracks_removed += remove_listed_segments(board, pcbnew, segs_to_remove)
 
         # Remove original-board VIAS the pipeline flagged (#508 finding 11:
         # route_diff now returns vias_to_remove; swig_gui parity).
@@ -1618,6 +1606,7 @@ class DifferentialTab(wx.Panel):
             'diff_pair_width_from_class': not self.diff_pair_width_check.GetValue(),
             'diff_pair_gap_from_class': not self.diff_pair_gap_check.GetValue(),
             'impedance': self.diff_impedance.GetValue() or None,  # 0 = off
+            'impedance_declare_only': self.impedance_declare_only.GetValue(),
             'min_turning_radius': self.min_turning_radius.GetValue(),
             'max_setback_angle': self.max_setback_angle.GetValue(),
             'max_turn_angle': self.max_turn_angle.GetValue(),

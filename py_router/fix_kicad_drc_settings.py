@@ -497,6 +497,12 @@ def connection_width_floor(pcb_data, track_width=None, *,
     path = getattr(pcb_data, 'source_path', '') or ''
     provider = getattr(pcb_data, 'live_rules_provider', None)
     live = provider() if callable(provider) else None
+    # The rules this reader has always taken from the live board: one that
+    # declares only the edge clearance (which the fill model reads from the
+    # same channel) still sends it to the file.
+    live = {k: v for k, v in (live or {}).items()
+            if k in ('min_track_width', 'min_connection',
+                     'min_hole_clearance')} or None
     if live is not None:
         floor = web_min_connection(
             {'board': {'design_settings': {'rules': dict(live)}}})
@@ -1310,6 +1316,71 @@ def count_below_floors(pcb_path: str, floors: dict) -> dict:
     return {k: sum(1 for v in values[k] if v < f - _FLOOR_EPS)
             for k, f in floors.items()
             if values.get(k) and isinstance(f, (int, float))}
+
+
+#: FAB_FLOOR_KEYS_MEASURABLE key -> the .kicad_dru constraint that can set it
+#: for one object (#1627)
+_RULE_KIND = {"min_track_width": "track_width", "min_via_diameter": "via_diameter",
+              "min_via_annular_width": "annular_width", "min_via_drill": "hole_size",
+              "min_through_hole_diameter": "hole_size"}
+
+
+def size_values_below_authored(pcb_path: str, floors: dict, rules_from: str) -> dict:
+    """#1627: every object of the board at ``pcb_path`` below the floor that
+    binds IT in the authored project beside ``rules_from``:
+    ``{key: {'below': [mm, ...], 'held_by_rule': n, 'rules': [names]}}``.
+
+    The floor of an object is the authored Board Setup value in ``floors``,
+    unless a rule of the AUTHORED ``.kicad_dru`` sets its minimum -- resolved
+    through ``design_rules`` exactly as check_drc resolves a size floor (the
+    net's classes from the authored project, KiCad's order, last match wins),
+    at KiCad's value. ``held_by_rule`` counts the objects under the Board
+    Setup value that such a rule allows; ``rules`` names those rules. The
+    objects are :func:`board_size_values`'. {} when the board cannot be
+    parsed."""
+    if not os.path.isfile(pcb_path):
+        return {}
+    try:
+        from kicad_parser import parse_kicad_pcb
+        from design_rules import DesignRules
+        pcb = parse_kicad_pcb(pcb_path)
+        dr = DesignRules.from_project(pcb, rules_from)
+    except Exception as e:  # pragma: no cover - parser is robust, but stay safe
+        print(f"warning: could not resolve authored size floors ({e})", file=sys.stderr)
+        return {}
+    objs = {
+        "min_track_width": [(s.width, dr.item_for_net(s.net_id, "track", s.layer), s.layer)
+                            for s in pcb.segments if s.width and s.width > 0
+                            and not getattr(s, "graphic", False)],
+        "min_via_diameter": [(v.size, dr.item_for_net(v.net_id, "via"), None)
+                             for v in pcb.vias if v.size],
+        "min_via_drill": [(v.drill, dr.item_for_net(v.net_id, "via"), None)
+                          for v in pcb.vias if v.drill],
+        "min_via_annular_width": [((v.size - v.drill) / 2.0, dr.item_for_net(v.net_id, "via"),
+                                   None) for v in pcb.vias
+                                  if v.size and v.drill and v.size > v.drill],
+    }
+    holes = [(v.drill, dr.item_for_net(v.net_id, "via"), None) for v in pcb.vias if v.drill]
+    for fp in pcb.footprints.values():
+        for pad in fp.pads:
+            if getattr(pad, "drill", 0):
+                holes.append((pad.drill, dr.item_for_pad(pad), None))
+    objs["min_through_hole_diameter"] = holes
+    out = {}
+    for key, f in floors.items():
+        if key not in objs or not objs[key] or not isinstance(f, (int, float)):
+            continue
+        below, held, names = [], 0, set()
+        for val, item, layer in objs[key]:
+            c = dr.resolve(_RULE_KIND[key], item, None, layer)
+            floor = c.kicad_min if (c.min_rule and c.kicad_min is not None) else f
+            if val < floor - _FLOOR_EPS:
+                below.append(val)
+            elif val < f - _FLOOR_EPS:
+                held += 1
+                names.add(c.min_rule)
+        out[key] = {"below": below, "held_by_rule": held, "rules": sorted(names)}
+    return out
 
 
 def scan_board_minima(pcb_path: str):

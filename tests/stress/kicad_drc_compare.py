@@ -52,6 +52,16 @@ carry them. Reported as kicad_track_dangling with the net and position, never
 matched against check_drc and never part of the CONSISTENT verdict or the exit
 code.
 
+Its own channel too (#1628): KiCad `clearance` items on two pads of ONE
+footprint closer than their clearance without touching. check_drc measures
+them and does not grade them (library geometry, #1306), and publishes each
+PAIR as an accepted `own-footprint-gap` row. KiCad lists the pair once per
+copper layer the two pads share (#1675), so one row answers for one item on an
+SMD pair and for two identical items on a through-hole pair of a 2-layer board.
+Every such item is dropped and counted as kicad_library_pad_gaps (KiCad items;
+checkdrc_library_pad_gaps counts pairs), not listed as a check_drc false
+negative.
+
 Usage:
   python3 tests/stress/kicad_drc_compare.py <board.kicad_pcb> [...]
   python3 tests/stress/kicad_drc_compare.py --wave <wave_dir>   # summary.json
@@ -175,8 +185,8 @@ KICAD_THERMAL_TYPES = {"starved_thermal"}
 KICAD_DANGLING_TYPES = {"track_dangling"}
 # KiCad 10 spells a through-hole pad "PTH pad 7 [GND] of JP1" (lower-case
 # `pad`, #1406) and an SMD one "Pad 1 [GND] of BUS1 on bottom_copper".
-_THERMAL_PAD_RE = re.compile(
-    r"(?:\b(?:N?PTH|SMD)\s+)?\b[Pp]ad\s+(\S+)\s+\[[^\]]*\]\s+of\s+(\S+)")
+_PAD_ITEM_RE = re.compile(
+    r"(?:\b(?:N?PTH|SMD)\s+)?\b[Pp]ad\s+(\S*)\s*\[[^\]]*\]\s+of\s+(\S+)")
 
 #: #1390: the error types of KiCad's LAST report that no channel of this
 #: comparator classifies ({type: count}). A type outside the copper, web,
@@ -316,13 +326,13 @@ def parse_kicad_report(data):
                "desc": v.get("description", ""),
                "kinds": tuple(sorted(kinds)),
                "graphic_owners": owners}
+        pad_items = [(m, i) for i in v.get("items", [])
+                     for m in [_PAD_ITEM_RE.search(
+                         i.get("description", "") or "")] if m]
+        # The pads the item names, as REF.PAD: for a thermal item the starved
+        # pad a reader goes to fix, for a clearance item its two participants.
+        row["pads"] = tuple(f"{m.group(2)}.{m.group(1)}" for m, _i in pad_items)
         if vtype in KICAD_THERMAL_TYPES:
-            # The starved PAD, as REF.PAD: what a reader goes to fix.
-            pad_items = [(m, i) for i in v.get("items", [])
-                         for m in [_THERMAL_PAD_RE.search(
-                             i.get("description", "") or "")] if m]
-            row["pads"] = tuple(f"{m.group(2)}.{m.group(1)}"
-                                for m, _i in pad_items)
             # At the PAD, not the zone's anchor (one point for every pad
             # the pour starves).
             _pp = pad_items[0][1].get("pos") if pad_items else None
@@ -371,6 +381,11 @@ def run_check_drc(board: str, clearance: float = None, netclasses: bool = True,
     # check_drc's accepted-edge publications (pad-covered, quantization-margin,
     # #448 npth-slot) never happen, so the reconciler can't subtract them.
     kw["respect_edge_severity"] = False
+    # #1626: check_drc grades at the board's own severities, and _staged_copy
+    # stages every copper class at "error" on the kicad-cli side (#526). Grade
+    # this side at the same staged severities; a .kicad_dru rule's own
+    # (severity ...) is left as authored on both sides.
+    kw["severity_overrides"] = {k: "error" for k in KICAD_COPPER_TYPES}
     try:
         from fix_kicad_drc_settings import read_project_edge_clearance
         edge = read_project_edge_clearance(board)
@@ -435,6 +450,14 @@ def run_check_drc(board: str, clearance: float = None, netclasses: bool = True,
         # on as a false negative. Carry the flag through for the reconciler.
         if v.get("accepted"):
             item["accepted"] = v["accepted"]
+        if v.get("pad_loc2"):
+            # #1628: a pad pair is anchored by KiCad on either pad
+            item["pos2"] = (float(v["pad_loc2"][0]), float(v["pad_loc2"][1]))
+        if v.get("accepted") == "own-footprint-gap":
+            # #1675: which two pads, as KiCad spells them: it has no `~2` for
+            # the second block of a reference one file uses twice (#726)
+            item["pad_pair"] = frozenset(re.sub(r"~\d+(?=\.)", "", v[k], count=1)
+                                         for k in ("pad_ref", "pad_ref2"))
         if v.get("owner"):
             item["owner"] = v["owner"]     # #995 footprint-own-copper
         # The part whose graphic copper the row names ("Polygon(U2)"), so
@@ -706,6 +729,43 @@ def _drop_kicad_own_copper(kicad, cd_own):
                 dropped += 1
                 continue
         keep.append(kv)
+    return keep, dropped
+
+
+#: how far KiCad's anchor for a pad pair may sit from either pad (#1628): it
+#: anchors the item on one of the two pads, and both belong to one part
+LIBRARY_GAP_MATCH_RADIUS_MM = 2.0
+
+
+def _drop_kicad_library_gaps(kicad, cd_gaps):
+    """Drop the KiCad `clearance` items check_drc published as
+    `own-footprint-gap` (#1628): two pads of ONE footprint on different nets,
+    closer than their clearance without touching. Library geometry no step
+    changes, so check_drc does not grade them (#1306) -- but it measured them,
+    so they are not its false negatives: they get their own channel.
+
+    A row publishes a PAIR, and KiCad lists a pair once per copper layer the
+    two pads share (#1675): one item for an SMD pair, two identical ones for a
+    through-hole pair on 2 layers, four on 4. So a row keeps matching, however
+    many KiCad lists, and n_dropped counts KiCad items, not rows. Which is why
+    an item must NAME the row's two pads: a track's clearance to one of those
+    pads, or another part's pad, on the same net pair beside them is a finding
+    of its own and stays. The anchor test separates the two blocks of a
+    reference one file uses twice. Returns (remaining_kicad, n_dropped)."""
+    if not cd_gaps:
+        return kicad, 0
+    keep, dropped = [], 0
+    for kv in kicad:
+        if kv.get("type") == "clearance" and any(
+                c["nets"] == kv.get("nets")
+                and c.get("pad_pair") == frozenset(kv.get("pads") or ())
+                and any(p and math.hypot(kv["pos"][0] - p[0], kv["pos"][1] - p[1])
+                        <= LIBRARY_GAP_MATCH_RADIUS_MM
+                        for p in (c.get("pos"), c.get("pos2")))
+                for c in cd_gaps):
+            dropped += 1
+        else:
+            keep.append(kv)
     return keep, dropped
 
 
@@ -1121,6 +1181,10 @@ def compare_board_data(board: str, label: str = None, clearance: float = None,
     cd_own_pads_pre = sum(1 for c in cd
                           if c.get("accepted") == "inherited-own-pad-contact")
     cd = [c for c in cd if c.get("accepted") != "inherited-own-pad-contact"]
+    # #1628: one footprint's pads closer than their clearance -- measured by
+    # check_drc and not graded, its own channel (never a false negative)
+    cd_gaps = [c for c in cd if c.get("accepted") == "own-footprint-gap"]
+    cd = [c for c in cd if c.get("accepted") != "own-footprint-gap"]
     cd_accepted = [c for c in cd if c.get("accepted")]
     cd = [c for c in cd if not c.get("accepted")]
     # Symmetric baseline subtraction (#405): drop the input's own check_drc
@@ -1177,6 +1241,7 @@ def compare_board_data(board: str, label: str = None, clearance: float = None,
         kicad_intentional += k_tie
         checkdrc_intentional += c_tie
     kicad, kicad_own = _drop_kicad_own_copper(kicad, cd_own)
+    kicad, kicad_gaps = _drop_kicad_library_gaps(kicad, cd_gaps)
     matched, kicad_only, cd_only = match(kicad, cd)
     # Part B: collapse the board-edge anchor double-count (same edge violation
     # anchored differently by each engine). One-sided edge divergence survives.
@@ -1216,6 +1281,10 @@ def compare_board_data(board: str, label: str = None, clearance: float = None,
             # and the check_drc contacts that accepted them
             "kicad_own_copper": kicad_own,
             "checkdrc_own_copper": len(cd_own),
+            # #1628: KiCad clearance items on one footprint's own pad pairs,
+            # and the gaps check_drc measured and published (not graded)
+            "kicad_library_pad_gaps": kicad_gaps,
+            "checkdrc_library_pad_gaps": len(cd_gaps),
             "matched": n_matched, "kicad_only": len(kicad_only),
             "checkdrc_only": len(cd_only),
             "pairs_both": len(kpairs & cpairs),
@@ -1251,6 +1320,7 @@ def compare_board_data(board: str, label: str = None, clearance: float = None,
 _SUMMARY_KEYS = ("board", "kicad", "kicad_preexisting", "check_drc",
                  "kicad_intentional_edge", "checkdrc_intentional_edge",
                  "kicad_own_copper", "checkdrc_own_copper",
+                 "kicad_library_pad_gaps", "checkdrc_library_pad_gaps",
                  "matched", "kicad_only", "checkdrc_only",
                  "pairs_kicad_only", "pairs_checkdrc_only",
                  "kicad_connection_width", "connection_width_min",
@@ -1277,6 +1347,12 @@ def compare_board(board: str, label: str = None, clearance: float = None,
     if data.get("kicad_own_copper") or data.get("checkdrc_own_copper"):
         ie_note += (f" [#995: -{data.get('kicad_own_copper', 0)} kicad / "
                     f"-{data.get('checkdrc_own_copper', 0)} check_drc footprint own copper]")
+    if data.get("kicad_library_pad_gaps") or data.get("checkdrc_library_pad_gaps"):
+        ie_note += (f" [#1628: -{data.get('kicad_library_pad_gaps', 0)} kicad "
+                    f"item(s) / -{data.get('checkdrc_library_pad_gaps', 0)} "
+                    f"check_drc pair(s) library pad gaps (one footprint's "
+                    f"pads, not graded; KiCad lists a pair per copper layer "
+                    f"they share)]")
     # #406 min copper web: separate class, not matched against check_drc.
     cw = data.get("kicad_connection_width")
     cw_min = data.get("connection_width_min")

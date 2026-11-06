@@ -795,9 +795,10 @@ This helps visualize the routing structure without affecting the actual routed c
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--diff-pair-gap` | board class, else 0.101 | Gap between P and N traces (mm). Omitted (the GUI: override unchecked), each pair takes its net class's `diff_pair_gap` and the call the Default class's; a class that leaves it unset inherits Default's, and a 0 is unset, falling back to the class clearance (the same rule makes an omitted `--track-width` the class `diff_pair_width`, else the class track width). Raised, never lowered, to the clearance (#441), the pair's net class (#530) and any `.kicad_dru` clearance rule that binds the pair on a layer it routes on (#1145): KiCad grades P against N as two nets. A pair a coupled-pair rule grades -- a clearance rule whose condition ANDs in `AB.isCoupledDiffPair()`, e.g. `AB.isCoupledDiffPair() && A.hasNetclass('USB')` -- keeps the gap asked for, floored at that rule alone (#1293). So does a pair whose net class has a `diff_pair_gap` below its clearance -- KiCad then grades P against N at that gap (its implicit "netclass '...' (diff pair)" rule, floored at the board minimum clearance; #1542) -- and a pair a class-scoped clearance rule binds, e.g. `A.NetClass == 'CSI' && B.NetClass == 'CSI'` (floored at the board minimum clearance too, which KiCad's coupling check grades the gap at; #1526). A "keep pairs apart" rule (`!AB.isCoupledDiffPair()`) never raises it: KiCad exempts a pair's own partner, by name (#1295) |
+| `--diff-pair-gap` | board class, else 0.101 | Gap between P and N traces (mm). Omitted (the GUI: override unchecked), each pair takes its net class's `diff_pair_gap` and the call the Default class's; a class that leaves it unset inherits Default's, and a 0 is unset, falling back to the class clearance (the same rule makes an omitted `--track-width` the class `diff_pair_width`, else the class track width). Raised, never lowered, to the clearance (#441), the pair's net class (#530) and any `.kicad_dru` clearance rule that binds the pair on a layer it routes on (#1145): KiCad grades P against N as two nets. A pair a coupled-pair rule grades -- a clearance rule whose condition ANDs in `AB.isCoupledDiffPair()`, e.g. `AB.isCoupledDiffPair() && A.hasNetclass('USB')` -- keeps the gap asked for, floored at that rule alone (#1293). So does a pair whose net class has a `diff_pair_gap` below its clearance -- KiCad then grades P against N at that gap (its implicit "netclass '...' (diff pair)" rule, floored at the board minimum clearance; #1542) -- and a pair a class-scoped clearance rule binds, e.g. `A.NetClass == 'CSI' && B.NetClass == 'CSI'` (floored at the board minimum clearance too, which KiCad's coupling check grades the gap at; #1526). Under `--escalation board --no-fix-drc-settings` such a rule still floors at the board minimum, not at the Default class the clearance base descends to there (#1630), and the post-route graze passes price P against N at the same rule, so the cleanup no longer moves the pair off its gap. A "keep pairs apart" rule (`!AB.isCoupledDiffPair()`) never raises it: KiCad exempts a pair's own partner, by name (#1295) |
 | `--track-width` | board class, else 0.3 | Each leg's width (mm). Omitted, the net class's `diff_pair_width` (see above). With `--impedance` it is the min-width floor and the no-stackup fallback |
-| `--impedance` | - | Target differential impedance (ohms, e.g. 100): solves each layer's leg width from the board stackup at `--diff-pair-gap` |
+| `--impedance` | - | Target differential impedance (ohms, e.g. 100): solves each layer's leg width from the board stackup at the gap the pairs are BUILT at -- `--diff-pair-gap` after every floor above, or, with it omitted, each pair's own class gap -- and records that gap with the declaration (#1630). Pairs of one call built at different gaps get one width per layer, which is said; route each gap in its own call. `check_impedance.py` reads the declared ohms back off the shipped width and P/N gap (disclosure) |
+| `--impedance-declare-only` | off | With `--impedance`: record the target ohms and the gap each pair is built at (a `declare_only` net_impedance record) and change nothing else -- the pairs route as without `--impedance`, at their class geometry, and `check_impedance.py` grades the shipped width and P/N gap against the ohms. No later step recomputes widths from such a record. For a pair class the project solved itself (#1630); the Differential tab's Declare Only box |
 | `--coplanar-gap` | - | Declares that every pair in the call runs through a same-layer ground pour this far (mm) from each trace's outer edge, so outer layers use the coplanar-waveguide model (requires `--impedance`; see [configuration.md](configuration.md#differential-pair-options-route_diffpy-only)) |
 | `--diff-pair-centerline-setback` | 2x P-N dist | Distance in front of stubs to start centerline (mm) |
 | `--max-setback-angle` | 45 | Half-angle of the setback angle scan (degrees) |
@@ -873,9 +874,13 @@ When enabled:
    escape or seam re-ask returns no stub lengths, and on imx6ulz DQS0 the result
    read P 12.00 < N 13.08 while the board had P 21.31 > N 16.82. A member whose
    pads are not joined yet falls back to the result's own sums (segments plus
-   recorded stub lengths), as before. It is a path measure, not KiCad's: a
-   track that ends inside a via off its centre is charged differently by
-   KiCad's skew DRC, by up to a via barrel (#1583; step 6 reports what ships)
+   recorded stub lengths), as before. The copper kept is measured as KiCad's
+   skew DRC measures it (#1623): copper inside a pad that the run carries is
+   charged, a run ending at a pad's anchor is charged from the pad's outline,
+   and a via the stackup between the layers it joins. A track that ends inside
+   a via is charged from where it enters the via straight to the centre, the
+   line KiCad's skew DRC measures and the copper the post-route cleanup's
+   via-centre bridge leaves (#1583; step 6 reports what ships)
 2. If the difference exceeds `--length-match-tolerance` (default 0.1mm), meanders are added to the shorter track. When the first bump count falls short because foreign copper beside the leg clamps its bumps, more bumps are added at a lower amplitude (never above `--meander-amplitude`) before the pair is reported `meanders-ran-out` (#1583)
 3. The meanders are placed with clearance checking against the other track of the pair
 4. For polarity-swapped pairs, stub lengths are correctly recalculated using post-swap assignments (P gets P_source + N_target stubs, N gets N_source + P_target stubs) -- in the fallback; the board copper already carries the swap
@@ -898,6 +903,16 @@ When enabled:
    joined). `matcher_status` / `matcher_delta_mm` keep what the matcher reported;
    `delta_before_mm` stays the matcher's estimate. The `Intra-pair (shipped
    copper)` console line prints the regraded verdict
+7. **A pair the cleanup moved out of its tolerance is matched again** (#1622),
+   before the regrade, on the copper the cleanup left
+   (`length_matching.rematch_intra_pairs_on_shipped_copper`): a graze re-bend
+   took 1.378 mm out of a member matched to 0.089 mm, and the pair shipped at
+   1.466 mm against 0.127 mm. Every pair with a single coupled result whose
+   shipped skew (`diff_pair_skew`) is over its tolerance is meandered once more,
+   and the new copper is kept only when that skew goes down; otherwise the
+   copper is left exactly as the cleanup left it. The record's `rematch` says
+   what happened (`skew_before_mm`, `skew_after_mm`, `kept`), and on a kept one
+   `matcher_status` / `matcher_delta_mm` are the second pass's
 
 ```bash
 # Enable intra-pair matching

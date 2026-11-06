@@ -78,7 +78,7 @@ def _count_copper_layers(content):
     return len(re.findall(r'\(\d+\s+"[^"]*\.Cu"', content)) or 0
 
 
-def effective_floors(constraints, copper_layers):
+def effective_floors(constraints, copper_layers, via_rule_floors=None):
     """Combine the board's own Constraints with the JLC fab floor.
 
     Returns the values the tools should actually use:
@@ -109,10 +109,17 @@ def effective_floors(constraints, copper_layers):
     # tier's via meets). That changes nothing on a board whose working via
     # already met both: over the corpus, the 58 of 437 projects it moves are
     # exactly those whose old suggestion failed their own annular rule.
-    via_drill = floor(constraints.get('min_through_hole_diameter'), fab['via_drill'])
-    via_ring = max(constraints.get('min_via_annular_width') or 0.0,
+    # #1676: a .kicad_dru rule on a via (``via_rule_floors``,
+    # DesignRules.via_floors) REPLACES the Board Setup minimum of its kind, as
+    # KiCad resolves it, so the working via is the smallest one that board's
+    # rule file accepts.
+    _vr = via_rule_floors or {}
+    via_drill = floor(_vr.get('via_drill', constraints.get('min_through_hole_diameter')),
+                      fab['via_drill'])
+    via_ring = max(_vr.get('annular', constraints.get('min_via_annular_width')) or 0.0,
                    (fmin['via_diameter'] - fmin['via_drill']) / 2.0)
-    via_dia = floor(constraints.get('min_via_diameter'), fab['via_diameter'])
+    via_dia = floor(_vr.get('via_diameter', constraints.get('min_via_diameter')),
+                    fab['via_diameter'])
     via_held = round(via_drill + 2.0 * via_ring, 4)
 
     return {
@@ -154,6 +161,26 @@ def effective_floors(constraints, copper_layers):
         'drc_edge_clearance':   floor(constraints.get('min_copper_edge_clearance'), fmin['board_edge']),
         'fab': fab,
     }
+
+
+_VIA_FLOORS_READING = set()
+
+
+def _board_via_rule_floors(pcb_path):
+    """`DesignRules.via_floors` of the board's `.kicad_dru`, {} without one.
+    DesignRules itself reads a project with no classes through
+    read_design_rules, whose own answer then needs no floors."""
+    if pcb_path in _VIA_FLOORS_READING \
+            or not os.path.isfile(os.path.splitext(pcb_path)[0] + '.kicad_dru'):
+        return {}
+    _VIA_FLOORS_READING.add(pcb_path)
+    try:
+        from design_rules import DesignRules
+        return DesignRules.from_project(None, pcb_path).via_floors(0)
+    except (OSError, ValueError):
+        return {}
+    finally:
+        _VIA_FLOORS_READING.discard(pcb_path)
 
 
 def read_design_rules(pcb_path):
@@ -250,7 +277,8 @@ def read_design_rules(pcb_path):
 
     return {'classes': classes, 'assignments': assignments, 'patterns': patterns,
             'constraints': constraints, 'copper_layers': copper_layers,
-            'effective': effective_floors(constraints, copper_layers),
+            'effective': effective_floors(constraints, copper_layers,
+                                          _board_via_rule_floors(pcb_path)),
             'source': source}
 
 
@@ -852,6 +880,34 @@ def net_clearance_map(pcb_path, net_names, rules=None):
     return out
 
 
+def _print_relaxing_dru_rules(pcb_path, constraints):
+    """#1649: the sibling `.kicad_dru` rules that relax a Board Constraint
+    printed above, for the nets (or items) their condition names. A size
+    below the board minimum is legal only there, so it belongs on a step of
+    its own whose --nets are those nets."""
+    dru = os.path.splitext(pcb_path)[0] + '.kicad_dru'
+    if not os.path.isfile(dru):
+        return
+    try:
+        from design_rules import parse_dru, relaxing_rules
+        rows = relaxing_rules(parse_dru(open(dru, encoding='utf-8').read())[0], constraints)
+    except Exception as e:                                     # noqa: BLE001
+        print(f"  (.kicad_dru rules not read: {e})")
+        return
+    if not rows:
+        return
+    print(f"Rules in {os.path.basename(dru)} that RELAX a Board Constraint above, for "
+          f"the items their condition names only:")
+    for r in rows:
+        where = (f" if {r['condition']}" if r['condition'] else ' (no condition: every item)')
+        layer = f" on {r['layer']}" if r['layer'] else ''
+        print(f"  - '{r['rule']}': {r['kind']} min {r['min']:g} "
+              f"(board {r['board_key']} {r['board']:g}){layer}{where}")
+    print("  A size below the board minimum is legal only on those items: request it on a "
+          "step of its own whose --nets are the nets the rule names; on any other net it "
+          "ships below the board minimum (check_drc grades it).")
+
+
 def print_design_rules(pcb_path):
     """Human + skill-friendly dump of the board's net-class design rules."""
     dr = read_design_rules(pcb_path)
@@ -882,6 +938,7 @@ def print_design_rules(pcb_path):
     if dr['constraints']:
         cons = "  ".join(f"{k}={v}" for k, v in dr['constraints'].items())
         print(f"\nBoard Constraints (DRC-enforced minima, {dr['copper_layers']}-layer): {cons}")
+        _print_relaxing_dru_rules(pcb_path, dr['constraints'])
     _tier, _ovr = get_default_fab_tier()
     _tier_desc = f"{_tier}" + (f" + overrides({','.join(sorted(_ovr))})" if _ovr else "")
     print(f"Manufacturing floor (active fab tier: {_tier_desc}; Constraint or JLC fab "

@@ -33,7 +33,9 @@ named after a hash of everything it ships, so two runs over the same tree share
 one deployed app and a changed tree gets its own; it is deployed when missing
 and STOPPED once nothing spawned on it is pending. Rerunning the same command
 resumes: finished routes are skipped and pending calls collected, never
-respawned (a call outlives this client, so a dropped link loses nothing).
+respawned (a call outlives this client, so a dropped link loses nothing). A
+pending call is matched by its inputs as well as its name, so two arms routed
+at once under one --prefix never collect each other's routes.
 
 Modal routes run on Linux, KiCad's image python and its KiCad (modal_app.py):
 compare them only with Modal routes -- route the baseline arm here too.
@@ -128,7 +130,7 @@ def shipped(src, corpus, boards):
     for root, names in ((src, tree), (corpus, files)):
         for f in names:
             h.update(f.encode() + b'\0' + open(os.path.join(root, f), 'rb').read())
-    for f in ('route_placed.py', 'modal_app.py'):
+    for f in ('route_placed.py', 'modal_app.py', 'prove_models.py'):
         h.update(open(os.path.join(HERE, f), 'rb').read())
     h.update(os.environ.get('KRT_PAB_KICAD_IMAGE', '').encode())
     return tree, files, f'krt-pab-{h.hexdigest()[:10]}'
@@ -143,7 +145,8 @@ def deploy(app, src, corpus, tree, files):
             dst = os.path.join(sd, sub, f)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(os.path.join(root, f), dst)
-    shutil.copy2(os.path.join(HERE, 'route_placed.py'), os.path.join(sd, 'route_placed.py'))
+    for f in ('route_placed.py', 'prove_models.py'):
+        shutil.copy2(os.path.join(HERE, f), os.path.join(sd, f))
     sha = subprocess.run(['git', '-C', src, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(['git', '-C', src, 'status', '--porcelain'], capture_output=True, text=True).stdout.strip()
     # Forward slashes: the string rides into the image's env, where Modal
@@ -233,10 +236,6 @@ def main(argv=None):
             pend.clear()                    # a stopped app's calls are gone with it
             deploy(app, src, a.corpus, tree, files)
         for key, s, board, setn, name in jobs:
-            old = next((c for c, n in pend.items() if n == name), None)
-            if old:
-                mine[old] = (key, s, name)
-                continue
             files_in = {}
             # every sibling copy_board carries: the .kicad_dru's rules and the
             # brief's keep_away reach the route step (#498, #1253)
@@ -244,9 +243,23 @@ def main(argv=None):
                 p = os.path.join(placed_dir, key, f's{s}{ext}')
                 if os.path.exists(p):
                     files_in['placed' + ext] = open(p, 'rb').read()
+            quick = 0 if a.full else a.quick
+            # The call's name carries a digest of its inputs: a pending call
+            # is collected rather than respawned by NAME, so two arms routed
+            # at once under one prefix would otherwise collect each other's
+            # routes. The results directory keeps the plain name.
+            h = hashlib.sha256()
+            for k in sorted(files_in):
+                h.update(k.encode() + b'\0' + files_in[k])
+            h.update(f'{board}\0{setn}\0{quick}'.encode())
+            call_name = f'{name}_{h.hexdigest()[:10]}'
+            old = next((c for c, n in pend.items() if n == call_name), None)
+            if old:
+                mine[old] = (key, s, name)
+                continue
             fn = modal.Function.from_name(app, 'route')
-            call = retry(lambda: fn.spawn(name, board, setn, files_in, 0 if a.full else a.quick), f'spawn {name}')
-            pend[call.object_id] = name
+            call = retry(lambda: fn.spawn(call_name, board, setn, files_in, quick), f'spawn {name}')
+            pend[call.object_id] = call_name
             mine[call.object_id] = (key, s, name)
     print(f'{len(mine)} route(s) on {app}', flush=True)
     left = dict(mine)

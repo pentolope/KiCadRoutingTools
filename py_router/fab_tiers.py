@@ -193,6 +193,15 @@ _escalation_warned = set()
 # vocabulary, only the keys the board declares > 0), set per run the same way.
 _ESCALATION = DEFAULT_ESCALATION
 _BOARD_FLOORS = {}
+# #1630: the clearance floor of a RULE- or CLASS-set clearance when #1262
+# raised the base floor to the Default class (``--escalation board`` with the
+# writeback off): the board minimum KiCad grades such a clearance at, which
+# the Default class does not bind. None = no such raise this run.
+_BOARD_RULE_CLEARANCE = None
+
+#: The key :func:`floor_board_clearance_at_class` carries that floor under in
+#: the floors dict it returns; :func:`set_escalation_policy` reads it off.
+RULE_CLEARANCE_KEY = 'rule_clearance'
 
 # The per-run LEDGER: what went below a requested size, where, and by how much.
 _LEDGER = {'narrowed': [], 'fab_tier': [], 'ceiling_lowered': {}}
@@ -216,8 +225,10 @@ def get_default_fab_tier():
 def set_escalation_policy(policy, board_floors=None):
     """Set the process-wide escalation policy and the board's declared floors
     (a FLOOR_KEYS dict, e.g. from ``design_rules.board_floor_dict``). Resets
-    the per-run ledger: this marks the start of a run."""
-    global _ESCALATION, _BOARD_FLOORS
+    the per-run ledger: this marks the start of a run. A
+    :data:`RULE_CLEARANCE_KEY` entry is the floor of rule- and class-set
+    clearances (:func:`rule_fab_floors`, #1630)."""
+    global _ESCALATION, _BOARD_FLOORS, _BOARD_RULE_CLEARANCE
     policy = policy or DEFAULT_ESCALATION
     if policy not in ESCALATION_POLICIES:
         raise ValueError(f"unknown escalation policy {policy!r} "
@@ -225,13 +236,18 @@ def set_escalation_policy(policy, board_floors=None):
     _ESCALATION = policy
     _BOARD_FLOORS = {k: float(v) for k, v in (board_floors or {}).items()
                      if k in FLOOR_KEYS and v is not None and float(v) > 0}
+    rc = (board_floors or {}).get(RULE_CLEARANCE_KEY)
+    _BOARD_RULE_CLEARANCE = float(rc) if rc is not None else None
     reset_ledger()
 
 
 def get_escalation_policy():
     """``(policy, board_floors_dict)`` -- pass back to
     ``set_escalation_policy(*prev)`` to restore."""
-    return (_ESCALATION, dict(_BOARD_FLOORS))
+    floors = dict(_BOARD_FLOORS)
+    if _BOARD_RULE_CLEARANCE is not None:
+        floors[RULE_CLEARANCE_KEY] = _BOARD_RULE_CLEARANCE
+    return (_ESCALATION, floors)
 
 
 def may_narrow():
@@ -374,7 +390,11 @@ def floor_board_clearance_at_class(floors, graded_clearance,
     Only the clearance BASE moves: non-Default nets are floored at their own
     class under every policy (``GridRouteConfig.rule_floors``), and a
     ``.kicad_dru`` layer rule or a pad clearance override replaces the base
-    where it applies, at its usual precedence. Returns the new floors dict."""
+    where it applies, at its usual precedence. So the floor those are raised
+    to stays the one before the raise -- the board minimum KiCad grades
+    them at -- carried as ``floors[RULE_CLEARANCE_KEY]`` for
+    :func:`rule_fab_floors` (#1630: a pair rule at 0.11 under a 0.15 Default
+    class was built at 0.15). Returns the new floors dict."""
     out = dict(floors or {})
     if not isinstance(graded_clearance, (int, float)) or graded_clearance <= 0:
         return out
@@ -390,6 +410,7 @@ def floor_board_clearance_at_class(floors, graded_clearance,
     if prev is not None and abs(prev - target) <= 1e-9:
         return out
     out['clearance'] = target
+    out[RULE_CLEARANCE_KEY] = float(prev) if prev is not None else 0.0
     if announce:
         if below:
             print(f"  --escalation board, project writeback off: the run's "
@@ -640,6 +661,32 @@ def _apply_board_floors(rungs, floors=None):
     return out
 
 
+#: #1676: the `.kicad_dru` via minimums that bind a via of no particular net
+#: (`DesignRules.via_floors(0)`), set per board at the chokepoint every engine
+#: passes through (design_rules._install_rule_floors), for the descent sites
+#: with no net in hand.
+_RULE_VIA_FLOORS = {}
+
+
+def set_rule_via_floors(floors):
+    """Install this board's `_RULE_VIA_FLOORS` ({} when it has none)."""
+    _RULE_VIA_FLOORS.clear()
+    _RULE_VIA_FLOORS.update(floors or {})
+
+
+def get_rule_via_floors():
+    return dict(_RULE_VIA_FLOORS)
+
+
+def _first_choice_meets(rungs, floors):
+    """The ladder `--escalation fab` walks on a board whose rules size a via:
+    the first rung raised to meet them, then every tier rung below it, so a
+    descent below a rule is the last thing tried and never the first. An
+    unchanged first rung leaves the ladder as it was."""
+    first = _apply_board_floors(rungs[:1], floors)
+    return first + [r for r in rungs if r['via_diameter'] < first[0]['via_diameter'] - 1e-9]
+
+
 def fab_floor_ladder(copper_layer_count, tier=None, overrides=None):
     """Ordered list of floor dicts for the tier under the active escalation
     policy: the nominal (preferred) floor first, then any escalation rungs
@@ -686,6 +733,17 @@ def escalation_rungs(copper_layer_count, tier=None, overrides=None,
     # class clearance -- a grading floor the writeback never lowers, #530).
     if extra_floors:
         rungs = _apply_board_floors(rungs, extra_floors)
+    # #1676: the board's own via rules. ``board`` may not go below them;
+    # ``fab`` may, but only after a first choice that meets them, and each rule
+    # a run then breaks is named when the step ends
+    # (design_rules.disclose_step_rules).
+    want = dict(_RULE_VIA_FLOORS)
+    for k, v in (extra_floors or {}).items():
+        if k.startswith('first_'):
+            want[k[len('first_'):]] = max(want.get(k[len('first_'):], 0.0), v)
+    if want and rungs:
+        rungs = (_apply_board_floors(rungs, want) if _ESCALATION == 'board'
+                 else _first_choice_meets(rungs, want))
     return rungs
 
 
@@ -694,6 +752,30 @@ def fab_floors(copper_layer_count, tier=None, overrides=None):
     necks down to first. Flat dict of FLOOR_KEYS (raised to the board's own
     floors under ``--escalation board``)."""
     return fab_floor_ladder(copper_layer_count, tier, overrides)[0]
+
+
+def rule_fab_floors(copper_layer_count, tier=None, overrides=None):
+    """:func:`fab_floors` for a clearance a RULE or a non-Default CLASS sets
+    -- the fab floor ``DesignRules`` (step 5) and the scoped channel raise
+    such a value to (#1630).
+
+    The same dict, except under ``--escalation board`` with the writeback off,
+    where #1262 raises the clearance floor to the Default class: that floor is
+    the clearance BASE's, and KiCad grades a rule or another class at the
+    board minimum instead. A pair rule at 0.11 under a 0.15 Default class was
+    built and logged at 0.15 while KiCad grades 0.11 clean."""
+    if _ESCALATION != 'board' or _BOARD_RULE_CLEARANCE is None:
+        return fab_floors(copper_layer_count, tier, overrides)
+    if tier is None:
+        tier = _DEFAULT_TIER
+        if overrides is None:
+            overrides = _DEFAULT_OVERRIDES
+    floors = dict(_BOARD_FLOORS)
+    floors.pop('clearance', None)
+    if _BOARD_RULE_CLEARANCE > 0:
+        floors['clearance'] = _BOARD_RULE_CLEARANCE
+    return _apply_board_floors(
+        _tier_rungs(copper_layer_count, tier, overrides), floors)[0]
 
 
 def fab_floor_min(copper_layer_count, tier=None, overrides=None):
@@ -713,6 +795,9 @@ _PARAM_FLOOR_KEY = {
     # board because only --track-width was enforced).
     'min_track_width': 'track_width',
     'clearance': 'clearance',
+    # What it caps every net class at, in the map and in the writeback (#1691),
+    # so it holds the floor the Default class holds.
+    'clearance_ceiling': 'clearance',
     'via_size': 'via_diameter',
     'via_diameter': 'via_diameter',
     'via_drill': 'via_drill',
@@ -847,6 +932,15 @@ def min_via_center_distance(via_diameter, clearance, via_drill,
                float(via_drill) + float(hole_to_hole or 0.0))
 
 
+def fab_floor_pin_warning(name, val, floor):
+    """The line saying ``name`` was pinned up to the physical fab floor, on
+    both fronts."""
+    return (f"  WARNING: --{name.replace('_', '-')} {val} is below the physical fab "
+            f"floor {floor} (the advanced rung, or your --fab-overrides); "
+            f"pinning up to {floor}. Pass --fab-overrides "
+            f"to declare a smaller fab capability, or raise the value to silence this.")
+
+
 def enforce_fab_floors(copper_layer_count, tier=None, overrides=None, **params):
     """CLI guard: pin any routing parameter that is below the PHYSICAL fab
     floor (``fab_floor_for_param`` -> ``physical_fab_floor``: the advanced rung,
@@ -856,17 +950,15 @@ def enforce_fab_floors(copper_layer_count, tier=None, overrides=None, **params):
     a warning. Neither the selected tier nor a board minimum pins an explicit
     request: those bound automatic descents only.
 
-    Each CLI passes the params it accepts (track_width, clearance, via_size,
-    via_drill, hole_to_hole_clearance); None values skip. Returns a
+    Each CLI passes the params it accepts (track_width, clearance,
+    clearance_ceiling, via_size, via_drill, hole_to_hole_clearance); None values
+    skip. Returns a
     ``{param_name: pinned_floor}`` dict of the clamps applied (empty if all in
     range) so the caller can write the pinned values back onto its parsed args."""
     viols = check_param_floors(copper_layer_count, tier, overrides, **params)
     pinned = {}
     for name, val, floor in viols:
-        print(f"  WARNING: --{name.replace('_', '-')} {val} is below the physical fab "
-              f"floor {floor} (the advanced rung, or your --fab-overrides); "
-              f"pinning up to {floor}. Pass --fab-overrides "
-              f"to declare a smaller fab capability, or raise the value to silence this.")
+        print(fab_floor_pin_warning(name, val, floor))
         pinned[name] = floor
     # #1433: the size and drill floors hold one value at a time; the via must
     # also keep a copper ring around its hole.
@@ -995,6 +1087,11 @@ def cap_net_clearances(net_clearances, ceiling, *, net_names=None, class_of=None
     ``escalation_summary()['ceiling_lowered_classes']`` (JSON_SUMMARY
     ``design_rules``): the class, its clearance, the capped value and the nets
     it covers. Disclosure only: the map is capped exactly as before.
+
+    ``ceiling`` is the value the front pinned at the physical fab floor
+    (``enforce_fab_floors``, the GUI's ``_class_ceiling``, #1691), so the cap
+    never lowers a class below that floor; a class the board declares below it
+    stays as declared, as the Default class does in the writeback.
 
     ``net_names`` is {net_id: name}; the class of each net is ``class_of``
     ({net_id or net name: class}) when given (a front that read the classes
@@ -1506,7 +1603,8 @@ def apply_clearance_ceiling(args, tool=''):
     The run clearance is ``min(requested, ceiling)`` -- tighten-only, exactly
     as it is for the Default class on the routing mains. The classes: both
     fanouts price each class at ``min(class, ceiling)`` and write it there,
-    as route.py does (#1529, ``fanout_fix_kwargs``).
+    as route.py does (#1529, ``fanout_fix_kwargs``). The caller's
+    ``enforce_fab_floors`` then pins both values at the physical fab floor.
 
     Call it AFTER ``parse_args`` and BEFORE anything reads ``args.clearance``
     (on bga_fanout that means before ``enforce_fab_floors``, which would

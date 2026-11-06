@@ -483,7 +483,46 @@ def _member_connected(pcb_data, nid: int) -> bool:
     return bool(r.get('connected'))
 
 
-def run_single_ended_member_fallback(state, diff_pairs_list) -> Dict:
+def _single_ended_engine(state, nets_to_route, net_clearances):
+    """What a member fallback routes single-ended with.
+
+    The diff engine bakes each layer's impedance width into its maps
+    (`reserve_layer_widths`), for the pose router, which has no track margin
+    to carry a width on. So on those maps a wide member's margin is 0 -- but
+    only track and via stamps reserve the width. Pads and the board edge stamp
+    the call's nominal `track_width`, because in the single-ended engine the
+    margin covers what they do not. A member routed there at its layer width
+    therefore comes (layer width - track width) / 2 closer to each of them
+    than its clearance allows.
+
+    Take the single-ended engine whole instead: the nominal reserve and a map
+    stamped at it, so the margin prices every obstacle class and a route that
+    does not fit at full width can neck down, as it does in route.py. A run
+    with no layer wider than the call's width has identical stamps either
+    way and keeps the map it already holds.
+
+    Returns (config, base map, lift records of the run's own build): the build
+    rebinds the per-build lift records on the board, and the caller puts these
+    back when it is done, since a later reader holds the run's maps."""
+    config = state.config
+    if not any(config.get_track_width(layer) > config.track_width + 1e-9
+               for layer in config.layers):
+        return config, state.base_obstacles, None
+    from dataclasses import replace
+    from obstacle_map import build_base_obstacle_map
+    pcb_data = state.pcb_data
+    records = {k: getattr(pcb_data, k, None) for k in (
+        '_net_tie_lift', '_graphic_own_pad_lift', '_graphic_own_pad_via_lift')}
+    se_config = replace(config, reserve_layer_widths=False)
+    print("Building single-ended obstacle map for the member fallback...")
+    return (se_config,
+            build_base_obstacle_map(pcb_data, se_config, nets_to_route,
+                                    net_clearances=net_clearances),
+            records)
+
+
+def run_single_ended_member_fallback(state, diff_pairs_list, nets_to_route,
+                                     net_clearances) -> Dict:
     """Single-ended completion pass for non-coupled diff pairs: attempt BOTH
     members (P->P and N->N), engine-side.
 
@@ -500,9 +539,9 @@ def run_single_ended_member_fallback(state, diff_pairs_list) -> Dict:
     Members that fail here keep their copper unchanged and stay listed for the
     downstream single-ended pass (which has the full rip-up arsenal); members
     routed here become already-connected no-ops downstream. DRC-safe: each
-    member routes against the standard single-ended obstacle map (all other
-    nets' copper priced as obstacles), exactly like the casualty reconcile's
-    depth-1 reroute.
+    member routes in the single-ended engine (`_single_ended_engine`), with all
+    other nets' copper priced as obstacles. ``nets_to_route`` and
+    ``net_clearances`` are what the run's base maps were built with.
 
     Returns a JSON-ready summary dict ('attempted'/'routed'/'partial'/'failed'
     lists of member net names).
@@ -515,7 +554,7 @@ def run_single_ended_member_fallback(state, diff_pairs_list) -> Dict:
     from connectivity import get_multipoint_net_pads
 
     summary = {'attempted': [], 'routed': [], 'partial': [], 'failed': []}
-    pcb_data, config = state.pcb_data, state.config
+    pcb_data = state.pcb_data
 
     todo = []
     for pair_name, pair in diff_pairs_list:
@@ -538,6 +577,8 @@ def run_single_ended_member_fallback(state, diff_pairs_list) -> Dict:
           f"attempting BOTH members P->P / N->N (no rip-up)")
     print("=" * 60)
 
+    config, base_obstacles, records = _single_ended_engine(
+        state, nets_to_route, net_clearances)
     for pair_name, pair, members in todo:
         outcomes = {}
         for tag, nid, nm in members:
@@ -546,7 +587,7 @@ def run_single_ended_member_fallback(state, diff_pairs_list) -> Dict:
                 continue
             summary['attempted'].append(nm)
             obstacles, _ = build_single_ended_obstacles(
-                state.base_obstacles, pcb_data, config, state.routed_net_ids,
+                base_obstacles, pcb_data, config, state.routed_net_ids,
                 state.remaining_net_ids, state.all_unrouted_net_ids, nid,
                 state.gnd_net_id, state.track_proximity_cache, state.layer_map,
                 ripped_route_layer_costs=state.ripped_route_layer_costs,
@@ -592,7 +633,59 @@ def run_single_ended_member_fallback(state, diff_pairs_list) -> Dict:
                       f"({pair_name} {tag.upper()} member) - left for the "
                       f"downstream single-ended pass")
         record_pair_diag(state, pair_name, se_fallback=outcomes)
+    if records is not None:
+        for key, value in records.items():
+            setattr(pcb_data, key, value)
     return summary
+
+
+MEMBER_FALLBACK_WIDTH_SITE = 'pair member fallback copper shipped under width'
+
+
+def disclose_member_fallback_widths(pcb_data, config, member_names,
+                                    input_keys) -> Dict:
+    """The design-rules rows of the member fallback's narrowed copper (#1679).
+
+    On a run with a layer wider than the call's `track_width`, a fallback
+    member that does not fit at its layer width necks down in the
+    single-ended engine, and that ladder records nothing. Route.py's rule for
+    a net with its own width (found reviewing #1282), on the same helpers:
+    one row per member net, measured on the board this run ships
+    (`pcb_data.segments` once the engine is done), graded on the copper THIS
+    run laid -- a segment whose `segment_identity` is in `input_keys` was on
+    the input board -- against the member's own width on that copper's
+    layer. The member's per-attempt `track_width` rows (terminal necks of
+    coupled attempts that never shipped, among them) are replaced, so a
+    member that necked in one attempt and shipped at full width records
+    nothing.
+
+    `member_names` is the fallback summary's `attempted` list. The members
+    belong to pairs with no coupled copper, so no `pair partner neck` row of
+    a shipped pair is touched. Returns the shortfall per covered net."""
+    from routing_common import new_copper_width_shortfall
+    from fab_tiers import replace_track_rows
+    member_names = set(member_names or ())
+    names = {nid: net.name for nid, net in pcb_data.nets.items()}
+    by_name = {}
+    for nid, nm in names.items():
+        if (nm in member_names and config.layers
+                and max(config.get_net_track_width(nid, layer)
+                        for layer in config.layers)
+                > config.track_width + 1e-9):
+            by_name[nm] = nid
+    if not by_name:
+        return {}
+    short = new_copper_width_shortfall(
+        pcb_data.segments, lambda nid: names.get(nid, f"Net {nid}"),
+        input_keys,
+        lambda nm, layer: (config.get_net_track_width(by_name[nm], layer)
+                           if nm in by_name else None))
+    replace_track_rows(
+        set(by_name.values()),
+        [(by_name[nm], nm, r['requested_mm'], r['min_mm'], r['under_mm'])
+         for nm, r in short.items()],
+        MEMBER_FALLBACK_WIDTH_SITE)
+    return short
 
 
 # --------------------------------------------------------------------------

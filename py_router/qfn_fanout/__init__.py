@@ -24,8 +24,9 @@ from kicad_parser import parse_kicad_pcb, Footprint, PCBData, find_components_by
 from kicad_writer import add_tracks_and_vias_to_pcb
 from qfn_fanout.types import QFNLayout, PadInfo, FanoutStub
 from bga_fanout.constants import POSITION_TOLERANCE
-from bga_fanout import single_pad_net_ids
-from net_queries import matches_net_filter
+from bga_fanout import (single_pad_net_ids, net_filter_misses,
+                        filter_miss_lines)
+from net_queries import matches_net_filter, literal_net_patterns, board_net_names
 from qfn_fanout.layout import analyze_qfn_layout, analyze_pad, single_line_reason
 from qfn_fanout.geometry import calculate_fanout_stub
 
@@ -70,6 +71,13 @@ LAST_UNDERPAD_REPORT: Dict = {}
 # end-of-run line read; this list is the per-pad view a test or the GUI can
 # read without parsing that.
 LAST_ESCALATED: List[Dict] = []
+
+# #1641: the --nets patterns the last run selected no pad with, one dict per
+# pattern (bga_fanout.net_filter_misses: `pattern`, `reason`, `nets`, `pads`).
+# Refreshed by every generate_qfn_fanout call; EMPTY with no filter or when
+# every pattern selected a pad. The CLI's JSON_SUMMARY `unmatched` and the
+# fanout tab's completion message read it.
+LAST_FILTER_MISSES: List[Dict] = []
 
 
 #: #1565: (board, part) pairs whose held .kicad_dru rules this call named, so
@@ -538,6 +546,11 @@ def _board_edge_model(pcb_data, clearance, board_edge_clearance):
     usable outline AND no bounds (then no edge test is possible)."""
     from check_drc import board_edge_geometry
     edge_clear = board_edge_clearance if board_edge_clearance > 0 else clearance
+    # #1678: a .kicad_dru edge_clearance rule outranks it, at the strictest
+    # floor any net's copper is held to: an escape is laid before the net's
+    # own route, and the fanout keeps one number per part.
+    from design_rules import strictest_edge_floor
+    edge_clear = strictest_edge_floor(pcb_data, edge_clear)
     rings, outer, cutouts = board_edge_geometry(pcb_data.board_info, rect_ring=True)
     return edge_clear, rings, outer, cutouts
 
@@ -997,6 +1010,10 @@ def _underpad_via_escape(footprint, pcb_data, pad_infos, layout, layer,
         pcb_data, clearance, board_edge_clearance)
     from check_drc import _point_to_rings_distance as _pt_rings_dist
     from check_drc import _point_on_board as _pt_on_board
+    # #1682: a filled graphic's interior, on the nets this run erases from its
+    # map too (a fanned net's shape is foreign to the part's other pins).
+    from check_drc import FilledCopperGate
+    _filled_gate = FilledCopperGate(pcb_data)
 
     # #1568: each pad with the radius about its centre that holds all its
     # copper, so `via_clears` calls the grader only on a pad the via's
@@ -1043,6 +1060,9 @@ def _underpad_via_escape(footprint, pcb_data, pad_infos, layout, layer,
                 return False
             if _pt_rings_dist(vx, vy, _edge_rings) < via_size / 2 + _edge_clear - 1e-6:
                 return False
+        if _filled_gate and _filled_gate.via_hit(
+                vx, vy, via_size, net_id, lambda sh: _pc(net_id, sh.net_id)) is not None:
+            return False
         for fx, fy, fs, fn, fd in foreign_vias:
             # The DRILLS are an obstacle whatever the net: hole-to-hole is
             # net-independent (#282/#479 audit gap 2), and on a board whose
@@ -1129,6 +1149,10 @@ def _underpad_via_escape(footprint, pcb_data, pad_infos, layout, layer,
         10.9s baseline (-36%); appended after `via_clears` instead, +18%.
         The gate is a speed-up.
         """
+        if stub_layer_idx is not None and _filled_gate and _filled_gate.segment_hit(
+                px, py, vx, vy, track_width, stub_layer, net_id,
+                lambda sh: _pc(net_id, sh.net_id)) is not None:
+            return False
         if math.hypot(vx - px, vy - py) <= POSITION_TOLERANCE:
             # Via centred on the pad: the commit loop emits NO track at all
             # (:604, :616), so there is no stub to test. `run_output_conflict`
@@ -1774,8 +1798,12 @@ def generate_qfn_fanout(footprint: Footprint,
     nets are published as qfn_fanout.LAST_CANCEL_SKIPPED. Passing None (the
     default, and what the CLI passes) is fully inert.
     """
+    # #1676: the rungs below start at the board's own via rules
+    from design_rules import install_board_via_rule_floors
+    install_board_via_rule_floors(pcb_data)
     LAST_CANCEL_SKIPPED.clear()
     LAST_ESCALATED.clear()          # #1328
+    LAST_FILTER_MISSES.clear()      # #1641
     _RULES_SAID.clear()             # #1565: said once per call
     # #619: and the erased-set report, for the same reason. `generate_qfn_fanout`
     # returns early on several paths that never reach `_underpad_via_escape`
@@ -1890,6 +1918,11 @@ def generate_qfn_fanout(footprint: Footprint,
         print(f"  Skipping {len(nc_net_ids)} single-pad/NC net(s) "
               f"(nothing to connect to)")
 
+    # #1641: a pattern that spells a board net verbatim selects that net
+    # alone, so a bus member 'D[3]' fans out itself rather than 'D3'.
+    _user_filter = net_filter
+    net_filter = literal_net_patterns(net_filter, board_net_names(pcb_data))
+
     for pad in footprint.pads:
         if not pad.net_name or pad.net_id == 0:
             continue
@@ -1920,6 +1953,15 @@ def generate_qfn_fanout(footprint: Footprint,
     print(f"  Found {len(pad_infos)} pads to fanout:")
     for side, count in sorted(side_counts.items()):
         print(f"    {side}: {count} pads")
+    # #1641: each --nets pattern that selected no pad, and why -- the stub
+    # escape's interior skip above among the reasons.
+    LAST_FILTER_MISSES.extend(net_filter_misses(
+        footprint, pcb_data, _user_filter,
+        skip_reason=(None if escape_method == "underpad" else
+                     lambda p: ('interior' if analyze_pad(p, layout).side
+                                == 'center' else None))))
+    for _line in filter_miss_lines(LAST_FILTER_MISSES):
+        print(_line)
 
     # Show sample pad geometry
     if pad_infos:
@@ -2194,6 +2236,8 @@ def generate_qfn_fanout(footprint: Footprint,
         pcb_data, clearance, board_edge_clearance)
     from check_drc import _segment_to_rings_distance as _seg_rings_dist
     from check_drc import _point_on_board as _pt_on_board
+    from check_drc import FilledCopperGate
+    _filled_gate = FilledCopperGate(pcb_data)   # #1682: as the under-pad escape
 
     # #1328: a stub that cannot escape at `clearance` retries at the rungs of
     # qfn_clearance_ladder (empty under --escalation off), and #1318 tries a
@@ -2250,6 +2294,9 @@ def generate_qfn_fanout(footprint: Footprint,
     def _seg_grazes(p1, p2, net_id, cl=clearance, width=track_width):
         # Board edge first (issue #288) - independent of net.
         if _seg_hits_edge(p1, p2, cl, width):
+            return True
+        if _filled_gate and _filled_gate.segment_hit(
+                p1[0], p1[1], p2[0], p2[1], width, layer, net_id, cl) is not None:
             return True
         # Foreign tracks / vias via the shared obstacle map (issue #149 part 2).
         if _obs_layer_idx is not None:
@@ -2620,9 +2667,9 @@ def main():
                         help="'stub' (default) = surface 45-degree fan; 'underpad' = drop a "
                              "through-via just past each pad and escape on an inner layer "
                              "(issue #164), for crowded fine-pitch edges where the surface is full.")
-    parser.add_argument('--via-size', type=float, default=0.45,
+    parser.add_argument('--via-size', type=float, default=None,
                         help='Underpad escape via outer diameter (mm, default 0.45)')
-    parser.add_argument('--via-drill', type=float, default=0.25,
+    parser.add_argument('--via-drill', type=float, default=None,
                         help='Underpad escape via drill diameter (mm, default 0.25)')
     parser.add_argument('--board-edge-clearance', type=float, default=defaults.BOARD_EDGE_CLEARANCE,
                         help='Min clearance from stub/via copper to the Edge.Cuts '
@@ -2707,11 +2754,20 @@ def main():
     # stock 0.2 mm board minimum pinned 0.1 mm escape stubs up to 0.2.
     if getattr(args, 'track_width', None) is None:
         args.track_width = args.width
+    # #1676: a via nobody asked for starts at the board's own .kicad_dru rules
+    _vs_explicit = args.via_size is not None or args.via_drill is not None
+    args.via_size = 0.45 if args.via_size is None else args.via_size
+    args.via_drill = 0.25 if args.via_drill is None else args.via_drill
+    if not _vs_explicit:
+        from design_rules import run_via_for_rules
+        args.via_size, args.via_drill = run_via_for_rules(args.pcb, None, args.via_size,
+                                                          args.via_drill)
     __import__('fab_tiers').set_policy_from_args(args, args.pcb)  # #857
     _pinned_floors = enforce_fab_floors(
         count_copper_layers_in_file(args.pcb),
         track_width=getattr(args, 'track_width', None),
         clearance=getattr(args, 'clearance', None),
+        clearance_ceiling=getattr(args, 'clearance_ceiling', None),
         via_size=getattr(args, 'via_size', None),
         via_drill=getattr(args, 'via_drill', None),
         hole_to_hole_clearance=getattr(args, 'hole_to_hole_clearance', None),
@@ -2816,6 +2872,14 @@ def main():
         # at the ceiling when one was given, as route.py's map is.
         clearance_ceiling=getattr(args, 'clearance_ceiling', None),
     )
+    # #1641: a --nets list naming no net on the board is an input error (a
+    # typo, a stale list), refused as route.py refuses one; a pattern that
+    # names a net but selects no pad here is disclosed in `unmatched`.
+    from bga_fanout import refuse_unknown_nets
+    _refusal = refuse_unknown_nets(LAST_FILTER_MISSES, pcb_data, args.nets)
+    if _refusal:
+        print(f"Error: {_refusal}")
+        return 2
 
     if tracks or vias:
         # vias can be non-empty with zero tracks: a via-in-pad centred on its
@@ -2950,6 +3014,10 @@ def main():
         'flagged_escaped_nets': flagged_escaped,
         # #1342: single-pad (NC) nets the engine skipped, as bga_fanout's key.
         'skipped_nc': len(single_pad_net_ids(footprint, pcb_data)),
+        # #1641: each --nets pattern that selected no pad, with its reason
+        # (an interior pad the stub escape skips, a net with no pad on the
+        # part, ...): requested counts only the pads a pattern selected.
+        'unmatched': list(LAST_FILTER_MISSES),
         'clearance': args.clearance,
         'track_width': args.width,
         'escape_method': args.escape_method,

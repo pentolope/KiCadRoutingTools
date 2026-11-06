@@ -70,6 +70,20 @@ BREAKS = [
       '# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py '
       'final.kicad_pcb after.kicad_pcb --nets GND --plane-layers In1.Cu\n'
       '# Verification')),
+    # #1646: a check_join WITHOUT --keep-staged writes nothing, so it is a
+    # read-only check like any other, and an executable one is refused.
+    ('R03', 'a hand join checked but not kept, as an executable line',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu\n# Verification')),
+    # ...and a kept join is a board-mutating step: a route step after the
+    # joins is not the final route.py the joins follow.
+    ('R04', 'a diff step after the hand joins',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu --keep-staged joined.kicad_pcb\n'
+      'python3 -u -X utf8 py_router/route_diff.py joined.kicad_pcb '
+      'd.kicad_pcb --nets /D+ /D-\n# Verification')),
     ('R05', 'connectivity never named',
      ('#   python3 -X utf8 py_router/check_connected.py final.kicad_pcb\n',
       '')),
@@ -192,6 +206,22 @@ COMPLIANT_VARIANTS = [
       "s3i.kicad_pcb --nets RF --impedance 50 --clearance 0.09\n"
       "# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3i.kicad_pcb "
       "final.kicad_pcb --nets '*' '!RF' ")),
+    # #1646: hand joins FOLLOW the final route.py (a route step after one may
+    # rip its net), so a kept join is neither an executable check (R03) nor
+    # a chain end that is not route.py (R04) -- including its --keep-staged
+    # on a continuation line.
+    ('R03', 'hand joins kept after the final route.py',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu --keep-staged j1.kicad_pcb\n'
+      'python3 -X utf8 py_tools/check_join.py j1.kicad_pcb SIG2 \\\n'
+      '    3,1,F.Cu 4,1,F.Cu --keep-staged j2.kicad_pcb\n# Verification')),
+    ('R04', 'hand joins kept after the final route.py',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu --keep-staged j1.kicad_pcb\n'
+      'python3 -X utf8 py_tools/check_join.py j1.kicad_pcb SIG2 \\\n'
+      '    3,1,F.Cu 4,1,F.Cu --keep-staged j2.kicad_pcb\n# Verification')),
     ('R17', 'a poured inner layer priced negative in --layer-costs is the '
             'documented way to keep escapes off it (#288)',
      ('--component U1 --nets \'*\' --clearance 0.09 --layers F.Cu B.Cu',
@@ -324,6 +354,35 @@ def t_a_rule_does_not_refuse_what_the_engine_prescribes():
               f'refused by the rule that could have')
 
 
+def t_the_gnd_via_floor_reads_a_clearance_ceiling():
+    """A chain spells its floor `--clearance-ceiling`, so the rule reads it,
+    on the step itself and elsewhere in the plan. It used to fall through to
+    the default clearance, which refuses a correct distance and can pass a
+    short one. Both directions, so neither arm is a default's accident."""
+    step = ('# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py a.kicad_pcb '
+            'b.kicad_pcb --nets GND +3V3 --plane-layers In1.Cu In2.Cu ')
+    gnd = '--add-gnd-vias --gnd-via-distance %s'
+
+    def verdict(tmp, name, text):
+        r = _run(_write(tmp, name, text))
+        return [ln for ln in r.stdout.splitlines() if 'gnd-via-distance' in ln]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, spelled in (
+                ('same_step', step + '--via-size 0.45 --clearance-ceiling 0.09 '
+                 + gnd + '\n'),
+                ('other_step', step + '--via-size 0.45 --clearance-ceiling 0.09\n'
+                 + step + gnd + '\n')):
+            # 3 x (0.45 + 0.09) = 1.62: the default 0.25 would ask for 2.1
+            ok = verdict(tmp, name + '_ok.sh', spelled % '2.0')
+            assert not ok, f'{name}: 2.0 is above the 1.62 floor, refused: {ok}'
+            low = verdict(tmp, name + '_low.sh', spelled % '1.5')
+            assert any('clearance 0.09' in ln and '1.620' in ln for ln in low), (
+                f'{name}: 1.5 is under the 1.62 floor, and the reason must '
+                f'read the ceiling: {low}')
+    print('  PASS: the floor reads --clearance-ceiling, on the step and in the plan')
+
+
 def t_a_board_less_rule_is_not_gated_behind_the_board_flag():
     """`check()` SKIPS every rule whose text says '[needs --board]'. A rule
     that reads only the plan's argv and carries the marker anyway never runs
@@ -416,14 +475,30 @@ def t_every_rule_and_every_delegation_is_listed():
           f'{len(rpc.DELEGATED)} delegations')
 
 
+def t_the_skill_states_the_hand_join_exception():
+    """#1646: R03/R04 accept a kept hand join after the final route.py, so
+    the skill's end rule must say so -- or the text and the checker disagree,
+    and the plan that does what plan-pcb-placement says reads as a break."""
+    skill = open(os.path.join(ROOT, '.claude', 'skills', 'plan-pcb-routing',
+                              'SKILL.md'), encoding='utf-8').read()
+    end = skill[skill.index('### End every chain on route.py'):]
+    end = end[:end.index('\n### ', 5)]
+    for want in ('check_join.py', '--keep-staged', 'AFTER the closing `route.py`',
+                 'apply the joins again'):
+        assert want in end, f'"End every chain on route.py" does not say {want!r}'
+    print('  PASS: the end rule names the hand-join exception the checker accepts')
+
+
 TESTS = (t_the_compliant_plan_passes,
          t_each_break_is_refused_by_its_own_rule,
          t_a_rule_does_not_refuse_what_the_engine_prescribes,
+         t_the_gnd_via_floor_reads_a_clearance_ceiling,
          t_a_board_less_rule_is_not_gated_behind_the_board_flag,
          t_a_break_does_not_redden_unrelated_rules,
          t_the_checker_writes_nothing,
          t_an_unreadable_plan_is_exit_3_not_a_crash,
-         t_every_rule_and_every_delegation_is_listed)
+         t_every_rule_and_every_delegation_is_listed,
+         t_the_skill_states_the_hand_join_exception)
 
 
 def _every_case_is_registered():

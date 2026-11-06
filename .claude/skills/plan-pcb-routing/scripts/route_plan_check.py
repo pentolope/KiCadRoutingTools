@@ -140,10 +140,17 @@ def scalar(argv, flag):
         return None
 
 
+def is_kept_join(argv):
+    """`check_join.py ... --keep-staged <out>`: the one `check_*` tool that
+    writes a board, the hand join a chain continues from (#1397, #1646)."""
+    return tool_of(argv) == 'check_join.py' and '--keep-staged' in argv
+
+
 def is_check(argv):
-    """A read-only grader, by the repo's own convention (`check_*`)."""
+    """A read-only grader, by the repo's own convention (`check_*`) -- not
+    a kept join, which writes a board."""
     t = tool_of(argv)
-    return bool(t and t.startswith('check_'))
+    return bool(t and t.startswith('check_')) and not is_kept_join(argv)
 
 
 def boards_in(argv, chain=False):
@@ -245,29 +252,48 @@ def r_verification_is_commented(p):
     and a plan with no verification are the same file.
     """
     bad = []
-    for n, ln in enumerate(p.lines, 1):
-        s = ln.strip()
+    lines = p.lines
+    n = 0
+    while n < len(lines):
+        first, s = n + 1, lines[n].strip()
+        while not s.startswith('#') and s.endswith('\\') and n + 1 < len(lines):
+            n += 1
+            s = s[:-1] + ' ' + lines[n].strip()
+        n += 1
         if not s or s.startswith('#'):
             continue
-        t = tool_of(s.split())
-        if t and t.startswith('check_'):
-            bad.append(f'line {n} runs {t} as an EXECUTABLE line; its exit '
+        argv = s.split()
+        if is_check(argv):
+            bad.append(f'line {first} runs {tool_of(argv)} as an EXECUTABLE line; its exit '
                        f'code becomes the chain verdict. Comment it out.')
     return bad
 
 
 def r_ends_on_route(p):
-    """SKILL.md :2282 and :2562 -- the last board-mutating command is
-    `route.py`. Only route.py finalizes planes, so a chain ending on a bare
-    re-pour or a diff step writes a final board no weld/oracle pass ever
-    verified. That is a PLAN ERROR, not a tuning choice."""
-    if not p.mutating:
+    """SKILL.md "End every chain on route.py" -- the last board-mutating
+    command is `route.py`. Only route.py finalizes planes, so a chain ending
+    on a bare re-pour or a diff step writes a final board no weld/oracle pass
+    ever verified. That is a PLAN ERROR, not a tuning choice.
+
+    The one exception: hand joins (`check_join.py --keep-staged`) FOLLOW the
+    final route.py, since a route step after a join may rip its net (#1360,
+    #1646). They are the only commands that may come after it."""
+    muts = list(p.mutating)
+    if not muts:
         return ['the plan has no board-mutating command at all']
-    last = tool_of(p.mutating[-1])
+    while muts and is_kept_join(muts[-1]):
+        muts.pop()
+    if not muts:
+        return ['the plan writes no board but by hand joins: no route.py '
+                'finalizes it']
+    last = tool_of(muts[-1])
     if last != 'route.py':
-        return [f'the last board-mutating command is {last}, not route.py. '
+        after = (' (the hand joins after it do not change that)'
+                 if len(muts) < len(p.mutating) else '')
+        return [f'the last board-mutating command is {last}, not route.py{after}. '
                 f'Only route.py finalizes planes, so this ships a board whose '
-                f'welds and taps nothing verified.']
+                f'welds and taps nothing verified. Only a hand join '
+                f'(check_join.py --keep-staged) may follow the final route.py.']
     return []
 
 
@@ -536,12 +562,23 @@ def r_gnd_via_distance(p):
     places. A fanout escape via is not the via the GND pass places, and the
     skill itself has them at different sizes.
     """
-    def _resolved(flag, tool, fallback):
+    def _resolved(read, tool, fallback):
         seen = [v for a in p.by_tool(tool)
-                for v in (scalar(a, flag),) if v is not None]
+                for v in (read(a),) if v is not None]
         if seen:
             return min(seen), f'{tool} elsewhere in the plan'
         return fallback, 'routing_defaults'
+
+    def _via(argv):
+        return scalar(argv, '--via-size')
+
+    def _clearance(argv):
+        # A chain's routing steps spell the floor `--clearance-ceiling` (Step
+        # 4), so a plan that says only that must not read as saying nothing.
+        given = [v for v in (scalar(argv, '--clearance'),
+                             scalar(argv, '--clearance-ceiling'))
+                 if v is not None]
+        return min(given) if given else None
 
     bad = []
     for argv in p.argvs:
@@ -549,13 +586,12 @@ def r_gnd_via_distance(p):
         if d is None:
             continue
         tool = tool_of(argv)
-        vs, vs_src = scalar(argv, '--via-size'), 'this step'
+        vs, vs_src = _via(argv), 'this step'
         if vs is None:
-            vs, vs_src = _resolved('--via-size', tool,
-                                   routing_defaults.VIA_SIZE)
-        clr, clr_src = scalar(argv, '--clearance'), 'this step'
+            vs, vs_src = _resolved(_via, tool, routing_defaults.VIA_SIZE)
+        clr, clr_src = _clearance(argv), 'this step'
         if clr is None:
-            clr, clr_src = _resolved('--clearance', tool,
+            clr, clr_src = _resolved(_clearance, tool,
                                      routing_defaults.CLEARANCE)
         floor = 3.0 * (vs + clr)
         if d < floor - 1e-9:
@@ -649,7 +685,8 @@ RULES = (
     ('R02', 'no pipes', 'Step 10 rule 5', r_no_pipes),
     ('R03', 'verification is commented, not executable', 'Step 9',
      r_verification_is_commented),
-    ('R04', 'the chain ends on route.py', 'End every chain on route.py', r_ends_on_route),
+    ('R04', 'the chain ends on route.py (hand joins after it)', 'End every chain on route.py',
+     r_ends_on_route),
     ('R05', 'the three verification commands are present', 'Important Notes 4',
      r_checkers_are_present),
     ('R06', 'diff-pair gap is not below clearance', 'Step 4 diff pairs',

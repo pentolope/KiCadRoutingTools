@@ -3,10 +3,10 @@
 A 3D take on `py_placer/place_movie.py`. It tells the same placement story
 (the input with its piles, the fixed parts flying to their places, the
 scatter, the anneal, the best placement) on a 3D board, rendered to an .mp4.
-With `--route`, it also films place_movie's flow: one seed's placement and
-fast route, then every judged seed's board side by side, the best one picked,
-and its routes, with copper appearing and ripped copper going. It is a
-prototype, to judge whether a 3D movie is worth more work.
+With `--route` or `--route-chain`, it also films place_movie's flow: one
+seed's placement and fast route, then every judged seed's board side by side,
+the best one picked, and its routes, with copper appearing and ripped copper
+going. It is a prototype, to judge whether a 3D movie is worth more work.
 
 **The story is shared with the 2D movie.** `py_placer/placement_story.py`
 holds it: place_simple's hooks, the piles, the schedule and the captions.
@@ -41,14 +41,33 @@ the seed differently are refused (exit 2). The movie is written beside it as
 JSON and the frames go to the output's name + `_movie3d/` (or `--work`).
 
 With `--route BOARD:SET` (a stress-corpus board whose recorded chain routes
-this one), it runs place_movie's own `run_flow`, in `--route-work` (default:
-the output's name + `_work`, place_movie's default, so a 2D flow run's work
-is reused):
+this one) or `--route-chain FILE` (the chain a placement run routes its seeds
+with, its `judge_chain.txt`), it runs place_movie's own `run_flow`, in
+`--route-work` (default: the output's name + `_work`, place_movie's default,
+so a 2D flow run's work is reused):
 
 1. the round's seeds are placed (`--scattered` 6, `--clustered` 6, and the
    opt-in `--anchored`, 0);
 2. the `--judge` 6 cheapest legal seeds are fast-routed;
 3. the best of them is routed in full.
+
+`--route-chain` routes each seed the way `py_placer/judge_seeds.py --chain`
+does, with judge_seeds' own code: the chain file is in its format (one
+command per line, boards named by `{in}` `{out}` `{dir}` `{seed}` `{run}`),
+the fast routes run every route.py / route_diff.py step at `--quick 2`, the
+full route takes `--quick` off, each route is scored by quick_score with the
+`--intent` given and the input board as the baseline, and the best is picked
+by `quick_score.judge_key`. The routes land in judge_seeds' names in
+`--route-work` (`s<S>_route/`, `s<S>_full_route/` and their scores). Run it
+from the repo root, as judge_seeds is run: the chain's commands run from the
+current folder. So the movie routes the seeds with the run's own chain and
+picks the seed its judge picks, where `--route` routes with the corpus
+board's recorded chain. The two options are exclusive. Either way the
+flow's routes are routed AFRESH, in `--route-work`, by the chain: the full
+route the movie plays is that chain's route of the best seed, not the route a
+`/plan-pcb-routing` run shipped for the board (#1638). To film a routing run
+itself, give `py_router/route_movie.py` its run dir (and `--final` the board
+it kept).
 
 The movie films a seed the judge did NOT pick, so the pick is something the
 viewer sees happen: the judged seed the objective rates cheapest, or the next
@@ -91,7 +110,9 @@ Without it, every part is drawn as a box. **A model the library lacks** is
 found on the web by the skill -- and so is one for a part whose footprint
 names no model at all -- and recorded with `find_models.py` in
 `movie3d/cache/found/` (gitignored): its download is kept only when it is a
-STEP or VRML model (https only, at most 40 MB, a zip read in memory).
+STEP or VRML model (https only, at most 40 MB, a zip read in memory), and a
+VRML `Switch` is kept as a `Group` of the choice it shows, since kicad-cli's
+GLB export cannot read one and fails the whole board on it.
 make_movie runs no agent: it draws whatever has been recorded, names the
 models still missing, and keeps the box for a found model that does not sit
 on its footprint.
@@ -123,6 +144,13 @@ on its footprint.
     its declared underside, moving with its connector. Unassembled parts with no model (test pads, solder jumpers) get no
     body. A back-side part hangs below the board. Parts off the board lie on
     the table.
+- **Shield cans not drawn yet** (#1573): a can the design brief's `cans[]`
+  declares by `wall_mm` rather than by a footprint `ref` compiles to a
+  block's `fence_mm` band round its zone; that band is drawn on its face as
+  see-through grey walls, as tall as the can's declared room inside (2 mm
+  when no height is declared), so the viewer sees the cans the placement is
+  held to. Any intent block with a `fence_mm` is drawn the same way. A drawn
+  can is a footprint, and is drawn as one.
 - **Airwires**: the nets the objective prices (ground is left out), as one
   spanning tree per net, recomputed every frame.
 - **Text**: place_movie's caption at the top left, and the group key along the
@@ -151,8 +179,8 @@ Over the whole movie the camera orbits slowly, 20 degrees either side of a
 base azimuth, at 46 degrees of elevation. Each frame is fitted to the board,
 or to the board and the piles.
 
-With `--route`, the placed seed's routes follow, as place_movie's 2D flow
-plays them:
+With `--route` or `--route-chain`, the placed seed's routes follow, as
+place_movie's 2D flow plays them:
 
 1. The fast route plays: one router event per frame. New copper is lit white
    (cyan when the router restored it). A ripped track turns magenta, then
@@ -208,12 +236,20 @@ view across the board's long side wins a near tie.
   ships is pointed at its `.step` twin, a still-missing model is found by
   its file name in the library, and failing that it takes the one the
   make-3d-movie skill found on the web (`find_models.py`, one per
-  footprint). The GLB is cached in `movie3d/cache/<key>/` (gitignored), keyed by the staged board and kicad-cli's version, so a
-  re-render or another seed does not export again. kicad-cli writes no
+  footprint). One model file kicad-cli cannot read fails the whole export,
+  so when it fails with found models staged, the board is exported without
+  them, and then with a half of them at a time, a half that fails halved
+  again (one export per try, a few seconds each), until the ones it cannot
+  read are known: only their parts are boxes, and `record:` names each
+  such model with its parts. When the board does not export even without
+  the found models, every part is a box and `record:` gives the reason.
+  The GLB is cached in `movie3d/cache/<key>/` (gitignored), keyed by the staged board, kicad-cli's version and each found model file's size and time, so a
+  re-render or another seed does not export again (nor look for an
+  unreadable model again). kicad-cli writes no
   metallic factor, and glTF's default of 1 makes every model a black mirror,
   so the page sets each model material's metalness to 0.15.
-- `route3d.py` plays a route_placed.py chain as route_movie's `play_chain`
-  does, with its own helpers. Each track, via and pour gets the tick it was
+- `route3d.py` plays a route_placed.py or judge_seeds.py chain as
+  route_movie's `play_chain` does, with its own helpers. Each track, via and pour gets the tick it was
   born at and the tick it died at (stage3d's copper lifetimes). A frame names
   one tick, and the page's shader shows, lights or reddens each item for it.
 - `render.mjs` uses Node and playwright-core to open `page/index.html` in

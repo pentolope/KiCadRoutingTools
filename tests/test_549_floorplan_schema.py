@@ -181,7 +181,9 @@ KEY_SETS = {
         'side',
         # The side of the footprint its mating face opens on, in its own
         # frame: a part placed from a pile has no pose to read it from.
-        'mating_face'} | FREE,
+        'mating_face',
+        # #1652: what that face was read off (a drawing, the 3D model).
+        'mating_face_source'} | FREE,
     '_OVERHANG_KEYS': {'min', 'max'},
     '_CENTER_ON_EDGE_KEYS': {'tolerance_mm'},
     '_ALONG_EDGE_BAND_KEYS': {'from', 'to'},
@@ -347,7 +349,7 @@ def test_an_intent_using_every_known_key_loads():
             # is accepted" claim would silently degrade to "every key but one".
             {'ref': 'J2', 'edge': 'west',
              'along_edge_band': {'from': 0.10, 'to': 0.35},
-             'mating_face': '-x'}],
+             'mating_face': '-x', 'mating_face_source': 'the 3D model'}],
         'decaps': {'max_distance_mm': 2.5, 'exempt': ['C99'],
                    'search_radius_mm': 6.0, 'max_pin_distance_mm': 1.5,
                    'pin_functions': ['VCC', 'VDD'], 'same_side': False,
@@ -753,6 +755,8 @@ def test_severity_keys_are_checked_against_the_rule_names():
                                         'plan_fixed_overlap_budget',
                                         # #1463
                                         'plan_fixed_in_exclusive_zone',
+                                        # #1631
+                                        'plan_zone_on_fixed',
                                         # #959 (#1000)
                                         'edge_connector_side',
                                         # an edge whose declared parts

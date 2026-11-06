@@ -194,10 +194,10 @@ the routing pipeline applies both so the model and the output file agree.
 > **#1581 -- a pour-only join must be one KiCad's fill makes.** A removal
 > that SPLITS the net's copper (the net's copper-only graph gains a
 > component) leaves one side joined to the rest only by the pour, and both
-> grades above read that join off the fill MODEL, which pours channels
-> KiCad does not: its min-thickness opening passes a 45-degree gap down to
-> about 0.07 mm at min_thickness 0.1, and it keeps no hole clearance. So
-> such a removal is graded a third time, with the zone credit taken from
+> grades above read that join off the fill MODEL, a raster of KiCad's fill
+> (since #1608 it keeps the hole clearance and opens at min_thickness as
+> KiCad does, but it is still sampled, and its probe is widened). So such a
+> removal is graded a third time, with the zone credit taken from
 > `plane_fill_model.trusted_zone_model` (passed as
 > `check_net_connectivity(..., fill_model_for=...)`): KiCad's own fill when
 > it is installed, else a CONSERVATIVE `ZoneFillModel` whose free cells are
@@ -205,13 +205,25 @@ the routing pipeline applies both so the model and the output file agree.
 > edge, the zone outline and the board edge, with every foreign drill kept
 > at the board's hole clearance (`fill_hole_clearance`: the declared rule,
 > else pcbnew's factory 0.25), queried at the point's own cell. A path of
-> such cores is fill KiCad pours. Measured: a GND pad ringed by four
-> via-in-pad pins lost its only stub through a 0.086 mm gap and shipped
-> open. Removals that keep a copper path never reach this grade, and the
+> such cores is fill KiCad pours. Measured before #1608: a GND pad ringed
+> by four via-in-pad pins lost its only stub through a 0.086 mm gap and
+> shipped open. Removals that keep a copper path never reach this grade, and the
 > conservative model is never published to the shared caches.
 > `tests/test_1581_graze_prune_pour_only_join.py` pins it, and
 > `tests/test_1581_route_keeps_pour_only_join_kicad.py` grades route.py's
 > output with KiCad.
+>
+> **#1619 -- at the classes KiCad fills at.** The conservative model carves
+> each foreign item at max(zone clearance, its net class), as KiCad's refill
+> does, from the prune's own `net_clearances` (`trusted_zone_model(...,
+> net_clearances=)`) -- route.py's cleanup holds the class map but does not
+> publish it on the board, so the model used to carve at the zone's clearance
+> alone and pour onto a pad that the 0.5 mm class pads beside it keep KiCad's
+> fill 0.36 mm away from. And a segment is a candidate only when it grazes at
+> the pair's real clearance: with `config` the prune reads the
+> class/type-scoped `.kicad_dru` rules (#1491) pair-exact, as check_drc does
+> and as the nudges do since #1561, so a stub a rule allows is not removed.
+> `tests/test_1619_graze_prune_class_fill.py` pins both.
 
 > **#1227 -- a dead-end prune never splits copper.** Every gated dead-end pass
 > (`add_route_to_pcb_data`'s per-commit prune, `sweep_dead_ends`,
@@ -238,11 +250,11 @@ the routing pipeline applies both so the model and the output file agree.
 ### File-level post-passes
 
 ```python
-compute_plane_copper_cleanup(pcb, plane_net_names, clearance=0.1,
-                             grid_step=0.05, progress_callback=None)
+compute_plane_copper_cleanup(pcb, plane_net_names, clearance, grid_step,
+                             board_edge_clearance, progress_callback=None)
     -> PlaneCleanupDelta      # connectors, segments_to_remove, vias_to_remove, snapped
-clean_plane_copper(output_file, plane_net_names, clearance=0.1,
-                   grid_step=0.05) -> Tuple[int, int]   # (snapped, removed)
+clean_plane_copper(output_file, plane_net_names, clearance, grid_step,
+                   board_edge_clearance) -> Tuple[int, int]   # (snapped, removed)
 compute_castellated_landing_retract(pcb, board_edge_clearance, margin=0.02)
     -> CastellationRetractDelta   # moves: [(segment, 'start'|'end', new_x, new_y)]
 retract_castellated_landings(output_file, board_edge_clearance) -> int
