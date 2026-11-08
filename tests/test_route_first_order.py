@@ -7,16 +7,20 @@ summary records what the run did.
    order in both loops is honoured; another net ahead of them, the declared
    ones swapped, or a Phase 3 net ahead of a declared one is not; a declared
    net not routed (already connected) does not count; nothing routed is None.
+   A bus member's name ('D[3]') is a name, not a wildcard, as --nets reads
+   it: under --nets /A/* it selects both sheets' D[3] and is refused as GND
+   is, '/B/D[3]' is refused, '/A/D[3]' and the wildcard 'D*' give /A/D[3].
 2. It wins over every reorder before it, each shown in force by a control run
    without the flag: the bus-first reorder (--ordering bus routes a detected
    bus group first), direct-first (#472: a BGA's bare-ball nets first) and
    the global plan's order file (KICAD_GLOBAL_PLAN=1 front-loads a listed
    net). With --route-first the declared net routes first and every other
    net keeps the control's relative order; the summary says it was honoured.
-3. Phase 3: a multipoint net whose pending terminal sits among foreign pads
-   is the boxed-in one, so Phase 3 routes its taps first without the flag.
-   With --route-first naming the other multipoint net, that net's taps route
-   first and the summary's `phase3` says so.
+3. Phase 3: four multipoint nets of boxed-in risks 0, 1, 2, 0 (foreign pads
+   near their terminals), so without the flag Phase 3 routes their taps in
+   risk order, M_3, M_2, M_1, M_4, not the main loop's M_1 ... M_4. With
+   --route-first M_4, M_4's taps route first and M_3, M_2, M_1 keep that
+   exact risk order; the summary's `phase3` says so.
 4. Reconciliation: on a one-layer board where a locked ring walls in SIG_X's
    pad, SIG_X fails and the end-of-run reconciliation retries it alone. With
    --route-first SIG_A that retry runs (no "final reconciliation pass
@@ -77,6 +81,47 @@ def test_record():
         got = rec(*args)
         expect(got['honoured'] is honoured and got['nets'] == args[0],
                f"{what}: honoured {honoured} ({got})")
+    assert len(FAILS) == n, FAILS[n:]
+
+
+def sheets_board(path):
+    """Two sheets, each with a bus member D[3] and a GND."""
+    b = RoutingBoard(40, 30)
+    for i, net in enumerate(('/A/D[3]', '/B/D[3]', '/A/GND', '/B/GND')):
+        b.pad(f'S{2 * i}', 5, 5 + 5 * i, net)
+        b.pad(f'S{2 * i + 1}', 35, 5 + 5 * i, net)
+    return write_board(b.text(), path)
+
+
+def test_names_and_wildcards():
+    from kicad_parser import parse_kicad_pcb
+    from net_ordering import resolve_route_first
+    from net_queries import expand_net_patterns
+    print("a bus member is a name, as --nets reads it; a name keeps every sheet's net")
+    n = len(FAILS)
+    board = sheets_board(os.path.join(TMP, 'sheets.kicad_pcb'))
+    pcb = parse_kicad_pcb(board)
+    scope = expand_net_patterns(pcb, ['/A/*'], quiet=True)
+    expect(sorted(scope) == ['/A/D[3]', '/A/GND'], f"the scope /A/* ({scope})")
+    for pats, want in (
+            (['GND'], '/B/GND not among the nets this run routes'),
+            (['D[3]'], '/B/D[3] not among the nets this run routes'),
+            (['/B/D[3]'], '/B/D[3] not among the nets this run routes'),
+            (['/A/D[3]'], ['/A/D[3]']),
+            (['D*'], ['/A/D[3]'])):
+        try:
+            got = resolve_route_first(pcb, pats, scope)
+        except ValueError as exc:
+            got = str(exc)
+        ok = got == want if isinstance(want, list) else (
+            isinstance(got, str) and got == '--route-first: ' + want)
+        expect(ok, f"{pats}: {want} ({got})")
+    out = os.path.join(TMP, 'sheets_out.kicad_pcb')
+    check([sys.executable, '-X', 'utf8', ROUTE, board, out, '--nets', '/A/*',
+           '--route-first', 'D[3]'],
+          refuse='route.py: error: --route-first: /B/D[3] not among the nets this '
+                 'run routes', code=2)
+    expect(not os.path.exists(out), "route.py refuses 'D[3]' the same way")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -152,36 +197,45 @@ def test_wins_over_reorders():
 
 
 def phase3_board(path):
-    """Two three-pad nets: every M_A pad has a foreign pad 0.9 mm off it (the
-    boxed-in terminal), M_B's pads stand clear."""
-    b = RoutingBoard(50, 40)
-    for i, (x, y) in enumerate([(5, 5), (45, 5), (25, 35)]):
-        b.pad(f'A{i}', x, y, 'M_A')
-        b.pad(f'F{i}a', x + 0.9, y + 0.9, f'F_{i}')
-        b.pad(f'F{i}b', x + 8, y + 0.9, f'F_{i}')
-    for i, (x, y) in enumerate([(5, 20), (45, 20), (25, 12)]):
-        b.pad(f'B{i}', x, y, 'M_B')
+    """Four three-pad nets of boxed-in risks 0, 1, 2 and 0: one-pad foreign
+    nets sit within 1 mm (diagonally) of every pad of M_2 (one each) and M_3
+    (two each), so Phase 3's risk order, M_3, M_2, M_1, M_4, is not the main
+    loop's (M_1 ... M_4)."""
+    b = RoutingBoard(60, 60)
+    k = 0
+    near = {'M_1': (), 'M_2': ((0.9, 0.9),), 'M_3': ((0.9, 0.9), (-0.9, -0.9)),
+            'M_4': ()}
+    for row, net in enumerate(sorted(near)):
+        y = 5 + 13 * row
+        for i, (x, py) in enumerate([(5, y), (55, y), (30, y + 8)]):
+            b.pad(f'{net}{i}', x, py, net)
+            for dx, dy in near[net]:
+                k += 1
+                b.pad(f'K{k}', x + dx, py + dy, f'K_{k}')
     return write_board(b.text(), path)
 
 
 def _phase3_order(log):
     tail = log.split('Multi-point Phase 3:', 1)[-1]
-    return re.findall(r'^(M_[AB]) \(net \d+\):$', tail, re.M)
+    return re.findall(r'^(M_\d) \(net \d+\):$', tail, re.M)
 
 
 def test_phase3():
-    print("Phase 3: the declared net's taps first")
+    print("Phase 3: the declared net's taps first, the rest in risk order")
     n = len(FAILS)
     board = phase3_board(os.path.join(TMP, 'p3.kicad_pcb'))
-    _, _, plain = route(board, 'p3_plain')
-    expect(_phase3_order(plain) == ['M_A', 'M_B'],
-           f"without the flag the boxed-in M_A's taps route first "
-           f"({_phase3_order(plain)})")
-    seq, rec, log = route(board, 'p3_first', '--route-first', 'M_B')
-    expect(seq[:1] == ['M_B'] and _phase3_order(log) == ['M_B', 'M_A'],
-           f"with --route-first M_B: M_B first in the main loop ({seq}) and in "
-           f"Phase 3 ({_phase3_order(log)})")
-    expect(rec and rec['phase3'] == ['M_B'] and rec['honoured'] is True,
+    seq, _, plain = route(board, 'p3_plain')
+    expect(seq == ['M_1', 'M_2', 'M_3', 'M_4']
+           and _phase3_order(plain) == ['M_3', 'M_2', 'M_1', 'M_4'],
+           f"without the flag the main loop routes {seq} and Phase 3 by boxed-in "
+           f"risk, M_3, M_2, M_1, M_4 ({_phase3_order(plain)})")
+    seq, rec, log = route(board, 'p3_first', '--route-first', 'M_4')
+    expect(seq == ['M_4', 'M_1', 'M_2', 'M_3']
+           and _phase3_order(log) == ['M_4', 'M_3', 'M_2', 'M_1'],
+           f"with --route-first M_4: the main loop {seq}; Phase 3 M_4, then the "
+           f"rest in their exact risk order, not the main loop's "
+           f"({_phase3_order(log)})")
+    expect(rec and rec['phase3'] == ['M_4'] and rec['honoured'] is True,
            f"the summary records Phase 3's order ({rec})")
     assert len(FAILS) == n, FAILS[n:]
 
@@ -239,7 +293,8 @@ def test_reconciliation():
 def main():
     global TMP
     with tempfile.TemporaryDirectory() as TMP:
-        for t in (test_record, test_wins_over_reorders, test_phase3, test_reconciliation):
+        for t in (test_record, test_names_and_wildcards, test_wins_over_reorders,
+                  test_phase3, test_reconciliation):
             before = len(FAILS)
             try:
                 t()

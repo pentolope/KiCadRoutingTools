@@ -2402,8 +2402,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             other net keeps the strategy's order (net_ordering.
             order_route_first, applied last in the single-ended loop and to
             Phase 3's taps). A pattern that selects no net, an exclusion, a
-            wildcard that selects none of net_names and a name outside them
-            raise ValueError. JSON_SUMMARY's `route_first` records what the
+            wildcard that selects none of net_names and a name that selects
+            a net outside them (an unqualified name selects every sheet's
+            net of that leaf name) raise ValueError. JSON_SUMMARY's `route_first` records what the
             two loops did (net_ordering.route_first_record). The nested
             reconciliation sub-runs are not given it.
         track_width: Track width in mm (default: defaults.TRACK_WIDTH, 0.3)
@@ -6321,7 +6322,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         from net_ordering import route_first_record
         summary['route_first'] = route_first_record(
             config.route_first, getattr(state, 'main_loop_order', []),
-            getattr(state, 'story_phase3_order', []))
+            getattr(state, 'phase3_routed_order', []))
     if rescue_summary:
         # #331/#371 rescue pass outcome (key absent when nothing was rescued,
         # so pre-rescue JSON_SUMMARY consumers/diffs are unaffected).
@@ -9830,8 +9831,9 @@ For differential pair routing, use route_diff.py:
                              "order, and Phase 3's taps too. A wildcard counts "
                              "only the routed nets it selects; a pattern that "
                              "selects no net, an exclusion, a wildcard that "
-                             "selects none of the routed nets and a name outside "
-                             "them are refused")
+                             "selects none of the routed nets and a name that "
+                             "selects a net outside them (an unqualified name "
+                             "selects every sheet's net of that leaf) are refused")
     parser.add_argument("--direction", "-d", choices=["forward", "backward"],
                         default=None,
                         help="Direction search order for each net route")

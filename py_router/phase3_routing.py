@@ -665,6 +665,9 @@ def run_phase3_tap_routing(
     state.story_phase3_order = [
         (pcb_data.nets[nid].name if nid in pcb_data.nets else str(nid))
         for nid, _ in _p3_pairs]
+    # The nets whose taps this loop starts, in that order (past the skip
+    # below), for the summary's route_first record.
+    state.phase3_routed_order = []
     for net_id, main_result in _p3_pairs:
         # Check for cancellation at start of each phase 3 iteration
         if cancel_check and cancel_check():
@@ -682,6 +685,7 @@ def run_phase3_tap_routing(
 
         net_name = pcb_data.nets[net_id].name if net_id in pcb_data.nets else f"net_{net_id}"
         print(f"\n{net_name} (net {net_id}):")
+        state.phase3_routed_order.append(net_name)
         net_start_time = time.time()
 
         # Get the length-matched result (with meanders applied)

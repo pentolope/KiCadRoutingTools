@@ -2653,7 +2653,9 @@ Options:
                      wildcard counts only the nets the route steps route
                      (--nets, else every net route.py's `*` selects). A
                      pattern that selects no net, an exclusion, a wildcard
-                     that selects none of those nets and a name outside them
+                     that selects none of those nets and a name that selects a
+                     net outside them (an unqualified name selects every
+                     sheet's net of that leaf name)
                      are refused before any step (exit 2).
   --json-out FILE    Also write FILE: `status`, `shipped_step` (the step whose
                      board ships, `input` for the input under --finish),

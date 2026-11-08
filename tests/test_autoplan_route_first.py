@@ -282,7 +282,7 @@ def test_analysis():
     check([sys.executable, '-X', 'utf8', ROUTE, lone, out,
            '--route-first', 'unconnected-(J1-Pad9)'],
           refuse='route.py: error: ' + why, code=2)
-    expect(True, "route.py refuses it for the same reason")
+    expect(not os.path.exists(out), f"route.py: {why}: refused, no board written")
     assert len(FAILS) == n, FAILS[n:]
 
 
