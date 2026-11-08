@@ -653,6 +653,13 @@ def run_phase3_tap_routing(
     net_index = 0
     _p3_pairs = list(_order_nets_by_boxed_in_risk(
         state.pending_multipoint_nets, pcb_data))
+    # --route-first: the declared nets' taps first, in their order; the rest
+    # keep the boxed-in risk order.
+    if getattr(config, 'route_first', None):
+        from net_ordering import order_route_first
+        _p3_pairs = order_route_first(
+            _p3_pairs, config.route_first,
+            name=lambda t: pcb_data.nets[t[0]].name if t[0] in pcb_data.nets else None)
     # Net-story recording: the tap-routing order is part of every deferred
     # terminal's story (which siblings sealed a ball first, and why).
     state.story_phase3_order = [

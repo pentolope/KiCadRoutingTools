@@ -19,6 +19,12 @@ value in both; the following step must see the CLI default in both -- the
 reset_params_to_defaults half, without which a plan leaks one step's value
 into every later step.
 
+The Route First field is followed past the config too: the Route tab's real
+worker must hand batch_route the typed patterns as its route_first kwarg, and
+_validate_routing_inputs must refuse, before routing, the patterns route.py
+refuses (no net, an exclusion, a name not selected) and accept a wildcard
+that selects a selected net.
+
 Needs KiCad's python (re-execs into it); exits 77 when there is none. Seconds.
 
 Run: python3 tests/gui_parity/test_plan_flags_reach_dialog.py
@@ -264,6 +270,51 @@ def _worker_net_clearances(dlg, path):
             for tag, m in seen.items()}
 
 
+def _worker_route_first(dlg, text):
+    """The route_first kwarg the Route tab's REAL worker hands batch_route
+    with the Route First field set to TEXT (a spy engine stops the run)."""
+    import wx
+    import route
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    def _engine(*a, **kw):
+        seen['route_first'] = kw.get('route_first', '<no kwarg>')
+        raise _Stop('engine reached')
+
+    real = (route.batch_route, wx.CallAfter)
+    try:
+        route.batch_route = _engine
+        wx.CallAfter = lambda *a, **k: None
+        dlg.route_first_ctrl.SetValue(text)
+        dlg._run_routing(dlg._build_routing_config(['/CLOCK_IN', '/LED_C'],
+                                                   ['F.Cu', 'B.Cu']))
+    finally:
+        route.batch_route, wx.CallAfter = real
+        dlg.route_first_ctrl.SetValue('')
+    return seen.get('route_first', '<engine not reached>')
+
+
+def _validate_route_first(dlg, text, nets):
+    """(what _validate_routing_inputs returned, the warning boxes it showed)
+    with NETS selected and the Route First field set to TEXT."""
+    import wx
+    boxes = []
+    real = wx.MessageBox
+    try:
+        wx.MessageBox = lambda msg, title='', *a, **k: boxes.append((title, msg)) or wx.OK
+        dlg.net_panel.set_selected_nets(nets)
+        dlg.route_first_ctrl.SetValue(text)
+        got = dlg._validate_routing_inputs()
+    finally:
+        wx.MessageBox = real
+        dlg.route_first_ctrl.SetValue('')
+    return got, boxes
+
+
 def _qfn_engine_layers(dlg, run_until):
     """{'mounted' | 'B.Cu': (layer the tab hands generate_qfn_fanout, the
     warning lines it logged)} from the FanoutTab's REAL QFN run, with the
@@ -409,6 +460,12 @@ def main():
             qfn_runs = _qfn_engine_layers(dlg, run_until)
             ncl_runs = {'file': _worker_net_clearances(dlg, ncl_path),
                         'none': _worker_net_clearances(dlg, '')}
+            rf_runs = {'set': _worker_route_first(dlg, '/LED_C /CLOCK_IN'),
+                       'empty': _worker_route_first(dlg, '')}
+            rf_checks = [
+                (text, _validate_route_first(dlg, text, ['/CLOCK_IN', '/LED_C']))
+                for text in ('/LED_C /CLOCK_IN', 'NOPE', '!/LED_C', '/LED_A',
+                             '/LED_*')]
         finally:
             dlg.Destroy()
         if len(seen) != len(steps):
@@ -486,6 +543,32 @@ def main():
             check(f"{tag} worker with the field empty: the net classes' map "
                   f"(empty on this all-Default board), not the file's",
                   none == {}, f"{none}")
+
+        print("\n[6] Route First reaches the engine: the Route tab's worker "
+              "hands batch_route the patterns in order, as route.py "
+              "--route-first does, and None when the field is empty")
+        check("field set: batch_route(route_first=...) in the typed order",
+              rf_runs['set'] == ['/LED_C', '/CLOCK_IN'], f"{rf_runs['set']!r}")
+        check("field empty: batch_route(route_first=None), the CLI's omitted flag",
+              rf_runs['empty'] is None, f"{rf_runs['empty']!r}")
+
+        print("\n[7] Route First is refused before routing for route.py's "
+              "reasons (selected nets /CLOCK_IN and /LED_C)")
+        for text, want in (
+                ('/LED_C /CLOCK_IN', None),
+                ('NOPE', 'NOPE selects no net on this board'),
+                ('!/LED_C', '!/LED_C is an exclusion'),
+                ('/LED_A', '/LED_A not among the nets this run routes'),
+                ('/LED_*', None)):
+            got, boxes = dict(rf_checks)[text]
+            if want is None:
+                check(f"{text!r} accepted", got[0] is not None and not boxes,
+                      f"returned nets {got[0]!r}, boxes {boxes}")
+            else:
+                check(f"{text!r} refused: {want}",
+                      got == (None, None) and len(boxes) == 1
+                      and boxes[0][0] == 'Invalid Route First' and want in boxes[0][1],
+                      f"returned {got!r}, boxes {boxes}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
