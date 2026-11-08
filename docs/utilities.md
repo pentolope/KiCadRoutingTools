@@ -2639,6 +2639,21 @@ Options:
                      keep the floor their escapes need.
   --quick LEVEL      route.py's --quick LEVEL (1 or 2) for every route step:
                      a chain to judge a placement by, not to ship.
+  --route-first PATTERN [...]
+                     Route the nets the patterns select before every other net
+                     in each route pass, in the order given (one pattern's nets
+                     by name, as route.py's --nets lists them): each pass's
+                     --nets starts with a pattern for each of them, and the
+                     pass runs route.py's `--ordering original`, so the other
+                     nets follow in --nets order rather than mps order. The
+                     analysis states the nets in order (`route_first`); each
+                     pass's step records the declared nets its log says
+                     route.py routed and whether they came first, in that
+                     order (`route_first`: `routed`, `honoured`, null when it
+                     routed none), and AUTOPLAN_SUMMARY gives both for the pass
+                     that ships. A pattern that selects no net, an exclusion
+                     and a net outside --nets are refused before any step
+                     (exit 2).
   --json-out FILE    Also write FILE: `status`, `shipped_step` (the step whose
                      board ships, `input` for the input under --finish),
                      `shipped_board`, `route_summary` -- the object route.py's

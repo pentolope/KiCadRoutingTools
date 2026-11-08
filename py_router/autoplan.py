@@ -82,6 +82,17 @@ which their escapes need.
 --quick LEVEL passes route.py's --quick LEVEL to every route step: the chain
 judges a placement and is not shipped.
 
+--route-first PATTERN [...] routes the nets the patterns select before every
+other net in each route pass, in the order the patterns are given (one
+pattern's nets by name, as route.py's --nets lists them): each pass's --nets
+starts with a pattern for each of them and the pass runs route.py's
+--ordering original, so the other nets follow in --nets order, not mps
+order. The analysis states the nets in order (`route_first`), each pass the
+nets its log says route.py routed and whether they came first, in that order
+(`route_first` on the step), and AUTOPLAN_SUMMARY both for the pass that
+ships. A pattern that selects no net, an exclusion and a net outside --nets
+are refused before any step runs (exit 2).
+
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
 routing CLI takes. autoplan's own floors (step 1) come from them, and it
 passes each one the caller gave to every step that takes them (planes,
@@ -419,7 +430,7 @@ def plane_layers(n):
 
 
 def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
-            keep_pours=False, fab_args=(), only=(), route_track=None):
+            keep_pours=False, fab_args=(), only=(), route_track=None, route_first=()):
     from kicad_parser import parse_kicad_pcb, pour_zones
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs)
@@ -536,6 +547,7 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     power_nets = [n for n in power_nets if n in globs]
     pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
              if pairs[i] in globs and pairs[i + 1] in globs]
+    first = _route_first(pcb, route_first, names, scope) if route_first else None
 
     out = dict(layers=layers, clearance=clearance, track=track, via=via,
                drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
@@ -551,11 +563,37 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         out['net_patterns'] = list(only)
     if route_track is not None:
         out['route_track'] = route_track
+    if first is not None:
+        out['route_first'] = first
+        out['route_first_patterns'] = list(route_first)
     if keep_pours:
         out['keep_pours'] = True
     if fab_args:
         out['fab_args'] = list(fab_args)
     return out
+
+
+def _route_first(pcb, patterns, names, scope):
+    """The nets PATTERNS select, in the order the patterns are given (each
+    pattern's own nets by name, as route.py's --nets lists them), each once.
+    A pattern that selects no net, an exclusion, a net outside SCOPE (the
+    caller's --nets) and a net no pattern isolates are refused."""
+    from net_queries import expand_net_patterns
+    first = []
+    for p in patterns:
+        if p.startswith('!') and p not in names:
+            raise Refused(f"--route-first: {p} is an exclusion; name the nets to route first")
+        got = [n for n in expand_net_patterns(pcb, [p], quiet=True) if n in names]
+        if not got:
+            raise Refused(f"--route-first: {p} selects no net on this board")
+        first += [n for n in got if n not in first]
+    outside = [n for n in first if scope is not None and n not in scope]
+    if outside:
+        raise Refused(f"--route-first: {', '.join(outside)} not among the nets --nets selects")
+    alone = [n for n in first if not _selects_exactly(_glob(n), n, names)]
+    if alone:
+        raise Refused(f"--route-first: no pattern selects only {', '.join(alone)} on this board")
+    return first
 
 
 # --------------------------------------------------------------------------
@@ -986,7 +1024,9 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     could not route without it. The REROUTE nets are first ripped and routed
     again on their own. Every step routes the power nets at RAIL_WIDTH, with
     the caller's --power-nets ahead of them, so a net those select routes at
-    their width. With
+    their width. The caller's --route-first nets head each pass's --nets, in
+    their order, under route.py's --ordering original, and each pass records
+    what its log says route.py did with them (`route_first_record`). With
     ROUTE_JSON each pass writes route.py's --json-out beside its board.
     Returns (chain, best board or None, its grade or None)."""
     def route_args(costs):
@@ -1009,7 +1049,9 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
         shared += ['--rip-existing-nets', *rip]
     if quick:
         shared += ['--quick', str(quick)]
-    base = ['{IN}', '{OUT}', '--nets', *_scope_args(a)] + shared
+    order = a.get('route_first') or []
+    base = (['{IN}', '{OUT}', '--nets', *[_glob(n) for n in order], *_scope_args(a)]
+            + (['--ordering', 'original'] if order else []) + shared)
     best = None                        # (grade, board)
     if finish:
         g = ch.grade(ch.cur)
@@ -1043,6 +1085,9 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
                 break
         out, _, _ = ch.run('route', route_args(crossing if i else costs),
                            'route' + (f'_p{i + 1}' if i else ''))
+        if order:
+            ch.steps[-1]['route_first'] = route_first_record(
+                os.path.join(ch.work, ch.steps[-1]['log']), order)
         if ch.last_iterations is not None:
             spent = (spent or 0) + ch.last_iterations
             if first is None:
@@ -1068,9 +1113,36 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     return ch, (best[1] if best else None), (best[0] if best else None)
 
 
+#: route.py's line for each net its main loop starts, with the net's name.
+_ROUTING_LINE = re.compile(r'^\[\d+/\d+(?: \(\d+ \w+\))*\] Routing (.*) \(id=\d+\)$', re.M)
+
+
+def route_first_record(log, order):
+    """What the route step's LOG says of ORDER, the nets the caller declared
+    to route first: {'routed': those it routed, in the order it first routed
+    them, 'honoured': whether they were the first nets it routed, in ORDER's
+    order}. A net already connected is not routed and is not counted against
+    it; 'honoured' is None when the log names no net routed."""
+    try:
+        text = open(log, errors='replace').read()
+    except OSError:
+        text = ''
+    seq = list(dict.fromkeys(m.group(1) for m in _ROUTING_LINE.finditer(text)))
+    routed = [n for n in seq if n in order]
+    return {'routed': routed,
+            'honoured': (seq[:len(routed)] == routed
+                         and routed == [n for n in order if n in routed]) if seq else None}
+
+
 #: The tags route_passes gives its passes; the diff-pair reroute is a route
 #: step but not a pass.
 _PASS_TAG = re.compile(r'route(_p\d+)?')
+
+
+def _step_of(ch, board):
+    """The step of CH that wrote BOARD, or None (the input, or no board)."""
+    stem = board and os.path.basename(board)[:-len('.kicad_pcb')]
+    return next((s for s in ch.steps if stem and s.get('log') == stem + '.log'), None)
 
 
 def shipped_record(ch, final):
@@ -1080,8 +1152,7 @@ def shipped_record(ch, final):
     --json-out, as written. `status` says which: 'route_pass',
     'route_pass_without_summary', 'no_route_pass' or 'no_board', each but
     the first with `why`."""
-    stem = final and os.path.basename(final)[:-len('.kicad_pcb')]
-    step = next((s for s in ch.steps if stem and s.get('log') == stem + '.log'), None)
+    step = _step_of(ch, final)
     doc = {'status': None, 'shipped_board': final and os.path.basename(final),
            'shipped_step': step['tag'] if step else (final and 'input'),
            'route_summary': None}
@@ -1193,6 +1264,13 @@ def main():
     ap.add_argument('--quick', type=int, choices=(1, 2), default=0, metavar='LEVEL',
                     help='every route step runs at route.py\'s --quick LEVEL: a '
                          'chain to judge a placement by, not to ship')
+    ap.add_argument('--route-first', nargs='+', default=[], metavar='PATTERN',
+                    help='the nets these patterns select route first in every route '
+                         'pass, in the order given (a pattern\'s own nets by name), '
+                         'under route.py\'s --ordering original, so every other net '
+                         'follows in --nets order rather than mps order. A pattern '
+                         'that selects no net, an exclusion and a net outside --nets '
+                         'are refused before any step runs')
     ap.add_argument('--json-out', metavar='FILE',
                     help='also write FILE: the shipped route pass\'s route.py '
                          '--json-out summary, the step that produced the shipped '
@@ -1235,7 +1313,7 @@ def main():
         a = analyze(args.input_file, finish=args.finish, plane_cost=args.plane_layer_cost,
                     caller_power=list(zip(args.power_nets, args.power_nets_widths)),
                     keep_pours=args.keep_pours, fab_args=fab_args, only=args.nets,
-                    route_track=args.track_width)
+                    route_track=args.track_width, route_first=args.route_first)
     except Refused as exc:
         print(f"AUTOPLAN: refused: {exc}", flush=True)
         return 2
@@ -1283,13 +1361,18 @@ def main():
         return 1
     _ship(final, out)
     write_json_out()
-    print("AUTOPLAN_SUMMARY: " + json.dumps(
-        {'final_step': os.path.basename(final),
-         'open': grade['open'] if grade else None,
-         'drc': grade['drc'] if grade else None,
-         'drc_items': grade['drc_items'] if grade else None,
-         'steps': len(ch.steps),
-         'skipped': [s['tag'] for s in ch.steps if not s.get('ok', True)]}), flush=True)
+    summary = {'final_step': os.path.basename(final),
+               'open': grade['open'] if grade else None,
+               'drc': grade['drc'] if grade else None,
+               'drc_items': grade['drc_items'] if grade else None,
+               'steps': len(ch.steps),
+               'skipped': [s['tag'] for s in ch.steps if not s.get('ok', True)]}
+    if 'route_first' in a:
+        # The declared order, and what the shipped pass's log says of it
+        # (None when the board that ships is no route pass's).
+        summary['route_first'] = {'nets': a['route_first'],
+                                  'shipped': (_step_of(ch, final) or {}).get('route_first')}
+    print("AUTOPLAN_SUMMARY: " + json.dumps(summary), flush=True)
     return 0
 
 
