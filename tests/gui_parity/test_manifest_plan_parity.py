@@ -139,6 +139,8 @@ LIST_FLAGS = {
     # #1869: route_diff's intra-pair lane ('auto' or P_NET=REF.PAD:REF.PAD ...)
     '--diff-pair-intra-lane': 'diff_pair_intra_lane',
     '--coplanar-nets': 'coplanar_nets',
+    # route.py's route-first patterns, in order.
+    '--route-first': 'route_first',
     # bga_fanout's future-pour declaration: collected by the converter and
     # then never copied into the step (26 kept corpus steps on 18 boards).
     '--plane-net-layers': 'plane_net_layers',
@@ -511,7 +513,7 @@ _ACTION_BLOCK_HANDLED = {
 # Params that MUST resolve to a GUI control (the D5 fallback list + D3 polarity
 # + D7 QFN width/clearance).
 _MUST_RESOLVE = {
-    'rip_existing_nets',
+    'rip_existing_nets', 'route_first',
     'impedance', 'ordering', 'direction', 'time_matching',
     'keepout', 'guide_corridor', 'length_match_groups', 'swappable_nets',
     'polarity_swap_nets', 'qfn_track_width', 'qfn_clearance',

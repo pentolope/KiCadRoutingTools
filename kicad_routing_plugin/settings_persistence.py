@@ -81,6 +81,7 @@ def get_dialog_settings(dialog):
         'via_span_type': dialog.via_span_type.GetStringSelection(),
         'via_span_escape': dialog.via_span_escape.GetStringSelection(),
         'rip_existing_nets': dialog.rip_existing_nets_ctrl.GetValue(),
+        'route_first': dialog.route_first_ctrl.GetValue(),
         'layer_costs': dialog.layer_costs_ctrl.GetValue(),
 
         # Advanced parameters
@@ -429,6 +430,8 @@ def restore_dialog_settings(dialog, settings):
         dialog.via_span_escape.SetSelection(_i if _i >= 0 else 0)
     if 'rip_existing_nets' in settings:
         dialog.rip_existing_nets_ctrl.SetValue(settings['rip_existing_nets'])
+    if 'route_first' in settings:
+        dialog.route_first_ctrl.SetValue(settings['route_first'])
     if 'layer_costs' in settings:
         dialog.layer_costs_ctrl.SetValue(settings['layer_costs'])
 

@@ -139,6 +139,51 @@ def order_pin_joins_last(net_ids: List[Tuple[str, int]]) -> List[Tuple[str, int]
     return [t for t in net_ids if t not in pin_join] + pin_join
 
 
+def resolve_route_first(pcb_data: PCBData, patterns: List[str],
+                        scope: Optional[List[str]] = None) -> List[str]:
+    """The nets a route-first list names, in the order it names them.
+
+    Each pattern is read as --nets reads it (expand_net_patterns: wildcards,
+    a sheet's last component); one pattern's nets come in name order, and a
+    net two patterns select comes once, at its first. Raises ValueError, with
+    the reason, for a pattern that selects no net, an exclusion (a leading
+    '!' that names no net) and a net outside SCOPE (the run's nets, when
+    given): a priority that cannot be honoured is refused, not dropped.
+    """
+    from net_queries import expand_net_patterns
+    names = {n.name for n in pcb_data.nets.values() if n.name}
+    first: List[str] = []
+    for p in patterns:
+        if p.startswith('!') and p not in names:
+            raise ValueError(f"--route-first: {p} is an exclusion; name the nets to route first")
+        got = [n for n in expand_net_patterns(pcb_data, [p], quiet=True) if n in names]
+        if not got:
+            raise ValueError(f"--route-first: {p} selects no net on this board")
+        first += [n for n in got if n not in first]
+    if scope is not None:
+        inside = set(scope)
+        outside = [n for n in first if n not in inside]
+        if outside:
+            raise ValueError(f"--route-first: {', '.join(outside)} not among the nets "
+                             f"this run routes")
+    return first
+
+
+def order_route_first(net_ids: List[Tuple[str, int]],
+                      first: List[str]) -> List[Tuple[str, int]]:
+    """Move the FIRST nets to the front, in FIRST's order; every other net
+    keeps its place relative to the rest, so the strategy's order (mps, bus
+    groups, direct-first) stands for them. A FIRST net not in NET_IDS (already
+    connected) is skipped."""
+    rank = {n: i for i, n in enumerate(first)}
+    front = sorted((t for t in net_ids if t[0] in rank), key=lambda t: rank[t[0]])
+    if not front:
+        return net_ids
+    print(f"Route-first ordering: {len(front)} declared net(s) routed first: "
+          f"{', '.join(nm for nm, _ in front[:8])}{', ...' if len(front) > 8 else ''}")
+    return front + [t for t in net_ids if t[0] not in rank]
+
+
 def order_nets_inside_out(
     pcb_data: PCBData,
     net_ids: List[Tuple[str, int]],
