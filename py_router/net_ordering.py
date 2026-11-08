@@ -139,9 +139,14 @@ def order_pin_joins_last(net_ids: List[Tuple[str, int]]) -> List[Tuple[str, int]
     return [t for t in net_ids if t not in pin_join] + pin_join
 
 
-#: A route-first pattern with one of these is a wildcard: it may select nets
-#: outside the run, and only the ones inside count.
-_WILDCARD_CHARS = '*?['
+def _is_wildcard(pattern: str, names) -> bool:
+    """PATTERN is a wildcard (it may select nets outside the run, and only
+    the ones inside count) as net_queries.net_pattern_matches reads it: it
+    holds '*' or '?', or a '[' and spells no net's name or leaf (#1641: a
+    bus member 'D[3]' is that net, literally)."""
+    from net_queries import _pattern_names_a_net
+    return ('*' in pattern or '?' in pattern
+            or ('[' in pattern and not _pattern_names_a_net(pattern, frozenset(names))))
 
 
 def resolve_route_first(pcb_data: PCBData, patterns: List[str],
@@ -151,11 +156,13 @@ def resolve_route_first(pcb_data: PCBData, patterns: List[str],
     Each pattern is read as --nets reads it (expand_net_patterns: wildcards,
     a sheet's last component); one pattern's nets come in name order, and a
     net two patterns select comes once, at its first. With SCOPE (the run's
-    nets) a wildcard keeps the nets it selects inside SCOPE, and a name
-    selects only itself. Raises ValueError, with the reason, for a pattern
-    that selects no net, an exclusion (a leading '!' that names no net), a
-    wildcard that selects none of SCOPE and a name outside SCOPE: a priority
-    that cannot be honoured is refused, not dropped.
+    nets) a wildcard (`_is_wildcard`) keeps the nets it selects inside SCOPE,
+    and a name keeps every net it selects -- an unqualified one ('GND',
+    'D[3]') every sheet's net of that leaf name -- so each must be in SCOPE.
+    Raises ValueError, with the reason, for a pattern that selects no net, an
+    exclusion (a leading '!' that names no net), a wildcard that selects none
+    of SCOPE and a name that selects a net outside SCOPE: a priority that
+    cannot be honoured is refused, not dropped.
     """
     from net_queries import expand_net_patterns
     names = {n.name for n in pcb_data.nets.values() if n.name}
@@ -169,7 +176,7 @@ def resolve_route_first(pcb_data: PCBData, patterns: List[str],
         if not got:
             raise ValueError(f"--route-first: {p} selects no net on this board")
         if inside is not None:
-            if any(c in p for c in _WILDCARD_CHARS):
+            if _is_wildcard(p, names):
                 got = [n for n in got if n in inside]
                 if not got:
                     raise ValueError(f"--route-first: {p} selects none of the nets "
@@ -202,10 +209,11 @@ def route_first_record(first: List[str], main_order: List[str],
                        phase3_order: List[str]) -> Dict:
     """The JSON summary's `route_first`: the declared nets (FIRST), those the
     single-ended loop started, in the order it started them (`main_loop`),
-    those Phase 3 routed taps for, in its order (`phase3`), and `honoured`:
-    in each, the declared nets came before every other net, in FIRST's
-    order. None when neither routed a net. Only this run's own loops count;
-    a nested sub-run (reconciliation, plane finalize) is not this order."""
+    those whose taps Phase 3 started routing, in its order (`phase3`), and
+    `honoured`: in each, the declared nets came before every other net, in
+    FIRST's order (None when neither routed a net). Only this run's own
+    loops count; a nested sub-run (reconciliation, plane finalize) is not
+    this order."""
     rank = {n: i for i, n in enumerate(first)}
 
     def seen(seq):

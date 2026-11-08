@@ -92,8 +92,9 @@ nets its single-ended loop and Phase 3 routed, in order, and whether they came
 first; `route_first` on the step), and AUTOROUTE_SUMMARY both for the pass
 that ships. A wildcard counts only the nets the route steps route (--nets,
 else every net route.py's '*' selects). A pattern that selects no net, an
-exclusion, a wildcard that selects none of those nets and a name outside them
-are refused before any step runs (exit 2).
+exclusion, a wildcard that selects none of those nets and a name that selects
+a net outside them (an unqualified name selects every sheet's net of that
+leaf name) are refused before any step runs (exit 2).
 
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
 routing CLI takes. autoroute's own floors (step 1) come from them, and it
@@ -649,8 +650,8 @@ def _route_first(pcb, patterns, names, scope):
     order route.py's --route-first reads them (net_ordering.
     resolve_route_first: each pattern's own nets by name, each net once, a
     wildcard's only inside SCOPE). A pattern that selects no net, an
-    exclusion, a wildcard that selects none of SCOPE, a name outside it and a
-    net no pattern isolates are refused."""
+    exclusion, a wildcard that selects none of SCOPE, a name that selects a
+    net outside it and a net no pattern isolates are refused."""
     from net_ordering import resolve_route_first
     try:
         first = resolve_route_first(pcb, list(patterns), scope)
