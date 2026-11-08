@@ -9,15 +9,17 @@ order, and the run says whether route.py did so.
    declared order; its --nets and every other argument, and every other step
    (the diff-pair reroute included), are the chain autoplan builds without
    the flag.
-2. route_first_record against route.py's progress lines as single_ended_loop
-   prints them: the declared nets first and in order is honoured; another net
-   ahead of them, or the declared two swapped, is not; a declared net already
-   connected (absent from the log) does not count against it; a log naming no
-   routed net is unknown (None).
+2. route_first_record is route.py's own JSON_SUMMARY record: the outermost
+   run's, though a reconciliation sub-run's summary comes after it, and not
+   the progress lines (a declared net routed only in a sub-run does not
+   count); None when no summary carries one.
 3. Analysis: the nets in pattern order, a pattern's own nets by name, each
    once; a pattern that selects no net, an exclusion and a net outside --nets
    are refused for their reason (exit 2) before any step runs; route.py
-   refuses the same three for the same reasons.
+   refuses the same three for the same reasons. A wildcard keeps only the
+   routed nets it selects, and is refused only when it selects none of them.
+   Without --nets the scope is route.py's '*', so a single-pad unconnected-*
+   net is refused before any step, as route.py refuses it.
 4. A real run on a synthetic 2-layer board of four two-pad nets: with
    --route-first SIG_D SIG_B the route step's command line and route.py's own
    log put SIG_D, then SIG_B, ahead of SIG_A and SIG_C, and the analysis, the
@@ -58,12 +60,15 @@ def expect(cond, what):
         FAILS.append(what)
 
 
-def synthetic_board(path):
-    """Four two-pad nets across a 40 x 30 mm two-layer board, one row each."""
+def synthetic_board(path, lone=None):
+    """Four two-pad nets across a 40 x 30 mm two-layer board, one row each;
+    LONE names a one-pad net too."""
     b = RoutingBoard(40, 30)
     for i, net in enumerate(NETS):
         b.pad(f'P{2 * i + 1}', 5, 5 + 5 * i, net)
         b.pad(f'P{2 * i + 2}', 35, 5 + 5 * i, net)
+    if lone:
+        b.pad('J1', 20, 27, lone)
     return write_board(b.text(), path)
 
 
@@ -187,42 +192,39 @@ def test_steps():
     assert len(FAILS) == n, FAILS[n:]
 
 
-def _log(*nets, extra=''):
-    """A route log with single_ended_loop's progress line for each of NETS."""
-    lines = [f"[{i}/{len(nets)}{extra if i > 1 else ''}] Routing {nm} (id={i + 7})"
-             for i, nm in enumerate(nets, 1)]
-    return 'Using original net order (no sorting)\n\n' + '\n\n'.join(lines) + '\n'
+def _summary_line(**kw):
+    return 'JSON_SUMMARY: ' + json.dumps(dict({'successful': 1, 'failed': 0}, **kw))
 
 
 def test_record():
-    print("route_first_record: what route.py's log says of the declared nets")
+    print("route_first_record: route.py's own record, not its progress lines")
     n = len(FAILS)
-    order = ['/B', 'Net-(U1-PA0)']
+    rec = {'nets': ['/D'], 'main_loop': ['/D'], 'phase3': [], 'honoured': True}
+    # The outermost run's summary carries the record; a reconciliation
+    # sub-run then prints its own progress lines and a summary without one,
+    # routing an undeclared net ahead of nothing and the declared /D again.
+    log = '\n'.join([
+        '[1/2] Routing /D (id=4)', '[2/2] Routing /A (id=1)',
+        _summary_line(route_first=rec),
+        'Final reconciliation: retrying 1 incomplete/custody net(s)',
+        '[1/1] Routing /A (id=1)', _summary_line(scope='reconciliation-subset')])
+    path = os.path.join(TMP, 'route.log')
     for text, want, what in (
-            (_log('/B', 'Net-(U1-PA0)', '/A', extra=' (1 failed) (2 ripped)'),
-             {'routed': ['/B', 'Net-(U1-PA0)'], 'honoured': True},
-             "first and in order"),
-            (_log('/A', '/B', 'Net-(U1-PA0)'),
-             {'routed': ['/B', 'Net-(U1-PA0)'], 'honoured': False},
-             "another net routed ahead of them"),
-            (_log('Net-(U1-PA0)', '/B', '/A'),
-             {'routed': ['Net-(U1-PA0)', '/B'], 'honoured': False},
-             "the declared two swapped"),
-            (_log('/B', '/A', 'Net-(U1-PA0)'),
-             {'routed': ['/B', 'Net-(U1-PA0)'], 'honoured': False},
-             "in order, but another net between them"),
-            (_log('Net-(U1-PA0)', '/A'),
-             {'routed': ['Net-(U1-PA0)'], 'honoured': True},
-             "/B already connected, so not routed"),
-            ('All nets already connected\n', {'routed': [], 'honoured': None},
-             "no net routed")):
-        path = os.path.join(TMP, 'route.log')
+            (log, rec, "the outermost summary's record, though the last "
+                       "summary is the sub-run's"),
+            # Progress lines that would read as another net first: route.py
+            # recorded its own loop, and that is what counts.
+            ('[1/1] Routing /A (id=1)\n' + _summary_line(route_first=rec)
+             + '\n[1/1] Routing /D (id=4)\n', rec,
+             "a declared net routed only in a sub-run's lines does not count"),
+            (_summary_line() + '\n', None, "a summary with no record: none"),
+            ('All nets are already fully connected\n', None, "no summary: none")):
         with open(path, 'w') as fh:
             fh.write(text)
-        got = AP.route_first_record(path, order)
-        expect(got == want, f"{what}: {want} ({got})")
-    got = AP.route_first_record(os.path.join(TMP, 'missing.log'), order)
-    expect(got == {'routed': [], 'honoured': None}, f"no log: unknown ({got})")
+        got = AP.route_first_record(path)
+        expect(got == want, f"{what} ({got})")
+    expect(AP.route_first_record(os.path.join(TMP, 'missing.log')) is None,
+           "no log: none")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -256,7 +258,37 @@ def test_analysis():
         check([sys.executable, '-X', 'utf8', ROUTE, board, out, *argv],
               refuse=f'route.py: error: {why}', code=2)
         expect(not os.path.exists(out), f"route.py: {why}: refused, no board written")
+
+    print("a wildcard counts only the nets the run routes; a name outside refuses")
+    a = _analysis(board, '--nets', 'SIG_A', 'SIG_B', '--route-first', 'SIG_*')
+    expect(a.get('route_first') == ['SIG_A', 'SIG_B'],
+           f"--nets SIG_A SIG_B --route-first 'SIG_*': SIG_A, SIG_B; SIG_C and SIG_D "
+           f"are outside and dropped ({a.get('route_first')})")
+    why = "--route-first: SIG_[CD] selects none of the nets this run routes"
+    for tool, prefix in ((SCRIPT, 'AUTOPLAN: refused: '), (ROUTE, 'route.py: error: ')):
+        check([sys.executable, '-X', 'utf8', tool, board, out, '--nets', 'SIG_A', 'SIG_B',
+               '--route-first', 'SIG_[CD]'], refuse=prefix + why, code=2)
+        expect(not os.path.exists(out), f"{os.path.basename(tool)}: {why}")
+
+    print("without --nets the scope is route.py's '*', which leaves out a "
+          "single-pad unconnected-* net")
+    lone = synthetic_board(os.path.join(TMP, 'lone.kicad_pcb'), lone='unconnected-(J1-Pad9)')
+    why = "--route-first: unconnected-(J1-Pad9) not among the nets this run routes"
+    check([sys.executable, '-X', 'utf8', SCRIPT, lone, out,
+           '--route-first', 'unconnected-(J1-Pad9)'],
+          refuse='AUTOPLAN: refused: ' + why, code=2)
+    expect(not os.path.exists(out + '.autoplan') and not os.path.exists(out),
+           f"{why}: refused before any step runs, as route.py refuses it")
+    check([sys.executable, '-X', 'utf8', ROUTE, lone, out,
+           '--route-first', 'unconnected-(J1-Pad9)'],
+          refuse='route.py: error: ' + why, code=2)
+    expect(True, "route.py refuses it for the same reason")
     assert len(FAILS) == n, FAILS[n:]
+
+
+#: route.py's record of --route-first SIG_D SIG_B on the four-net board.
+RF_DB = {'nets': ['SIG_D', 'SIG_B'], 'main_loop': ['SIG_D', 'SIG_B'], 'phase3': [],
+         'honoured': True}
 
 
 def _routing_order(log):
@@ -286,7 +318,7 @@ def test_run():
         seq = _routing_order(evidence(os.path.join(out + '.autoplan', s['log']), 'route log'))
         expect(seq[:2] == ['SIG_D', 'SIG_B'] and sorted(seq) == NETS,
                f"{s['tag']}: route.py routed SIG_D, then SIG_B, then the rest ({seq})")
-        expect(s.get('route_first') == {'routed': ['SIG_D', 'SIG_B'], 'honoured': True},
+        expect(s.get('route_first') == RF_DB,
                f"{s['tag']}: the pass records it honoured ({s.get('route_first')})")
     expect(plan['analysis'].get('route_first') == ['SIG_D', 'SIG_B'],
            f"plan.json's analysis states the order ({plan['analysis'].get('route_first')})")
@@ -300,7 +332,7 @@ def test_run():
     summary = json.loads(m.group(1)) if m else {}
     expect(summary.get('route_first') == {
         'nets': ['SIG_D', 'SIG_B'],
-        'shipped': {'routed': ['SIG_D', 'SIG_B'], 'honoured': True}},
+        'shipped': RF_DB},
         f"AUTOPLAN_SUMMARY states the order and that it was honoured "
         f"({summary.get('route_first')})")
     expect(summary.get('open') == 0, f"the board routes ({summary.get('open')} open)")
@@ -347,7 +379,8 @@ def test_rest_keep_mps():
     want = ['C_ROW'] + [x for x in plain if x != 'C_ROW']
     expect(seq == want, f"autoplan's first pass: C_ROW, then the rest in route.py's own "
                         f"order ({seq}, want {want})")
-    expect(p1.get('route_first') == {'routed': ['C_ROW'], 'honoured': True},
+    expect(p1.get('route_first') == {'nets': ['C_ROW'], 'main_loop': ['C_ROW'],
+                                     'phase3': [], 'honoured': True},
            f"and the pass records it honoured ({p1.get('route_first')})")
     first = routed('--route-first', 'C_ROW', tag='first')
     want = ['C_ROW'] + [x for x in plain if x != 'C_ROW']

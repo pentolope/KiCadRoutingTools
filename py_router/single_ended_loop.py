@@ -698,6 +698,8 @@ def route_single_ended_nets(
     if getattr(config, 'route_first', None):
         from net_ordering import order_route_first
         single_ended_nets = order_route_first(single_ended_nets, config.route_first)
+    # The order this loop starts nets in, for the summary's route_first record.
+    state.main_loop_order = []
 
     # Checkpoint abort (KICAD_STOP_AFTER / KICAD_STOP_FILE): stop routing at
     # a defined point, skip every later pass, and WRITE the partial board --
@@ -747,6 +749,7 @@ def route_single_ended_nets(
         _ripped = len(reroute_queue) if reroute_queue else 0
         ripped_str = f" ({_ripped} ripped)" if _ripped else ""
         print(f"\n[{route_index}/{total_routes}{failed_str}{ripped_str}] Routing {net_name} (id={net_id})")
+        state.main_loop_order.append(net_name)
 
         # Report progress
         if progress_callback is not None:

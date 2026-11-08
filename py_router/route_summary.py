@@ -261,6 +261,12 @@ def merge_summaries(summaries: List[Dict], aborted: bool = False,
     def _orank(v):
         return _ORACLE_RANK.get(str(v).split(' ')[0], 0)
 
+    # The route-first record is the outermost run's alone (no sub-run is
+    # given --route-first), so a sub-run's summary must not erase it.
+    _rf = next((s['route_first'] for s in summaries if 'route_first' in s), None)
+    if _rf is not None:
+        merged['route_first'] = _rf
+
     _oracles = [s.get('oracle_check') for s in summaries
                 if s.get('oracle_check') is not None]
     if _oracles:

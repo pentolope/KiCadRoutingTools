@@ -2646,13 +2646,15 @@ Options:
                      as a pattern that selects it alone, and every other net
                      keeps route.py's mps order. The
                      analysis states the nets in order (`route_first`); each
-                     pass's step records the declared nets its log says
-                     route.py routed and whether they came first, in that
-                     order (`route_first`: `routed`, `honoured`, null when it
-                     routed none), and AUTOPLAN_SUMMARY gives both for the pass
-                     that ships. A pattern that selects no net, an exclusion
-                     and a net outside --nets are refused before any step
-                     (exit 2).
+                     pass's step carries route.py's own JSON_SUMMARY record
+                     of them (`route_first`: `nets`, `main_loop`, `phase3`,
+                     `honoured`; null when route.py printed none), and
+                     AUTOPLAN_SUMMARY gives both for the pass that ships. A
+                     wildcard counts only the nets the route steps route
+                     (--nets, else every net route.py's `*` selects). A
+                     pattern that selects no net, an exclusion, a wildcard
+                     that selects none of those nets and a name outside them
+                     are refused before any step (exit 2).
   --json-out FILE    Also write FILE: `status`, `shipped_step` (the step whose
                      board ships, `input` for the input under --finish),
                      `shipped_board`, `route_summary` -- the object route.py's

@@ -2400,9 +2400,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         route_first: Net name patterns whose nets route before every other
             net, in the order given (net_ordering.resolve_route_first); every
             other net keeps the strategy's order (net_ordering.
-            order_route_first, applied last in the single-ended loop). A
-            pattern that selects no net, an exclusion and a net outside
-            net_names raise ValueError.
+            order_route_first, applied last in the single-ended loop and to
+            Phase 3's taps). A pattern that selects no net, an exclusion, a
+            wildcard that selects none of net_names and a name outside them
+            raise ValueError. JSON_SUMMARY's `route_first` records what the
+            two loops did (net_ordering.route_first_record). The nested
+            reconciliation sub-runs are not given it.
         track_width: Track width in mm (default: defaults.TRACK_WIDTH, 0.3)
         track_width_from_class: True = the width was NOT explicitly set by the
             operator (--track-width omitted / GUI override unchecked). Without
@@ -6314,6 +6317,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                     if quick < 2 else
                     'the seed judge: rank placements by what routes, then '
                     'route the chosen one again to ship')}
+    if getattr(config, 'route_first', None):
+        from net_ordering import route_first_record
+        summary['route_first'] = route_first_record(
+            config.route_first, getattr(state, 'main_loop_order', []),
+            getattr(state, 'story_phase3_order', []))
     if rescue_summary:
         # #331/#371 rescue pass outcome (key absent when nothing was rescued,
         # so pre-rescue JSON_SUMMARY consumers/diffs are unaffected).
@@ -8172,6 +8180,10 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             # partial copper (and thrash on a second failure).
             _rk.update(final_reconcile=False, skip_routing=False,
                        force_reroute=False, rip_preexisting=False)
+            # route_first must NOT forward: the sub-run routes only the
+            # retried nets, so a declared net outside them is refused there,
+            # and the order is this run's main loop's, already recorded.
+            _rk.pop('route_first', None)
             # #572 (fix direction 2): hand the oracle's EXACT unroutable
             # links to the sub-run as forced edges. Without them the
             # sub-run's model-credited connectivity both skips the custody
@@ -9815,8 +9827,11 @@ For differential pair routing, use route_diff.py:
                         help="Route the nets these patterns select before every "
                              "other net, in the order given (one pattern's nets "
                              "by name); every other net keeps the --ordering "
-                             "order. A pattern that selects no net, an exclusion "
-                             "and a net outside the routed nets are refused")
+                             "order, and Phase 3's taps too. A wildcard counts "
+                             "only the routed nets it selects; a pattern that "
+                             "selects no net, an exclusion, a wildcard that "
+                             "selects none of the routed nets and a name outside "
+                             "them are refused")
     parser.add_argument("--direction", "-d", choices=["forward", "backward"],
                         default=None,
                         help="Direction search order for each net route")

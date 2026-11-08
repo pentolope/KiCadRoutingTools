@@ -139,49 +139,84 @@ def order_pin_joins_last(net_ids: List[Tuple[str, int]]) -> List[Tuple[str, int]
     return [t for t in net_ids if t not in pin_join] + pin_join
 
 
+#: A route-first pattern with one of these is a wildcard: it may select nets
+#: outside the run, and only the ones inside count.
+_WILDCARD_CHARS = '*?['
+
+
 def resolve_route_first(pcb_data: PCBData, patterns: List[str],
                         scope: Optional[List[str]] = None) -> List[str]:
     """The nets a route-first list names, in the order it names them.
 
     Each pattern is read as --nets reads it (expand_net_patterns: wildcards,
     a sheet's last component); one pattern's nets come in name order, and a
-    net two patterns select comes once, at its first. Raises ValueError, with
-    the reason, for a pattern that selects no net, an exclusion (a leading
-    '!' that names no net) and a net outside SCOPE (the run's nets, when
-    given): a priority that cannot be honoured is refused, not dropped.
+    net two patterns select comes once, at its first. With SCOPE (the run's
+    nets) a wildcard keeps the nets it selects inside SCOPE, and a name
+    selects only itself. Raises ValueError, with the reason, for a pattern
+    that selects no net, an exclusion (a leading '!' that names no net), a
+    wildcard that selects none of SCOPE and a name outside SCOPE: a priority
+    that cannot be honoured is refused, not dropped.
     """
     from net_queries import expand_net_patterns
     names = {n.name for n in pcb_data.nets.values() if n.name}
+    inside = None if scope is None else set(scope)
     first: List[str] = []
+    outside: List[str] = []
     for p in patterns:
         if p.startswith('!') and p not in names:
             raise ValueError(f"--route-first: {p} is an exclusion; name the nets to route first")
         got = [n for n in expand_net_patterns(pcb_data, [p], quiet=True) if n in names]
         if not got:
             raise ValueError(f"--route-first: {p} selects no net on this board")
+        if inside is not None:
+            if any(c in p for c in _WILDCARD_CHARS):
+                got = [n for n in got if n in inside]
+                if not got:
+                    raise ValueError(f"--route-first: {p} selects none of the nets "
+                                     f"this run routes")
+            else:
+                outside += [n for n in got if n not in inside]
         first += [n for n in got if n not in first]
-    if scope is not None:
-        inside = set(scope)
-        outside = [n for n in first if n not in inside]
-        if outside:
-            raise ValueError(f"--route-first: {', '.join(outside)} not among the nets "
-                             f"this run routes")
+    if outside:
+        raise ValueError(f"--route-first: {', '.join(outside)} not among the nets "
+                         f"this run routes")
     return first
 
 
-def order_route_first(net_ids: List[Tuple[str, int]],
-                      first: List[str]) -> List[Tuple[str, int]]:
-    """Move the FIRST nets to the front, in FIRST's order; every other net
-    keeps its place relative to the rest, so the strategy's order (mps, bus
-    groups, direct-first) stands for them. A FIRST net not in NET_IDS (already
+def order_route_first(items: list, first: List[str], name=lambda t: t[0]) -> list:
+    """Move the ITEMS whose NAME is one of FIRST to the front, in FIRST's
+    order; every other item keeps its place relative to the rest, so the
+    order it came in (mps, bus groups, direct-first, the global plan, Phase
+    3's boxed-in risk) stands for them. A FIRST net not in ITEMS (already
     connected) is skipped."""
     rank = {n: i for i, n in enumerate(first)}
-    front = sorted((t for t in net_ids if t[0] in rank), key=lambda t: rank[t[0]])
+    front = sorted((t for t in items if name(t) in rank), key=lambda t: rank[name(t)])
     if not front:
-        return net_ids
+        return items
     print(f"Route-first ordering: {len(front)} declared net(s) routed first: "
-          f"{', '.join(nm for nm, _ in front[:8])}{', ...' if len(front) > 8 else ''}")
-    return front + [t for t in net_ids if t[0] not in rank]
+          f"{', '.join(name(t) for t in front[:8])}{', ...' if len(front) > 8 else ''}")
+    return front + [t for t in items if name(t) not in rank]
+
+
+def route_first_record(first: List[str], main_order: List[str],
+                       phase3_order: List[str]) -> Dict:
+    """The JSON summary's `route_first`: the declared nets (FIRST), those the
+    single-ended loop started, in the order it started them (`main_loop`),
+    those Phase 3 routed taps for, in its order (`phase3`), and `honoured`:
+    in each, the declared nets came before every other net, in FIRST's
+    order. None when neither routed a net. Only this run's own loops count;
+    a nested sub-run (reconciliation, plane finalize) is not this order."""
+    rank = {n: i for i, n in enumerate(first)}
+
+    def seen(seq):
+        seq = list(dict.fromkeys(seq))
+        got = [n for n in seq if n in rank]
+        return got, (seq[:len(got)] == got and got == sorted(got, key=rank.get))
+
+    main, main_ok = seen(main_order)
+    p3, p3_ok = seen(phase3_order)
+    return {'nets': list(first), 'main_loop': main, 'phase3': p3,
+            'honoured': (main_ok and p3_ok) if (main_order or phase3_order) else None}
 
 
 def order_nets_inside_out(

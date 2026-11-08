@@ -87,11 +87,14 @@ other net in each route pass, in the order the patterns are given (one
 pattern's nets by name): each pass is given route.py's own --route-first
 with a pattern that selects each of them alone, in that order, and every
 other net keeps route.py's mps order. The analysis states the nets in order
-(`route_first`), each pass the nets its log says route.py routed and whether
-they came first, in that order (`route_first` on the step), and
-AUTOPLAN_SUMMARY both for the pass that ships. A pattern that selects no net,
-an exclusion and a net outside --nets are refused before any step runs
-(exit 2).
+(`route_first`), each pass route.py's own JSON_SUMMARY record of them (the
+nets its single-ended loop and Phase 3 routed, in order, and whether they came
+first; `route_first` on the step), and AUTOPLAN_SUMMARY both for the pass that
+ships. A
+wildcard counts only the nets the route steps route (--nets, else every net
+route.py's '*' selects). A pattern that selects no net, an exclusion, a
+wildcard that selects none of those nets and a name outside them are refused
+before any step runs (exit 2).
 
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
 routing CLI takes. autoplan's own floors (step 1) come from them, and it
@@ -547,7 +550,14 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     power_nets = [n for n in power_nets if n in globs]
     pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
              if pairs[i] in globs and pairs[i + 1] in globs]
-    first = _route_first(pcb, route_first, names, scope) if route_first else None
+    first = None
+    if route_first:
+        # Against the nets route.py's route steps route: the caller's --nets,
+        # else '*' as route.py reads it (no single-pad unconnected-* net).
+        from net_queries import expand_net_patterns
+        steps_scope = scope if scope is not None else sorted(
+            set(expand_net_patterns(pcb, ['*'], quiet=True)) & set(names))
+        first = _route_first(pcb, route_first, names, steps_scope)
 
     out = dict(layers=layers, clearance=clearance, track=track, via=via,
                drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
@@ -574,11 +584,12 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
 
 
 def _route_first(pcb, patterns, names, scope):
-    """The nets PATTERNS select, in the order route.py's --route-first reads
-    them (net_ordering.resolve_route_first: each pattern's own nets by name,
-    each net once). A pattern that selects no net, an exclusion, a net
-    outside SCOPE (the caller's --nets) and a net no pattern isolates are
-    refused."""
+    """The nets PATTERNS select among SCOPE, the route steps' nets, in the
+    order route.py's --route-first reads them (net_ordering.
+    resolve_route_first: each pattern's own nets by name, each net once, a
+    wildcard's only inside SCOPE). A pattern that selects no net, an
+    exclusion, a wildcard that selects none of SCOPE, a name outside it and a
+    net no pattern isolates are refused."""
     from net_ordering import resolve_route_first
     try:
         first = resolve_route_first(pcb, list(patterns), scope)
@@ -1020,7 +1031,7 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     the caller's --power-nets ahead of them, so a net those select routes at
     their width. Each pass is given the caller's --route-first nets as
     route.py's own --route-first, a pattern per net in their order, and records
-    what its log says route.py did with them (`route_first_record`). With
+    route.py's own account of them (`route_first_record`). With
     ROUTE_JSON each pass writes route.py's --json-out beside its board.
     Returns (chain, best board or None, its grade or None)."""
     def route_args(costs):
@@ -1081,7 +1092,7 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
                            'route' + (f'_p{i + 1}' if i else ''))
         if order:
             ch.steps[-1]['route_first'] = route_first_record(
-                os.path.join(ch.work, ch.steps[-1]['log']), order)
+                os.path.join(ch.work, ch.steps[-1]['log']))
         if ch.last_iterations is not None:
             spent = (spent or 0) + ch.last_iterations
             if first is None:
@@ -1107,25 +1118,25 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     return ch, (best[1] if best else None), (best[0] if best else None)
 
 
-#: route.py's line for each net its main loop starts, with the net's name.
-_ROUTING_LINE = re.compile(r'^\[\d+/\d+(?: \(\d+ \w+\))*\] Routing (.*) \(id=\d+\)$', re.M)
-
-
-def route_first_record(log, order):
-    """What the route step's LOG says of ORDER, the nets the caller declared
-    to route first: {'routed': those it routed, in the order it first routed
-    them, 'honoured': whether they were the first nets it routed, in ORDER's
-    order}. A net already connected is not routed and is not counted against
-    it; 'honoured' is None when the log names no net routed."""
+def route_first_record(log):
+    """The `route_first` record route.py's own JSON_SUMMARY gives in the
+    route step's LOG -- the declared nets, those its single-ended loop and
+    Phase 3 routed, in their order, and whether they came first
+    (net_ordering.route_first_record) -- or None when the step printed none
+    (it routed nothing). Only the outermost run carries one: no nested
+    sub-run is given --route-first."""
     try:
         text = open(log, errors='replace').read()
     except OSError:
-        text = ''
-    seq = list(dict.fromkeys(m.group(1) for m in _ROUTING_LINE.finditer(text)))
-    routed = [n for n in seq if n in order]
-    return {'routed': routed,
-            'honoured': (seq[:len(routed)] == routed
-                         and routed == [n for n in order if n in routed]) if seq else None}
+        return None
+    for m in re.finditer(r'^JSON_SUMMARY: (\{.*\})$', text, re.M):
+        try:
+            rec = json.loads(m.group(1)).get('route_first')
+        except ValueError:
+            continue
+        if rec is not None:
+            return rec
+    return None
 
 
 #: The tags route_passes gives its passes; the diff-pair reroute is a route
