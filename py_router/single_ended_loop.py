@@ -692,6 +692,13 @@ def route_single_ended_nets(
                     "members": len(_bg.net_ids),
                     "corridor_planned": _bg.name in bus_corridors})
 
+    # --route-first: the declared nets ahead of every other, in their order,
+    # applied last so no strategy reorder (bus groups, direct-first, the
+    # global plan) puts a net before them; the rest keep that order.
+    if getattr(config, 'route_first', None):
+        from net_ordering import order_route_first
+        single_ended_nets = order_route_first(single_ended_nets, config.route_first)
+
     # Checkpoint abort (KICAD_STOP_AFTER / KICAD_STOP_FILE): stop routing at
     # a defined point, skip every later pass, and WRITE the partial board --
     # for inspecting intermediate states (e.g. "the board right after the

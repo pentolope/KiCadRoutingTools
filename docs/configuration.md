@@ -524,6 +524,7 @@ See [Rip-Up and Reroute](rip-up-reroute.md) for how failed routes trigger rip-up
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--ordering` / `-o` | mps | Net ordering: `mps`, `inside_out`, or `original`; `route.py` also takes `bus` (detected bus groups first, members middle-out, the rest by mps; ordering only, corridor attraction still needs `--bus`). See [Net Ordering](net-ordering.md) |
+| `--route-first PATTERN [...]` | (none) | `route.py`: the nets these patterns select route before every other net, in the order given; the rest keep the `--ordering` order. GUI: **Route First**. See [Net Ordering](net-ordering.md#after-the-strategy) |
 | `--direction` / `-d` | forward | Direction: `forward` or `backward` |
 | `--layers` / `-l` | all copper layers | Routing layers. For `route.py` the default is all of the board's copper layers; `route_diff.py` and `bga_fanout.py` default to `F.Cu B.Cu` |
 | `--layer-costs` | (see below) | Per-layer cost multipliers (1.0-1000; a negative value forbids track on that layer, which stays an obstacle vias may span), one per `--layers` entry (any other count is refused, see [Layer Costs](#layer-costs)). `route.py` default: all 1.0 when routing 4+ layers, else F.Cu=1.0 and the others 3.0; `route_diff.py` default: all 1.0 |

@@ -341,7 +341,9 @@ _PARAM_SPECIAL = {'layers', 'no_bga_zone', 'no_bga_zones', 'power_nets',
                   # #381 D5:
                   'impedance', 'length_match_groups', 'swappable_nets',
                   # #486:
-                  'coplanar_nets'}
+                  'coplanar_nets',
+                  # route.py --route-first: net patterns, quoted when spaced
+                  'route_first'}
 # (plane_net_layers left _PARAM_SPECIAL: its handler looked for the control on
 # the DIALOG, which never had one -- it is on fanout_tab.bga_options -- so it
 # was logged "ignored" on every step. The alias above reaches it through the
@@ -601,6 +603,15 @@ def apply_step_params(step, dialog):
         if name == 'coplanar_nets':
             # #486: list of glob patterns -> the space-separated text control.
             ctl = getattr(dialog, 'coplanar_nets_ctrl', None)
+            if ctl is None:
+                return False
+            ctl.SetValue(_join_nets(value) if isinstance(value, (list, tuple))
+                         else str(value or ''))
+            return True
+        if name == 'route_first':
+            # Net patterns in order -> the space-separated Route First field,
+            # a spaced net name quoted as _split_net_list reads it back.
+            ctl = getattr(dialog, 'route_first_ctrl', None)
             if ctl is None:
                 return False
             ctl.SetValue(_join_nets(value) if isinstance(value, (list, tuple))

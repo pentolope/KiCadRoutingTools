@@ -2177,6 +2177,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 bga_exclusion_zones: Optional[List[Tuple[float, float, float, float]]] = None,
                 direction_order: str = None,
                 ordering_strategy: str = defaults.DEFAULT_ORDERING_STRATEGY,
+                # --route-first: net patterns routed ahead of every other net,
+                # in their order; the rest keep the strategy's order.
+                route_first: Optional[List[str]] = None,
                 disable_bga_zones: Optional[List[str]] = None,
                 track_width: float = defaults.TRACK_WIDTH,
                 track_width_from_class: bool = False,
@@ -2394,6 +2397,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             - "mps": Use Maximum Planar Subset algorithm to minimize crossing conflicts (default)
             - "inside_out": Sort BGA nets by distance from BGA center
             - "original": Keep nets in original order
+        route_first: Net name patterns whose nets route before every other
+            net, in the order given (net_ordering.resolve_route_first); every
+            other net keeps the strategy's order (net_ordering.
+            order_route_first, applied last in the single-ended loop). A
+            pattern that selects no net, an exclusion and a net outside
+            net_names raise ValueError.
         track_width: Track width in mm (default: defaults.TRACK_WIDTH, 0.3)
         track_width_from_class: True = the width was NOT explicitly set by the
             operator (--track-width omitted / GUI override unchecked). Without
@@ -3217,6 +3226,10 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
 
     # The SE loop needs the strategy to apply the explicit 'bus' ordering.
     config.ordering_strategy = ordering_strategy
+    # ...and the route-first nets, which it puts ahead of that order.
+    from net_ordering import resolve_route_first
+    config.route_first = (resolve_route_first(pcb_data, list(route_first), net_names)
+                          if route_first else [])
     # #622 victim-priority restore scoping: the endgame sweep fires only in
     # a reconcile SUB-run (final_reconcile=False), where no deeper recovery
     # tier exists to pre-empt -- measured, firing in the outermost run's
@@ -9798,6 +9811,12 @@ For differential pair routing, use route_diff.py:
                              "inside_out, original, or bus (detected bus groups first, "
                              "members middle-out, rest by mps; ordering only -- "
                              "corridor attraction still needs --bus)")
+    parser.add_argument("--route-first", nargs="+", default=None, metavar="PATTERN",
+                        help="Route the nets these patterns select before every "
+                             "other net, in the order given (one pattern's nets "
+                             "by name); every other net keeps the --ordering "
+                             "order. A pattern that selects no net, an exclusion "
+                             "and a net outside the routed nets are refused")
     parser.add_argument("--direction", "-d", choices=["forward", "backward"],
                         default=None,
                         help="Direction search order for each net route")
@@ -10523,6 +10542,12 @@ For differential pair routing, use route_diff.py:
               f"for stray whitespace or a stale net list. First few: "
               f"{', '.join(repr(n) for n in net_names[:5])}", file=sys.stderr)
         sys.exit(2)
+    if args.route_first:
+        from net_ordering import resolve_route_first
+        try:
+            resolve_route_first(pcb_data, args.route_first, net_names)
+        except ValueError as _rfe:
+            parser.error(str(_rfe))
 
     # --undo: strip the scoped nets' copper instead of routing them.
     if args.undo:
@@ -10662,6 +10687,7 @@ For differential pair routing, use route_diff.py:
                 quick=args.quick,
                 direction_order=args.direction,
                 ordering_strategy=args.ordering,
+                route_first=args.route_first,
                 disable_bga_zones=args.no_bga_zones,
                 rip_existing_nets=args.rip_existing_nets,
                 force_reroute=args.force_reroute,

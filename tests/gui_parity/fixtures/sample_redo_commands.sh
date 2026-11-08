@@ -17,7 +17,8 @@
 # (--can-swap-to-top-layer, --skip-routing), the --no-X flags that must
 # UNTICK a positive checkbox, two --length-match-group occurrences (each must
 # survive as its own group), and the keepout / guide-corridor switches with
-# non-default layers and spacing. --relax-drc-severities sits right before
+# non-default layers and spacing, and --route-first's ordered patterns.
+# --relax-drc-severities sits right before
 # --clearance: the converter once read that switch as a value flag and
 # swallowed the token after it. Added to the existing route.py line rather
 # than as a new command: tests/test_506_507 pins the step sequence.
@@ -27,7 +28,7 @@ python3 -u -X utf8 bga_fanout.py board.kicad_pcb --output step1.kicad_pcb --comp
 # cwd=/repo
 python3 -u -X utf8 route_diff.py step1.kicad_pcb step2.kicad_pcb --nets /USB/D+ /USB/D- --clearance 0.10 --diff-pair-gap 0.1 --via-size 0.45 --via-drill 0.2 --grid-step 0.05 --no-gnd-vias --no-bga-zones U7 U9 --diff-pair-intra-match --ac-couple-match --diff-chamfer-extra 2
 # cwd=/repo
-python3 -u -X utf8 route.py step2.kicad_pcb step3.kicad_pcb --nets '*' '!GND' '!+3V3' --no-bga-zones --relax-drc-severities --clearance 0.09 --track-width 0.0762 --via-size 0.45 --via-drill 0.2 --hole-to-hole-clearance 0.2 --grid-step 0.05 --max-ripup 10 --max-iterations 1000000 --fab-tier advanced --fab-overrides my_fab.txt --ordering bus --bus --bus-detection-radius 4 --can-swap-to-top-layer --skip-routing --no-smoothing --no-stub-layer-swap --no-power-tap-neckdown --length-match-group 'DDR_DQ*' 'DDR_DQS*' --length-match-group auto --keepout --keepout-layer User.3 --guide-corridor --guide-corridor-layer User.4 --guide-corridor-spacing 0.5 --no-fix-drc-settings
+python3 -u -X utf8 route.py step2.kicad_pcb step3.kicad_pcb --nets '*' '!GND' '!+3V3' --no-bga-zones --relax-drc-severities --clearance 0.09 --track-width 0.0762 --via-size 0.45 --via-drill 0.2 --hole-to-hole-clearance 0.2 --grid-step 0.05 --max-ripup 10 --max-iterations 1000000 --fab-tier advanced --fab-overrides my_fab.txt --ordering bus --route-first /CLK '/DATA*' --bus --bus-detection-radius 4 --can-swap-to-top-layer --skip-routing --no-smoothing --no-stub-layer-swap --no-power-tap-neckdown --length-match-group 'DDR_DQ*' 'DDR_DQS*' --length-match-group auto --keepout --keepout-layer User.3 --guide-corridor --guide-corridor-layer User.4 --guide-corridor-spacing 0.5 --no-fix-drc-settings
 # cwd=/repo
 python3 -u -X utf8 route_planes.py step3.kicad_pcb step4.kicad_pcb --nets GND +3V3 --plane-layers In1.Cu In4.Cu --layer-costs 1 5 --via-size 0.45 --via-drill 0.2 --track-width 0.09 --clearance 0.10 --hole-to-hole-clearance 0.2 --grid-step 0.05
 # cwd=/repo

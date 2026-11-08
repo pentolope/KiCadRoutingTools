@@ -360,6 +360,9 @@ REFUSAL_SITES = {
         'if not net_names': ('board', "which nets the patterns match"),
         'if not resolve_net_ids(pcb_data, net_names)':
             ('board', "the board's net names"),
+        'except ValueError from resolve_route_first':
+            ('board', "which nets the --route-first patterns select on the "
+                      "board, and whether the run routes them"),
         'if _scope_defaulted': ('never a step', 'under --undo, which is refused'),
         'call:finish_design_rules':
             ('after the run', '--strict-sizes: exit 3 after routing'),

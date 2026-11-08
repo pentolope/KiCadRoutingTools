@@ -84,14 +84,14 @@ judges a placement and is not shipped.
 
 --route-first PATTERN [...] routes the nets the patterns select before every
 other net in each route pass, in the order the patterns are given (one
-pattern's nets by name, as route.py's --nets lists them): each pass's --nets
-starts with a pattern for each of them and the pass runs route.py's
---ordering original, so the other nets follow in --nets order, not mps
-order. The analysis states the nets in order (`route_first`), each pass the
-nets its log says route.py routed and whether they came first, in that order
-(`route_first` on the step), and AUTOPLAN_SUMMARY both for the pass that
-ships. A pattern that selects no net, an exclusion and a net outside --nets
-are refused before any step runs (exit 2).
+pattern's nets by name): each pass is given route.py's own --route-first
+with a pattern that selects each of them alone, in that order, and every
+other net keeps route.py's mps order. The analysis states the nets in order
+(`route_first`), each pass the nets its log says route.py routed and whether
+they came first, in that order (`route_first` on the step), and
+AUTOPLAN_SUMMARY both for the pass that ships. A pattern that selects no net,
+an exclusion and a net outside --nets are refused before any step runs
+(exit 2).
 
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
 routing CLI takes. autoplan's own floors (step 1) come from them, and it
@@ -574,22 +574,16 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
 
 
 def _route_first(pcb, patterns, names, scope):
-    """The nets PATTERNS select, in the order the patterns are given (each
-    pattern's own nets by name, as route.py's --nets lists them), each once.
-    A pattern that selects no net, an exclusion, a net outside SCOPE (the
-    caller's --nets) and a net no pattern isolates are refused."""
-    from net_queries import expand_net_patterns
-    first = []
-    for p in patterns:
-        if p.startswith('!') and p not in names:
-            raise Refused(f"--route-first: {p} is an exclusion; name the nets to route first")
-        got = [n for n in expand_net_patterns(pcb, [p], quiet=True) if n in names]
-        if not got:
-            raise Refused(f"--route-first: {p} selects no net on this board")
-        first += [n for n in got if n not in first]
-    outside = [n for n in first if scope is not None and n not in scope]
-    if outside:
-        raise Refused(f"--route-first: {', '.join(outside)} not among the nets --nets selects")
+    """The nets PATTERNS select, in the order route.py's --route-first reads
+    them (net_ordering.resolve_route_first: each pattern's own nets by name,
+    each net once). A pattern that selects no net, an exclusion, a net
+    outside SCOPE (the caller's --nets) and a net no pattern isolates are
+    refused."""
+    from net_ordering import resolve_route_first
+    try:
+        first = resolve_route_first(pcb, list(patterns), scope)
+    except ValueError as exc:
+        raise Refused(str(exc)) from None
     alone = [n for n in first if not _selects_exactly(_glob(n), n, names)]
     if alone:
         raise Refused(f"--route-first: no pattern selects only {', '.join(alone)} on this board")
@@ -1024,8 +1018,8 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     could not route without it. The REROUTE nets are first ripped and routed
     again on their own. Every step routes the power nets at RAIL_WIDTH, with
     the caller's --power-nets ahead of them, so a net those select routes at
-    their width. The caller's --route-first nets head each pass's --nets, in
-    their order, under route.py's --ordering original, and each pass records
+    their width. Each pass is given the caller's --route-first nets as
+    route.py's own --route-first, a pattern per net in their order, and records
     what its log says route.py did with them (`route_first_record`). With
     ROUTE_JSON each pass writes route.py's --json-out beside its board.
     Returns (chain, best board or None, its grade or None)."""
@@ -1050,8 +1044,8 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     if quick:
         shared += ['--quick', str(quick)]
     order = a.get('route_first') or []
-    base = (['{IN}', '{OUT}', '--nets', *[_glob(n) for n in order], *_scope_args(a)]
-            + (['--ordering', 'original'] if order else []) + shared)
+    base = (['{IN}', '{OUT}', '--nets', *_scope_args(a)]
+            + (['--route-first', *[_glob(n) for n in order]] if order else []) + shared)
     best = None                        # (grade, board)
     if finish:
         g = ch.grade(ch.cur)
@@ -1265,12 +1259,12 @@ def main():
                     help='every route step runs at route.py\'s --quick LEVEL: a '
                          'chain to judge a placement by, not to ship')
     ap.add_argument('--route-first', nargs='+', default=[], metavar='PATTERN',
-                    help='the nets these patterns select route first in every route '
-                         'pass, in the order given (a pattern\'s own nets by name), '
-                         'under route.py\'s --ordering original, so every other net '
-                         'follows in --nets order rather than mps order. A pattern '
-                         'that selects no net, an exclusion and a net outside --nets '
-                         'are refused before any step runs')
+                    help='route.py\'s --route-first for every route pass: the nets '
+                         'these patterns select route first, in the order given (a '
+                         'pattern\'s own nets by name), and every other net keeps '
+                         'route.py\'s mps order. A pattern that selects no net, an '
+                         'exclusion and a net outside --nets are refused before any '
+                         'step runs')
     ap.add_argument('--json-out', metavar='FILE',
                     help='also write FILE: the shipped route pass\'s route.py '
                          '--json-out summary, the step that produced the shipped '

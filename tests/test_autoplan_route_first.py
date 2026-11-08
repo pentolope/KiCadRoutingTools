@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""autoplan --route-first: the caller's nets route first in every route pass,
-in the order given, and the run says whether route.py did so.
+"""autoplan --route-first (and route.py's own): the caller's nets route first
+in every route pass, in the order given, every other net keeps route.py's mps
+order, and the run says whether route.py did so.
 
 1. Steps: for one analysis exercising every step, each route pass of a full
-   chain and of --finish is given the declared nets at the head of its
-   --nets, which route.py's own expand_net_patterns reads back in the
-   declared order ahead of every other net, with --ordering original; every
-   other step, the diff-pair reroute included, is the chain autoplan builds
-   without the flag.
+   chain and of --finish is given route.py's --route-first with a pattern per
+   declared net, which route.py's own resolve_route_first reads back in the
+   declared order; its --nets and every other argument, and every other step
+   (the diff-pair reroute included), are the chain autoplan builds without
+   the flag.
 2. route_first_record against route.py's progress lines as single_ended_loop
    prints them: the declared nets first and in order is honoured; another net
    ahead of them, or the declared two swapped, is not; a declared net already
@@ -15,12 +16,18 @@ in the order given, and the run says whether route.py did so.
    routed net is unknown (None).
 3. Analysis: the nets in pattern order, a pattern's own nets by name, each
    once; a pattern that selects no net, an exclusion and a net outside --nets
-   are refused for their reason (exit 2) before any step runs.
+   are refused for their reason (exit 2) before any step runs; route.py
+   refuses the same three for the same reasons.
 4. A real run on a synthetic 2-layer board of four two-pad nets: with
    --route-first SIG_D SIG_B the route step's command line and route.py's own
    log put SIG_D, then SIG_B, ahead of SIG_A and SIG_C, and the analysis, the
    pass's record, the --json-out document and AUTOPLAN_SUMMARY say so. The
    same board without the flag routes SIG_A first, so the order came from it.
+5. The rest keep mps order: on a board where one net (A_X) crosses three
+   parallel rows, route.py's mps order routes the rows first and A_X last,
+   unlike name order. With --route-first C_ROW, route.py (and autoplan's
+   pass) route C_ROW first and then every other net in the same relative
+   order as with no flag at all (B_ROW, D_ROW, A_X), not in name order.
 """
 import json
 import os
@@ -35,12 +42,12 @@ sys.path.insert(0, os.path.join(ROOT, 'py_router'))
 sys.path.insert(0, os.path.join(ROOT, 'tests'))
 import autoplan as AP                                        # noqa: E402
 from kicad_parser import parse_kicad_pcb                     # noqa: E402
-from net_queries import expand_net_patterns                  # noqa: E402
 from run_utils import check, evidence                        # noqa: E402
 from synth import RoutingBoard, write_board                  # noqa: E402
 
-RUN_ALL_TIMEOUT = 300
+RUN_ALL_TIMEOUT = 400
 SCRIPT = os.path.join(ROOT, 'py_router', 'autoplan.py')
+ROUTE = os.path.join(ROOT, 'py_router', 'route.py')
 NETS = ['SIG_A', 'SIG_B', 'SIG_C', 'SIG_D']
 FAILS = []
 
@@ -57,6 +64,19 @@ def synthetic_board(path):
     for i, net in enumerate(NETS):
         b.pad(f'P{2 * i + 1}', 5, 5 + 5 * i, net)
         b.pad(f'P{2 * i + 2}', 35, 5 + 5 * i, net)
+    return write_board(b.text(), path)
+
+
+def crossing_board(path):
+    """Three parallel rows (B_ROW, C_ROW, D_ROW) and A_X, which runs corner
+    to corner across all three: mps routes the rows before A_X, whose name
+    sorts first."""
+    b = RoutingBoard(40, 40)
+    b.pad('X1', 5, 5, 'A_X')
+    b.pad('X2', 35, 35, 'A_X')
+    for i, net in enumerate(('B_ROW', 'C_ROW', 'D_ROW')):
+        b.pad(f'R{2 * i + 1}', 5, 12 + 8 * i, net)
+        b.pad(f'R{2 * i + 2}', 35, 12 + 8 * i, net)
     return write_board(b.text(), path)
 
 
@@ -141,6 +161,7 @@ def _without(args, flag, n):
 
 
 def test_steps():
+    from net_ordering import resolve_route_first
     print("--route-first: the route passes put the declared nets first, nothing else changes")
     n = len(FAILS)
     stub = parse_kicad_pcb(synthetic_board(os.path.join(TMP, 'stub.kicad_pcb')))
@@ -157,16 +178,12 @@ def test_steps():
             if t not in passes:
                 expect(args == base, f"{label} {t}: unchanged")
                 continue
-            nets = _values(args, '--nets')
-            read = expand_net_patterns(stub, nets, quiet=True)
-            expect(read == ['SIG_D', 'SIG_B', 'SIG_A', 'SIG_C'],
-                   f"{label} {t}: route.py's --nets reading routes SIG_D, SIG_B, then "
-                   f"the rest ({read})")
-            expect(_values(args, '--ordering') == ['original'],
-                   f"{label} {t}: --ordering original ({_values(args, '--ordering')})")
-            rest = _without(args, '--ordering', 1)
-            rest = rest[:rest.index('--nets') + 1] + rest[rest.index('--nets') + 3:]
-            expect(rest == base, f"{label} {t}: every other argument is the default pass's")
+            read = resolve_route_first(stub, _values(args, '--route-first'))
+            expect(read == order,
+                   f"{label} {t}: route.py's --route-first reading is SIG_D, SIG_B ({read})")
+            expect(_without(args, '--route-first', 2) == base,
+                   f"{label} {t}: --nets, the ordering and every other argument are "
+                   f"the default pass's")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -231,11 +248,14 @@ def test_analysis():
             (('--route-first', 'SIG_A', 'NOPE'), '--route-first: NOPE selects no net'),
             (('--route-first', '!SIG_A'), '--route-first: !SIG_A is an exclusion'),
             (('--nets', 'SIG_A', 'SIG_B', '--route-first', 'SIG_C'),
-             '--route-first: SIG_C not among the nets --nets selects')):
+             '--route-first: SIG_C not among the nets this run routes')):
         check([sys.executable, '-X', 'utf8', SCRIPT, board, out, *argv],
               refuse=f'AUTOPLAN: refused: {why}', code=2)
         expect(not os.path.exists(out + '.autoplan') and not os.path.exists(out),
                f"{why}: refused before any step runs")
+        check([sys.executable, '-X', 'utf8', ROUTE, board, out, *argv],
+              refuse=f'route.py: error: {why}', code=2)
+        expect(not os.path.exists(out), f"route.py: {why}: refused, no board written")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -246,6 +266,7 @@ def _routing_order(log):
 
 
 def test_run():
+    from net_ordering import resolve_route_first
     print("a real run: four nets, --route-first SIG_D SIG_B")
     n = len(FAILS)
     board = synthetic_board(os.path.join(TMP, 'board.kicad_pcb'))
@@ -255,13 +276,13 @@ def test_run():
                '--route-first', 'SIG_D', 'SIG_B', '--json-out', js], accept=True)
     plan = json.load(open(evidence(out + '.autoplan/plan.json', 'plan.json')))
     passes = [s for s in plan['steps'] if s['tool'] == 'route']
-    expect(passes and all(_values(s['argv'], '--ordering') == ['original'] for s in passes),
-           f"every route pass ran --ordering original ({len(passes)} pass(es))")
+    expect(passes and not any('--ordering' in s['argv'] for s in passes),
+           f"no route pass is given an --ordering ({len(passes)} pass(es))")
     pcb = parse_kicad_pcb(evidence(board, 'input board'))
     for s in passes:
-        read = expand_net_patterns(pcb, _values(s['argv'], '--nets'), quiet=True)
-        expect(read[:2] == ['SIG_D', 'SIG_B'],
-               f"{s['tag']}: route.py's --nets reading starts SIG_D, SIG_B ({read})")
+        read = resolve_route_first(pcb, _values(s['argv'], '--route-first'))
+        expect(read == ['SIG_D', 'SIG_B'],
+               f"{s['tag']}: route.py's --route-first reading is SIG_D, SIG_B ({read})")
         seq = _routing_order(evidence(os.path.join(out + '.autoplan', s['log']), 'route log'))
         expect(seq[:2] == ['SIG_D', 'SIG_B'] and sorted(seq) == NETS,
                f"{s['tag']}: route.py routed SIG_D, then SIG_B, then the rest ({seq})")
@@ -299,10 +320,50 @@ def test_run():
     assert len(FAILS) == n, FAILS[n:]
 
 
+def test_rest_keep_mps():
+    print("the undeclared nets keep route.py's mps order")
+    n = len(FAILS)
+    board = crossing_board(os.path.join(TMP, 'crossing.kicad_pcb'))
+    names = sorted(['A_X', 'B_ROW', 'C_ROW', 'D_ROW'])
+
+    def routed(*argv, tag):
+        out = os.path.join(TMP, f'{tag}.kicad_pcb')
+        r = check([sys.executable, '-X', 'utf8', ROUTE, board, out, *argv], accept=True)
+        log = os.path.join(TMP, f'{tag}.log')
+        with open(log, 'w') as fh:
+            fh.write(r.stdout)
+        return _routing_order(log)
+
+    plain = routed(tag='mps')
+    expect(sorted(plain) == names and plain != names,
+           f"route.py's own order on this board is not name order ({plain})")
+    expect(plain and plain[-1] == 'A_X', f"mps routes A_X, the crossing net, last ({plain})")
+    out = os.path.join(TMP, 'crossing_routed.kicad_pcb')
+    check([sys.executable, '-X', 'utf8', SCRIPT, board, out, '--route-first', 'C_ROW'],
+          accept=True)
+    plan = json.load(open(evidence(out + '.autoplan/plan.json', 'plan.json')))
+    p1 = next(s for s in plan['steps'] if s['tool'] == 'route')
+    seq = _routing_order(evidence(os.path.join(out + '.autoplan', p1['log']), 'route log'))
+    want = ['C_ROW'] + [x for x in plain if x != 'C_ROW']
+    expect(seq == want, f"autoplan's first pass: C_ROW, then the rest in route.py's own "
+                        f"order ({seq}, want {want})")
+    expect(p1.get('route_first') == {'routed': ['C_ROW'], 'honoured': True},
+           f"and the pass records it honoured ({p1.get('route_first')})")
+    first = routed('--route-first', 'C_ROW', tag='first')
+    want = ['C_ROW'] + [x for x in plain if x != 'C_ROW']
+    expect(first == want, f"route.py --route-first C_ROW: C_ROW, then the rest in their "
+                          f"order without the flag ({first}, want {want})")
+    both = routed('--route-first', 'D_ROW', 'A_X', tag='both')
+    want = ['D_ROW', 'A_X'] + [x for x in plain if x not in ('D_ROW', 'A_X')]
+    expect(both == want, f"--route-first D_ROW A_X: those two, then the rest as before "
+                         f"({both}, want {want})")
+    assert len(FAILS) == n, FAILS[n:]
+
+
 def main():
     global TMP
     with tempfile.TemporaryDirectory() as TMP:
-        for t in (test_steps, test_record, test_analysis, test_run):
+        for t in (test_steps, test_record, test_analysis, test_run, test_rest_keep_mps):
             before = len(FAILS)
             try:
                 t()

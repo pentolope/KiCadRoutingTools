@@ -354,10 +354,11 @@ Either way the router tries the other direction when the first fails; the option
 
 ## After the Strategy
 
-On `route.py`, two reorders are applied on top of every strategy, in this order:
+On `route.py`, three reorders are applied on top of every strategy, in this order:
 
 1. **Direct-first (#472).** Nets with a bare BGA ball (a ball of the net with no stub or via on it, the fanout-deferred direct-route class) move to the front, keeping their relative order, so their short surface lanes are claimed before long nets and bus corridors contend for the space. Inert on a board whose balls all carry escape copper. `KICAD_DIRECT_FIRST=0` disables it.
 2. **Bus-first.** Under `--bus` or `--ordering bus`, detected bus groups move to the very front, each middle-out ([Bus Routing](bus-routing.md#routing-order-bus-groups-first-middle-out)).
+3. **Route-first.** `--route-first PATTERN [...]` (GUI: **Route First**) moves the nets the patterns select ahead of every other net, in the order the patterns are given (one pattern's nets by name, each net once); every other net keeps the order the strategy and the two reorders above gave it. A pattern that selects no net, an exclusion and a net outside the routed nets are refused (`net_ordering.resolve_route_first`).
 
 ## Performance Notes
 

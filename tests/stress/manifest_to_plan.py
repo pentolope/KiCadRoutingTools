@@ -378,6 +378,9 @@ LIST_FLAGS = {
     # carrying it. Protection is now recorded in the .kicad_pro by the step that
     # routes a matched group or diff pair, not passed as a flag.
     '--rip-existing-nets': 'rip_existing_nets',
+    # route.py's route-first net patterns (nargs='+', in order), to the Route
+    # First field through ai_plan's special handler.
+    '--route-first': 'route_first',
     # bga_fanout's future-pour declaration (NET:LAYER[,LAYER...] specs,
     # nargs='+'). Review parity finding 5: a recorded manifest carrying the
     # flag used to convert to a plan that silently dropped it. The GUI/plan
@@ -851,7 +854,8 @@ def parse_command(argv, cwd=None):
     # it still did (26 kept bga_fanout steps on 18 corpus boards).
     for k in ('--power-nets', '--power-nets-widths', '--layer-costs',
               '--layers', '--polarity-swap-nets', '--coplanar-nets',
-              '--rip-existing-nets', '--plane-net-layers', '--keep-away'):
+              '--rip-existing-nets', '--route-first', '--plane-net-layers',
+              '--keep-away'):
         if k in lists:
             step['params'][LIST_FLAGS[k]] = lists[k]
     return step

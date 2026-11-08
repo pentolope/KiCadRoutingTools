@@ -1542,6 +1542,17 @@ class RoutingDialog(wx.Dialog):
         rip_existing_sizer.Add(self.rip_existing_nets_ctrl, 1, wx.EXPAND)
         options_inner.Add(rip_existing_sizer, 0, wx.EXPAND | wx.ALL, 3)
 
+        # Route first: the CLI's --route-first (net patterns routed ahead of
+        # every other net, in their order; the rest keep the strategy's order).
+        route_first_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        route_first_sizer.Add(wx.StaticText(options_scroll, label="Route First:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.route_first_ctrl = wx.TextCtrl(options_scroll, value="")
+        self.route_first_ctrl.SetToolTip("Net-name patterns routed before every other net, in the order given "
+                                         "(e.g. TACH1 TACH2); every other net keeps the Ordering strategy's order. "
+                                         "Each pattern must select a net among those selected for routing")
+        route_first_sizer.Add(self.route_first_ctrl, 1, wx.EXPAND)
+        options_inner.Add(route_first_sizer, 0, wx.EXPAND | wx.ALL, 3)
+
         # Force re-route (#515 / PR #533): rip and re-route from scratch every
         # net SELECTED for this run, even if already fully connected. Mirrors
         # the CLI --force-reroute flag; the protection rules live engine-side
@@ -2917,6 +2928,7 @@ class RoutingDialog(wx.Dialog):
         self.power_widths_ctrl.SetValue("")
         self.no_bga_zones_ctrl.SetValue("")  # empty == CLI default (None: keep BGA zones)
         self.rip_existing_nets_ctrl.SetValue("")
+        self.route_first_ctrl.SetValue("")  # empty == CLI default (no --route-first)
         self.force_reroute.SetValue(False)  # match creation default + CLI (store_true)
         self.layer_costs_ctrl.SetValue("")
         # Not a control: the plan step's raw net globs (see
@@ -3267,6 +3279,18 @@ class RoutingDialog(wx.Dialog):
                           wx.OK | wx.ICON_WARNING)
             return None, None
 
+        # A Route First pattern route.py would refuse (no net, an exclusion,
+        # a net not selected) is refused here too, before routing starts.
+        route_first = _split_net_list(self.route_first_ctrl.GetValue())
+        if route_first:
+            try:
+                from net_ordering import resolve_route_first
+                resolve_route_first(self.pcb_data, route_first, selected_nets)
+            except ValueError as e:
+                wx.MessageBox(str(e), "Invalid Route First",
+                              wx.OK | wx.ICON_WARNING)
+                return None, None
+
         # A Net Clearances File route.py would fail to read is refused before
         # routing starts, not routed at the net classes instead.
         err = net_clearances_file_error(self.net_clearances_path.GetValue())
@@ -3452,6 +3476,8 @@ class RoutingDialog(wx.Dialog):
             config['rip_existing_nets'] = ['*']
         else:
             config['rip_existing_nets'] = _split_net_list(rip_existing_text)
+        # --route-first: empty -> None (the strategy's order alone).
+        config['route_first'] = _split_net_list(self.route_first_ctrl.GetValue()) or None
 
         # Parse layer costs
         config['layer_costs'] = self._selected_layer_costs()
@@ -3948,6 +3974,7 @@ class RoutingDialog(wx.Dialog):
                     power_nets_widths=config.get('power_nets_widths', []),
                     disable_bga_zones=config.get('no_bga_zones'),
                     rip_existing_nets=config.get('rip_existing_nets'),
+                    route_first=config.get('route_first'),
                     force_reroute=config.get('force_reroute', False),
                     # RAW patterns (pre-expansion), like the CLI main: the #521
                     # protection override must see what was TYPED/PLANNED, not

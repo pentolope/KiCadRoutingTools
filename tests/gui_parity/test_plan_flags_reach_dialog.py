@@ -142,6 +142,13 @@ CASES = [
          param=('fab_overrides_path', '{tmp}/' + _FAB_FILE),
          probe='fab_overrides_path',
          want=('{tmp}/' + _FAB_FILE,) * 2, default=('', '')),
+    # The route-first patterns, in their order, to the Route First field and
+    # the list the engine call reads.
+    dict(label='route --route-first',
+         cmd='python3 py_router/route.py {src} {dst} --nets "*"',
+         flag='--route-first /LED_C /CLOCK_IN',
+         param=('route_first', ['/LED_C', '/CLOCK_IN']), probe='route_first',
+         want=('/LED_C /CLOCK_IN', ['/LED_C', '/CLOCK_IN']), default=('', None)),
     dict(label='qfn_fanout --layer',
          cmd='python3 py_router/qfn_fanout.py {src} --output {dst} '
              '--component ' + _QFN_REF,
@@ -176,6 +183,8 @@ def _probes(dlg):
                                 route_cfg.get('net_clearances_path')),
         'fab_overrides_path': (dlg.fab_overrides_path.GetValue(),
                                route_cfg.get('fab_overrides_path')),
+        'route_first': (dlg.route_first_ctrl.GetValue(),
+                        route_cfg.get('route_first')),
         'net_clearances_path_diff': (dlg.net_clearances_path.GetValue(),
                                      diff_cfg.get('net_clearances_path')),
         'net_clearances_path_planes': (dlg.net_clearances_path.GetValue(),

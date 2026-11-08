@@ -2640,12 +2640,11 @@ Options:
   --quick LEVEL      route.py's --quick LEVEL (1 or 2) for every route step:
                      a chain to judge a placement by, not to ship.
   --route-first PATTERN [...]
-                     Route the nets the patterns select before every other net
-                     in each route pass, in the order given (one pattern's nets
-                     by name, as route.py's --nets lists them): each pass's
-                     --nets starts with a pattern for each of them, and the
-                     pass runs route.py's `--ordering original`, so the other
-                     nets follow in --nets order rather than mps order. The
+                     route.py's own --route-first for every route pass: the
+                     nets the patterns select route before every other net, in
+                     the order given (one pattern's nets by name), each passed
+                     as a pattern that selects it alone, and every other net
+                     keeps route.py's mps order. The
                      analysis states the nets in order (`route_first`); each
                      pass's step records the declared nets its log says
                      route.py routed and whether they came first, in that
