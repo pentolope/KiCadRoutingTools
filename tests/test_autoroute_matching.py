@@ -28,36 +28,69 @@ def expect(cond, what):
         FAILS.append(what)
 
 
+STACKUP = ('(setup (stackup (layer "F.Cu" (type "copper") (thickness 0.035)) '
+           '(layer "dielectric 1" (type "core") (thickness 0.2) (material "FR4") '
+           '(epsilon_r 4.5) (loss_tangent 0.02)) '
+           '(layer "B.Cu" (type "copper") (thickness 0.035))) '
+           '(pad_to_mask_clearance 0))')
+ER, H, T = 4.5, 0.2, 0.035
+
+
+def _write(b, path, stackup):
+    text = b.text()
+    if stackup:
+        text = text.replace('(setup (pad_to_mask_clearance 0))', STACKUP)
+    return write_board(text, path)
+
+
 def singles_board(path, ends=(42, 32, 30), stackup=False):
     b = RoutingBoard(50, 30)
     for i, (net, x2) in enumerate(zip(('SIG_A', 'SIG_B', 'SIG_C'), ends)):
         b.pad(f'P{2 * i + 1}', 6, 6 + 8 * i, net)
         b.pad(f'P{2 * i + 2}', x2, 6 + 8 * i, net)
-    text = b.text()
-    if stackup:
-        text = text.replace('(setup (pad_to_mask_clearance 0))', (
-            '(setup (stackup (layer "F.Cu" (type "copper") (thickness 0.035)) '
-            '(layer "dielectric 1" (type "core") (thickness 0.2) (material "FR4") '
-            '(epsilon_r 4.5) (loss_tangent 0.02)) '
-            '(layer "B.Cu" (type "copper") (thickness 0.035))) '
-            '(pad_to_mask_clearance 0))'))
-    return write_board(text, path)
+    return _write(b, path, stackup)
 
 
-def pairs_board(path, singles=False):
-    b = RoutingBoard(50, 50 if singles else 30)
+def pairs_board(path, singles=False, stackup=False):
+    b = RoutingBoard(50, 70 if singles else 30)
     k = 0
-    for i, (base, x2) in enumerate((('D', 42), ('E', 30))):
+    for i, (base, x2) in enumerate((('D', 42), ('E', 30), ('F', 36))[:3 if singles else 2]):
         for j, pol in enumerate('PN'):
             y = 8 + 10 * i + 0.6 * j
             for x in (6, x2):
                 k += 1
                 b.pad(f'U{k}', x, y, f'{base}_{pol}', sx=0.4, sy=0.4)
     if singles:
-        for i, (net, x2) in enumerate((('SIG_A', 42), ('SIG_B', 32), ('SIG_C', 30))):
-            b.pad(f'P{2 * i + 1}', 6, 28 + 8 * i, net)
-            b.pad(f'P{2 * i + 2}', x2, 28 + 8 * i, net)
-    return write_board(b.text(), path)
+        for i, (net, x2) in enumerate((('SIG_A', 42), ('SIG_B', 32), ('SIG_C', 30),
+                                       ('SIG_D', 34))):
+            b.pad(f'P{2 * i + 1}', 6, 38 + 8 * i, net)
+            b.pad(f'P{2 * i + 2}', x2, 38 + 8 * i, net)
+    return _write(b, path, stackup)
+
+
+def shadow_board(path):
+    b = RoutingBoard(50, 60)
+    for i, net in enumerate(('!E_P', '!E_N', ' E_P', ' E_N', '!SIG', ' SIG',
+                             'Q*1', 'QA1')):
+        b.pad(f'P{2 * i + 1}', 6, 4 + 6 * i, net)
+        b.pad(f'P{2 * i + 2}', 40, 4 + 6 * i, net)
+    return _write(b, path, True)
+
+
+def hand_board(path):
+    b = RoutingBoard(50, 30)
+    b.pad('P1', 6, 6, 'SIG_A')
+    b.pad('P2', 42, 6, 'SIG_A')
+    b.seg(6, 6, 20, 6, 'SIG_A', w=0.1)
+    b.via(20, 6, 'SIG_A')
+    b.seg(20, 6, 30, 6, 'SIG_A', w=0.1, layer='B.Cu')
+    b.via(30, 6, 'SIG_A')
+    b.seg(30, 6, 42, 6, 'SIG_A', w=0.1)
+    for i, (net, x2) in enumerate((('SIG_B', 32), ('SIG_C', 30))):
+        b.pad(f'Q{2 * i + 1}', 6, 14 + 8 * i, net)
+        b.pad(f'Q{2 * i + 2}', x2, 14 + 8 * i, net)
+        b.seg(6, 14 + 8 * i, x2, 14 + 8 * i, net, w=0.1)
+    return _write(b, path, True)
 
 
 def copper(board):
@@ -98,7 +131,9 @@ class Recorder(AP.ChainEvents):
         self.runs.append((kind, tag, list(args)))
         self.steps.append({'tag': tag, 'ok': True, 'log': tag + '.log'})
         self.last_iterations = 50
-        return f'OUT{len(self.runs)}', {}, {}
+        first_diff = kind == 'diff' and not any(r[0] == 'diff' for r in self.runs[:-1])
+        return f'OUT{len(self.runs)}', (
+            {'single_ended_followup_nets': ['F_P', 'F_N']} if first_diff else {}), {}
 
     def accept(self, out):
         if out:
@@ -109,7 +144,7 @@ class Recorder(AP.ChainEvents):
 
     def drc_nets(self, board):
         diff = [i for i, r in enumerate(self.runs) if r[0] == 'diff']
-        return {'D_N'} if diff and board == f'OUT{len(self.runs)}' else set()
+        return {'E_N'} if diff and board == f'OUT{len(self.runs)}' else set()
 
     def check_drc(self, board):
         return {'violations': 0, 'items': []}
@@ -123,7 +158,7 @@ def chain_runs(a):
         AP.run_plan('IN', 'OUT', a, TMP, effort_factor=4.0)
     finally:
         AP.Chain = orig
-    return ch.runs
+    return ch
 
 
 def parsed(kind, args):
@@ -139,12 +174,13 @@ def test_steps():
     from net_queries import expand_net_patterns, find_differential_pairs
     print("each group and target reaches the step that routes its nets")
     n = len(FAILS)
-    board = pairs_board(os.path.join(TMP, 'steps.kicad_pcb'), singles=True)
+    board = pairs_board(os.path.join(TMP, 'steps.kicad_pcb'), singles=True, stackup=True)
     pcb = parse_kicad_pcb(board)
     names = sorted(x.name for x in pcb.nets.values() if x.name)
-    a = AP.analyze(board, length_groups=[['E_P', 'E_N'], ['SIG_[AB]']], length_tol=0.5,
-                   impedance=[('D_*', 85.0), ('SIG_C', 50.0)])
-    runs = chain_runs(a)
+    a = AP.analyze(board, length_groups=[['E_*', 'F_*'], ['SIG_[AB]'], ['SIG_C', 'SIG_D']],
+                   length_tol=0.5, impedance=[('D_*', 85.0), ('SIG_[CD]', 50.0)])
+    ch = chain_runs(a)
+    runs = ch.runs
     tags = [t for _, t, _ in runs]
     expect(tags == ['diffpairs', 'diffpairs_85ohm', 'impedance_50ohm', 'reroute_pairs',
                     'route', 'route_p2', 'route_p3'],
@@ -164,24 +200,30 @@ def test_steps():
         got = (groups(ns), ns.get('impedance'), ns.get('length_match_tolerance'),
                ns.get('time_matching'))
         if tag == 'diffpairs':
-            want = ([['E_N', 'E_P']], None, 0.5, False)
-            expect(pairs(ns) == ['E_P'] and got == want,
-                   f"{tag}: pair E with its group at 0.5 mm, no impedance "
+            want = ([['E_N', 'E_P', 'F_N', 'F_P']], None, 0.5, False)
+            expect(pairs(ns) == ['E_P', 'F_P'] and got == want,
+                   f"{tag}: pairs E and F with their group at 0.5 mm, no impedance "
                    f"({pairs(ns)}, {got})")
         elif tag == 'diffpairs_85ohm':
             expect(pairs(ns) == ['D_P'] and got[:2] == ([], 85.0),
                    f"{tag}: pair D at --impedance 85, no group ({pairs(ns)}, {got})")
         elif tag == 'impedance_50ohm':
             nets = sorted(expand_net_patterns(pcb, ns['nets'], quiet=True))
-            expect(nets == ['SIG_C'] and got[:2] == ([], 50.0),
-                   f"{tag}: SIG_C alone at --impedance 50, no group ({nets}, {got})")
+            expect(nets == ['SIG_C', 'SIG_D'] and got == ([['SIG_C', 'SIG_D']], 50.0, 0.5, False),
+                   f"{tag}: SIG_C and SIG_D at --impedance 50 with their group "
+                   f"({nets}, {got})")
         elif tag == 'reroute_pairs':
             expect(got[:2] == ([], None), f"{tag}: no group, no impedance ({got})")
         else:
-            expect(got == ([['SIG_A', 'SIG_B']], None, 0.5, False),
-                   f"{tag}: the SIG_A/SIG_B group at 0.5 mm, no impedance ({got})")
+            expect(got == ([['SIG_A', 'SIG_B'], ['SIG_C', 'SIG_D']], None, 0.5, False),
+                   f"{tag}: both single-ended groups at 0.5 mm, no impedance ({got})")
+    row = AP.match_account(board, a, ch.steps)['match_groups'][0]
+    expect(row['nets'] == ['E_N', 'E_P', 'F_N', 'F_P']
+           and row['rerouted_without_group'] == ['E_N', 'F_N', 'F_P'],
+           f"the account names the group's nets the reroute and the passes laid "
+           f"single-ended ({row['rerouted_without_group']})")
 
-    plain = chain_runs(AP.analyze(board))
+    plain = chain_runs(AP.analyze(board)).runs
     flags = ('--length-match-group', '--length-match-tolerance', '--time-matching',
              '--impedance')
     expect([t for _, t, _ in plain] == ['diffpairs', 'reroute_pairs', 'route',
@@ -192,7 +234,7 @@ def test_steps():
 
     print("a time group reaches its step as --time-matching with its tolerance")
     a = AP.analyze(board, time_groups=[['SIG_A', 'SIG_B']], time_tol=3.0)
-    for kind, tag, args in chain_runs(a):
+    for kind, tag, args in chain_runs(a).runs:
         ns = parsed(kind, args)
         if kind == 'route' and tag.startswith('route'):
             expect(groups(ns) == [['SIG_A', 'SIG_B']] and ns.get('time_matching') is True
@@ -215,7 +257,7 @@ def _analysis(board, *argv):
 def test_refusals():
     print("what no step can do is refused for its reason, before any step runs")
     n = len(FAILS)
-    board = pairs_board(os.path.join(TMP, 'refuse.kicad_pcb'), singles=True)
+    board = pairs_board(os.path.join(TMP, 'refuse.kicad_pcb'), singles=True, stackup=True)
     out = os.path.join(TMP, 'refused.kicad_pcb')
     for argv, why in (
             (('--length-match-group', 'D_P', 'D_N', 'SIG_A'),
@@ -229,6 +271,30 @@ def test_refusals():
             (('--length-match-group', 'SIG_A'),
              "--length-match-group SIG_A: selects 1 of the nets this run routes; a "
              "group needs two"),
+            (('--length-match-group', 'E_*'),
+             "--length-match-group E_*: selects 1 pair, which route_diff.py matches as "
+             "one member; a group needs two"),
+            (('--length-match-group', 'SIG_A', 'NOPE'),
+             "--length-match-group SIG_A NOPE: NOPE selects no net"),
+            (('--nets', 'SIG_A', 'SIG_B', '--length-match-group', 'SIG_*'),
+             "--length-match-group SIG_*: SIG_* selects SIG_C, SIG_D, outside the nets "
+             "this run routes"),
+            (('--diff-pair', 'D_P', 'D_N', '--diff-pair', 'D_P', 'D_N'),
+             "--diff-pair: D_P is in two pairs"),
+            (('--diff-pair', 'X_P', 'X_N'), "--diff-pair X_P X_N: X_P is no net on this board"),
+            (('--finish', '--diff-pair', 'E_P', 'E_N'),
+             "--diff-pair: --finish runs no diff-pair step"),
+            (('--nets', 'SIG_*', '--diff-pair', 'D_P', 'D_N'),
+             "--diff-pair: D_P, D_N not among the nets this run routes"),
+            (('--net-impedance', '!SIG_C', '50'),
+             "--net-impedance !SIG_C 50: an exclusion selects no net"),
+            (('--net-impedance', 'NOPE', '50'),
+             "--net-impedance NOPE 50: selects none of the nets this run routes"),
+            (('--net-impedance', 'SIG_C', '50', '--net-impedance', 'SIG_[C]', '60'),
+             "--net-impedance: SIG_C is given 50 and 60 ohm"),
+            (('--finish', '--net-impedance', 'SIG_C', '50'),
+             "--net-impedance: --finish routes only the nets still open"),
+
             (('--length-match-group', 'auto'),
              "--length-match-group auto: 'auto' forms its DRAM groups inside a step"),
             (('--length-match-group', 'SIG_*', '--length-match-group', 'SIG_A', 'SIG_B'),
@@ -252,6 +318,36 @@ def test_refusals():
         expect(not os.path.exists(out + '.autoroute') and not os.path.exists(out),
                f"refused before any step runs: {why[:70]}")
 
+    flat = singles_board(os.path.join(TMP, 'flat.kicad_pcb'))
+    why = "--net-impedance: the board declares no stackup"
+    check([sys.executable, '-X', 'utf8', SCRIPT, flat, out, '--net-impedance', 'SIG_C', '50'],
+          refuse=f'AUTOROUTE: refused: {why}', code=2)
+    expect(not os.path.exists(out + '.autoroute'), f"refused before any step runs: {why}")
+    bare = os.path.join(TMP, 'bare_stack.kicad_pcb')
+    with open(flat, encoding='utf-8') as fh:
+        text = fh.read()
+    with open(bare, 'w', encoding='utf-8') as fh:
+        fh.write(text.replace('(setup (pad_to_mask_clearance 0))', (
+            '(setup (stackup (layer "F.Cu" (type "copper") (thickness 0.035)) '
+            '(layer "B.Cu" (type "copper") (thickness 0.035))) (pad_to_mask_clearance 0))')))
+    why = "--net-impedance: the stackup solves no width for 50 ohm on F.Cu, B.Cu"
+    check([sys.executable, '-X', 'utf8', SCRIPT, bare, out, '--net-impedance', 'SIG_C', '50'],
+          refuse=f'AUTOROUTE: refused: {why}', code=2)
+    expect(not os.path.exists(out + '.autoroute'), f"refused before any step runs: {why}")
+    shadow = shadow_board(os.path.join(TMP, 'shadow.kicad_pcb'))
+    for argv, why in (
+            (('--diff-pair', '!E_P', '!E_N'),
+             "--diff-pair: no pattern selects only !E_P, !E_N on this board"),
+            (('--net-impedance', '?SIG', '50'),
+             "--net-impedance: no pattern selects only !SIG on this board"),
+            (('--length-match-group', 'Q*1'),
+             "--length-match-group Q*1: no pattern selects only Q*1 through the "
+             "length-match matcher")):
+        check([sys.executable, '-X', 'utf8', SCRIPT, shadow, out, *argv],
+              refuse=f'AUTOROUTE: refused: {why}', code=2)
+        expect(not os.path.exists(out + '.autoroute') and not os.path.exists(out),
+               f"refused before any step runs: {why[:70]}")
+
     print("a length group and a time group on two different steps both run")
     a = _analysis(board, '--length-match-group', 'SIG_A', 'SIG_B',
                   '--time-match-group', 'D_*', 'E_*', '--time-match-tolerance', '2')
@@ -266,8 +362,8 @@ def test_refusals():
     a = _analysis(board, '--diff-pair', 'E_P', 'E_N')
     expect(a.get('pair_nets') == ['E_P', 'E_N'] and a.get('diff_pairs') == [['E_P', 'E_N']],
            f"--diff-pair E_P E_N: E alone, D left to route.py ({a.get('pair_nets')})")
-    expect(_analysis(board).get('pair_nets') == ['D_P', 'D_N', 'E_P', 'E_N'],
-           "without it both name-detected pairs")
+    expect(_analysis(board).get('pair_nets') == ['D_P', 'D_N', 'E_P', 'E_N', 'F_P', 'F_N'],
+           "without it every name-detected pair")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -278,7 +374,7 @@ def test_mode_conflict():
     for i, net in enumerate(('SIG_A', 'SIG_B', 'SIG_C', 'SIG_D')):
         b.pad(f'P{2 * i + 1}', 6, 6 + 8 * i, net)
         b.pad(f'P{2 * i + 2}', 40, 6 + 8 * i, net)
-    board = write_board(b.text(), os.path.join(TMP, 'four.kicad_pcb'))
+    board = _write(b, os.path.join(TMP, 'four.kicad_pcb'), True)
     out = os.path.join(TMP, 'four_out.kicad_pcb')
     check([sys.executable, '-X', 'utf8', SCRIPT, board, out, '--length-match-group',
            'SIG_A', 'SIG_B', '--time-match-group', 'SIG_C', 'SIG_D'],
@@ -367,8 +463,18 @@ def test_pair_run():
                      f"({ {x: round(cu[x][0], 3) for x in nets} })")
     row = (summary.get('match_groups') or [{}])[0]
     expect(row.get('step') == 'route_diff' and abs(row.get('spread', -1) - s) < 1e-3
-           and row.get('within_tolerance') is True,
+           and row.get('within_tolerance') is True
+           and row.get('rerouted_without_group') == [],
            f"the account: route_diff.py, the spread measured here ({row.get('spread')})")
+    want = {p: (max(cu[p][0], cu[q][0]), abs(cu[p][0] - cu[q][0]))
+            for p, q in (('D_P', 'D_N'), ('E_P', 'E_N'))}
+    got = row.get('pairs') or {}
+    expect(set(got) == set(want) and all(
+        got[p]['n'] == p[0] + '_N' and abs(got[p]['pair'] - want[p][0]) < 1e-3
+        and abs(got[p]['skew'] - want[p][1]) < 1e-3 for p in want)
+        and abs(row.get('pair_spread', -1) - abs(want['D_P'][0] - want['E_P'][0])) < 1e-3,
+        f"per pair: its longer leg, as route_diff matches it, and the P/N skew apart "
+        f"({got}, pair spread {row.get('pair_spread')})")
     _run(board, os.path.join(TMP, 'pairs_plain.kicad_pcb'))
     ps = spread(copper(os.path.join(TMP, 'pairs_plain.kicad_pcb')), nets)
     expect(ps > 10 * s, f"without the flag: {ps:.3f} mm")
@@ -399,11 +505,51 @@ def test_impedance_run():
            f"-> {[round(x, 1) for x in z]} ohm")
     expect(set(cu['SIG_A'][1]) == {0.1} and ipc2141_microstrip(0.1, 0.2, 0.035, 4.5) > 70,
            f"SIG_A keeps the track floor ({set(cu['SIG_A'][1])})")
-    imp = summary.get('impedance') or {}
-    expect(imp == {'SIG_C': {'requested_ohms': 50.0, 'differential': False,
-                             'recorded': {'ohms': 50.0, 'differential': False,
-                                          'coplanar_gap': 0.0, 'applied': True}}},
-           f"the account: the target and the project's record of it ({imp})")
+    imp = (summary.get('impedance') or {}).get('SIG_C') or {}
+    w = (imp.get('widths') or {}).get('F.Cu') or {}
+    expect(imp.get('recorded') == {'ohms': 50.0, 'differential': False,
+                                   'coplanar_gap': 0.0, 'applied': True}
+           and imp.get('at_target') is True and w.get('widths') == sorted(
+               round(x, 4) for x in widths)
+           and abs(w.get('target', 0) - min(widths)) < 1e-3 and w.get('off_target_mm') == 0,
+           f"the account: the project's record, and the shipped width at the target ({imp})")
+
+    print("a net routed before the run keeps its width, and the account says so")
+    board = hand_board(os.path.join(TMP, 'hand_imp.kicad_pcb'))
+    summary, _, _ = _run(board, os.path.join(TMP, 'hand_imp_routed.kicad_pcb'),
+                         '--net-impedance', 'SIG_C', '50')
+    cu = copper(os.path.join(TMP, 'hand_imp_routed.kicad_pcb'))
+    imp = (summary.get('impedance') or {}).get('SIG_C') or {}
+    w = (imp.get('widths') or {}).get('F.Cu') or {}
+    expect(set(cu['SIG_C'][1]) == {0.1} and imp.get('at_target') is False
+           and w.get('widths') == [0.1] and abs(w.get('off_target_mm', 0) - 24) < 1e-3
+           and 45 <= ipc2141_microstrip(w.get('target', 0), H, T, ER) <= 55,
+           f"SIG_C ships 24 mm at 0.1 mm, off the 50 ohm width ({imp})")
+    assert len(FAILS) == n, FAILS[n:]
+
+
+def test_account_measures():
+    print("the account measures vias, delays, and a spread over tolerance")
+    n = len(FAILS)
+    board = hand_board(os.path.join(TMP, 'hand.kicad_pcb'))
+    cu = copper(board)
+    a = AP.analyze(board, length_groups=[['SIG_A', 'SIG_B']], length_tol=0.5)
+    row = AP.match_account(board, a)['match_groups'][0]
+    want = cu['SIG_A'][0] + 2 * (T + H + T)
+    expect(cu['SIG_A'][2] == 2 and abs(row['measured']['SIG_A'] - want) < 1e-3,
+           f"SIG_A: 36 mm of track and two 0.27 mm vias ({row['measured']['SIG_A']}, "
+           f"want {want:.3f})")
+    expect(row['within_tolerance'] is False and abs(row['spread'] - (want - 26)) < 1e-3,
+           f"a 10.54 mm spread is not within 0.5 ({row['spread']})")
+    a = AP.analyze(board, time_groups=[['SIG_B', 'SIG_C']])
+    row = AP.match_account(board, a)['match_groups'][0]
+    c = 299.792458
+    for net, length in (('SIG_B', 26.0), ('SIG_C', 24.0)):
+        lo, hi = (1000 * length * math.sqrt(e) / c for e in ((ER + 1) / 2, ER))
+        ps = row['measured'].get(net, 0)
+        expect(lo - 1e-3 <= ps <= hi + 1e-3,
+               f"{net}: {ps} ps for {length:g} mm of microstrip, between the air-"
+               f"and-FR4 bound {lo:.1f} and the all-FR4 bound {hi:.1f}")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -425,7 +571,8 @@ def main():
     global TMP
     with tempfile.TemporaryDirectory() as TMP:
         for t in (test_steps, test_refusals, test_mode_conflict, test_length_run,
-                  test_pair_run, test_impedance_run, test_unrouted_account):
+                  test_pair_run, test_impedance_run, test_account_measures,
+                  test_unrouted_account):
             before = len(FAILS)
             try:
                 t()
