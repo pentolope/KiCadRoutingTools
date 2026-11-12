@@ -478,7 +478,9 @@ def plane_layers(n):
 
 
 def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
-            keep_pours=False, fab_args=(), only=(), route_track=None, route_first=()):
+            keep_pours=False, fab_args=(), only=(), route_track=None, route_first=(),
+            length_groups=(), time_groups=(), length_tol=None, time_tol=None,
+            impedance=(), diff_pairs=None):
     from kicad_parser import parse_kicad_pcb, pour_zones
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs,
@@ -498,7 +500,10 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     fine_via, fine_drill = _num(eff['fine_via_diameter']), _num(eff['fine_via_drill'])
 
     pairs = []
-    for pr in find_differential_pairs(pcb) or []:
+    if diff_pairs is not None:
+        pairs = _explicit_pairs(diff_pairs, {n.name for n in pcb.nets.values() if n.name},
+                                finish)
+    for pr in (find_differential_pairs(pcb) or []) if diff_pairs is None else ():
         p, n = (pr[0], pr[1]) if isinstance(pr, (tuple, list)) else (pr.p, pr.n)
         pairs += [getattr(p, 'name', p), getattr(n, 'name', n)]
 
@@ -580,6 +585,10 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         planes = [(n, l) for n, l in planes if n in scope]
         plane_nets = [n for n in plane_nets if n in scope]
         power_nets = [n for n in power_nets if n in scope]
+        outside = [n for n in pairs if n not in scope] if diff_pairs is not None else []
+        if outside:
+            raise Refused(f"--diff-pair: {', '.join(outside)} not among the nets "
+                          f"this run routes")
         pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
                  if pairs[i] in scope and pairs[i + 1] in scope]
     widths = None
@@ -598,20 +607,32 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
             globs[n] = g
         else:
             unnamed.append(n)
+    if diff_pairs is not None and any(n not in globs for n in pairs):
+        raise Refused(f"--diff-pair: no pattern selects only "
+                      f"{', '.join(n for n in pairs if n not in globs)} on this board")
     if unnamed:
         print(f"AUTOROUTE: no pattern selects only {', '.join(unnamed)} on this "
               f"board; left out of the power, exclusion and pair lists", flush=True)
     power_nets = [n for n in power_nets if n in globs]
     pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
              if pairs[i] in globs and pairs[i + 1] in globs]
-    first = None
-    if route_first:
+    first = steps_scope = None
+    if route_first or length_groups or time_groups or impedance:
         # Against the nets route.py's route steps route: the caller's --nets,
         # else '*' as route.py reads it (no single-pad unconnected-* net).
         from net_queries import expand_net_patterns
         steps_scope = scope if scope is not None else sorted(
             set(expand_net_patterns(pcb, ['*'], quiet=True)) & set(names))
+    if route_first:
         first = _route_first(pcb, route_first, names, steps_scope)
+    targets = _impedance_targets(pcb, impedance, steps_scope, pairs, names,
+                                 finish) if impedance else {}
+    for n in targets:
+        globs.setdefault(n, _glob(n))
+    groups = _match_groups(
+        [('length', g) for g in length_groups] + [('time', g) for g in time_groups],
+        {'length': length_tol, 'time': time_tol}, steps_scope, pairs, targets,
+        names, finish) if (length_groups or time_groups) else []
 
     out = dict(layers=layers, clearance=clearance, track=track, via=via,
                drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
@@ -638,6 +659,15 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     if first is not None:
         out['route_first'] = first
         out['route_first_patterns'] = list(route_first)
+    if diff_pairs is not None:
+        out['diff_pairs'] = [pairs[i:i + 2] for i in range(0, len(pairs), 2)]
+    if targets:
+        out['net_impedance'] = targets
+    if groups:
+        out['match_groups'] = groups
+        for mode, tol in (('length', length_tol), ('time', time_tol)):
+            if tol is not None:
+                out[f'{mode}_match_tolerance'] = tol
     if keep_pours:
         out['keep_pours'] = True
     if fab_args:
@@ -661,6 +691,161 @@ def _route_first(pcb, patterns, names, scope):
     if alone:
         raise Refused(f"--route-first: no pattern selects only {', '.join(alone)} on this board")
     return first
+
+
+def _explicit_pairs(given, names, finish):
+    from net_queries import extract_diff_pair_base
+    if finish:
+        raise Refused('--diff-pair: --finish runs no diff-pair step')
+    flat = []
+    for p, n in given:
+        for x in (p, n):
+            if x not in names:
+                raise Refused(f'--diff-pair {p} {n}: {x} is no net on this board')
+            if x in flat:
+                raise Refused(f'--diff-pair: {x} is in two pairs')
+            flat.append(x)
+        bp, bn = extract_diff_pair_base(p), extract_diff_pair_base(n)
+        if not (bp and bn and bp[1] and not bn[1] and bp[0] == bn[0] and bp[2] == bn[2]):
+            raise Refused(
+                f'--diff-pair {p} {n}: route_diff.py pairs nets by their names only, '
+                f'and these are not the positive and the negative half of one such '
+                f'pair (P/N, +/-, _t/_c, DP/DM, positive first)')
+    return flat
+
+
+def _impedance_targets(pcb, given, scope, pairs, names, finish):
+    from net_queries import expand_net_patterns
+    in_pair = {n: pairs[i ^ 1] for i, n in enumerate(pairs)}
+    out = {}
+    for pattern, ohms in given:
+        label = f'--net-impedance {pattern} {ohms:g}'
+        if pattern.startswith('!'):
+            raise Refused(f'{label}: an exclusion selects no net')
+        sel = sorted(set(expand_net_patterns(pcb, [pattern], quiet=True)) & set(scope))
+        if not sel:
+            raise Refused(f'{label}: selects none of the nets this run routes')
+        if any(n in in_pair for n in sel) and any(n not in in_pair for n in sel):
+            raise Refused(f'{label}: selects pair nets (a differential target) and '
+                          f'single-ended nets (a single-ended target); give each '
+                          f'kind its own pattern')
+        for n in sel:
+            if n in out and out[n]['ohms'] != ohms:
+                raise Refused(f"--net-impedance: {n} is given {out[n]['ohms']:g} "
+                              f"and {ohms:g} ohm")
+            out[n] = {'ohms': ohms, 'differential': n in in_pair}
+    for n, spec in sorted(out.items()):
+        if spec['differential']:
+            if finish:
+                raise Refused(f'--net-impedance: {n} is a pair net and --finish '
+                              f'runs no diff-pair step')
+            if (out.get(in_pair[n]) or {}).get('ohms') != spec['ohms']:
+                raise Refused(f'--net-impedance: {n} and {in_pair[n]} are one pair, '
+                              f'which route_diff.py routes at one differential '
+                              f'target; give both halves the same ohms')
+        elif not _selects_exactly(_glob(n), n, names):
+            raise Refused(f'--net-impedance: no pattern selects only {n} on this board')
+    return out
+
+
+def _lm_pattern(name):
+    s = name.replace('[', '[[]')
+    return '[-]' + s[1:] if s.startswith('-') else s
+
+
+def _owner_text(key):
+    tool, ohms = key
+    if tool == 'route_diff':
+        return 'pairs by route_diff.py' + (f' at {ohms:g} ohm' if ohms else '')
+    return ('single-ended by ' + (f"route.py's {ohms:g} ohm step" if ohms
+                                  else "route.py's route passes"))
+
+
+def _match_groups(groups, tols, scope, pairs, targets, names, finish):
+    from length_matching import find_nets_matching_patterns
+    import routing_defaults as defaults
+    in_pair = set(pairs)
+    flag = {'length': '--length-match-group', 'time': '--time-match-group'}
+    out, seen = [], {}
+    for mode, g in groups:
+        label = f"{flag[mode]} {' '.join(g)}"
+        if any(p.lower() == 'auto' for p in g):
+            raise Refused(f"{label}: 'auto' forms its DRAM groups inside a step, so "
+                          f"autoroute cannot tell which step routes them; name the "
+                          f"group's nets")
+        nets = sorted(find_nets_matching_patterns(list(scope), list(g)))
+        if len(nets) < 2:
+            raise Refused(f'{label}: selects {len(nets)} of the nets this run routes; '
+                          f'a group needs two')
+        for n in nets:
+            if n in seen:
+                raise Refused(f'{label}: {n} is in {seen[n]} too')
+            seen[n] = label
+        owners = {}
+        for n in nets:
+            key = ('route_diff' if n in in_pair else 'route',
+                   (targets.get(n) or {}).get('ohms'))
+            owners.setdefault(key, []).append(n)
+        if len(owners) > 1:
+            split = '; '.join(f"{_owner_text(k)}: {', '.join(v)}"
+                              for k, v in sorted(owners.items(), key=lambda kv: (
+                                  kv[0][0] != 'route_diff', kv[0][1] or 0)))
+            raise Refused(
+                f'{label}: its nets are routed by different steps ({split}). A step '
+                f'lengthens only the nets it routes -- copper an earlier step laid '
+                f'sets the target but is never lengthened -- so the group cannot be '
+                f'matched across steps; give each step\'s nets their own group')
+        (tool, ohms), = owners
+        if tool == 'route_diff' and finish:
+            raise Refused(f'{label}: --finish runs no diff-pair step, and the '
+                          f'group\'s nets are pairs route_diff.py routes')
+        pats = [_lm_pattern(n) for n in nets]
+        loose = [n for n, p in zip(nets, pats)
+                 if find_nets_matching_patterns(list(names), [p]) != [n]]
+        if loose:
+            raise Refused(f"{label}: no pattern selects only {', '.join(loose)} "
+                          f"through the length-match matcher on this board")
+        tol = tols[mode]
+        if tol is None:
+            tol = (defaults.LENGTH_MATCH_TOLERANCE if mode == 'length'
+                   else defaults.TIME_MATCH_TOLERANCE)
+        out.append({'mode': mode, 'patterns': list(g), 'nets': nets, 'tolerance': tol,
+                    'unit': 'mm' if mode == 'length' else 'ps', 'step': tool,
+                    'impedance': ohms, 'step_patterns': pats})
+    carried = {}
+    for grp in out:
+        if grp['step'] == 'route_diff':
+            recv = [f"route_diff.py's call" + (f" at {grp['impedance']:g} ohm"
+                                                if grp['impedance'] else '')]
+        else:
+            recv = ["route.py's route passes"] + (
+                [f"route.py's {grp['impedance']:g} ohm step"] if grp['impedance'] else [])
+        for r in recv:
+            carried.setdefault(r, {}).setdefault(grp['mode'], []).append(grp)
+    for r, modes in carried.items():
+        if len(modes) > 1:
+            raise Refused(
+                f"{r} would carry length group(s) "
+                f"{'; '.join(' '.join(x['patterns']) for x in modes['length'])} and "
+                f"time group(s) {'; '.join(' '.join(x['patterns']) for x in modes['time'])}, "
+                f"and its --time-matching applies to every group of a call; match "
+                f"them in separate runs")
+    return out
+
+
+def match_args(a, groups):
+    if not groups:
+        return []
+    args = []
+    for g in groups:
+        args += ['--length-match-group', *g['step_patterns']]
+    mode = groups[0]['mode']
+    if mode == 'time':
+        args.append('--time-matching')
+    tol = a.get(f'{mode}_match_tolerance')
+    if tol is not None:
+        args += [f'--{mode}-match-tolerance', str(tol)]
+    return args
 
 
 # --------------------------------------------------------------------------
@@ -985,6 +1170,40 @@ class Chain(ChainEvents):
             self.cur = out
 
 
+def diff_calls(a):
+    """[(tag, ohms or None, pair nets)]: one route_diff.py call per
+    differential impedance target among the pairs, the pairs without one
+    first, as run_plan runs them and AUTOROUTE_PLAN lists them."""
+    imp = a.get('net_impedance') or {}
+    calls = {}
+    for n in a['pair_nets']:
+        calls.setdefault((imp.get(n) or {}).get('ohms'), []).append(n)
+    return [('diffpairs' + (f'_{o:g}ohm' if o else ''), o, calls[o])
+            for o in sorted(calls, key=lambda k: (k is not None, k or 0))]
+
+
+def impedance_steps(a):
+    """[(tag, ohms, nets)]: one route.py --impedance step per single-ended
+    impedance target, ahead of the route passes, as route_passes runs them
+    and AUTOROUTE_PLAN lists them."""
+    imp = {}
+    for n, spec in sorted((a.get('net_impedance') or {}).items()):
+        if not spec['differential']:
+            imp.setdefault(spec['ohms'], []).append(n)
+    return [(f'impedance_{o:g}ohm', o, imp[o]) for o in sorted(imp)]
+
+
+def _matched(a, step, ohms=...):
+    """'; length-matches GROUP ...' for the match groups STEP's call at
+    OHMS carries (every STEP group when OHMS is not given: the route passes
+    carry them all), for AUTOROUTE_PLAN's why; else ''."""
+    gs = [g for g in a.get('match_groups') or ()
+          if g['step'] == step and (ohms is ... or g['impedance'] == ohms)]
+    return ('; ' + '; '.join(f"{g['mode']}-matches {' '.join(g['patterns'])} "
+                             f"within {g['tolerance']:g} {g['unit']}" for g in gs)
+            if gs else '')
+
+
 def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
     """AUTOROUTE_PLAN's payload: the design rules the chain routes at and the
     steps it means to run, in order, as {tag, tool, what, why, optional}. A
@@ -1019,11 +1238,19 @@ def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
                 'once, after the fanouts, when one escaped a ball; a part it leaves '
                 'shorted to a BGA\'s copper re-fans that BGA holding the part',
                 optional=True)
-        if a['pair_nets']:
-            row('diffpairs', 'diff',
-                f"route {len(a['pair_nets']) // 2} differential pair(s) with route_diff",
-                'pairs found by name, routed before the single nets; a pair net '
-                'left in a DRC violation is routed again single-ended')
+        for tag, ohms, nets in diff_calls(a):
+            row(tag, 'diff',
+                f"route {len(nets) // 2} differential pair(s) with route_diff"
+                + (f' at {ohms:g} ohm (--net-impedance)' if ohms else ''),
+                ('pairs given by --diff-pair' if 'diff_pairs' in a else 'pairs found by name')
+                + ', routed before the single nets; a pair net left in a DRC violation '
+                'is routed again single-ended' + _matched(a, 'route_diff', ohms))
+        for tag, ohms, nets in impedance_steps(a):
+            row(tag, 'route', f"route {', '.join(nets[:6])}"
+                + (' ...' if len(nets) > 6 else '') + f' at {ohms:g} ohm (--net-impedance)',
+                'a single-ended impedance target: route.py --impedance solves its '
+                'widths from the stackup, on its own ahead of the route passes'
+                + _matched(a, 'route', ohms))
     row('route', 'route', ('route the nets --nets selects' if a.get('nets') else
                            'route every net') + (' still open' if finish else ''),
         f"grid {a['grid']:g} mm"
@@ -1040,7 +1267,8 @@ def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
            + ' (--power-nets, ahead of the rails)' if a.get('caller_power_nets') else '')
         + (', deeper rip-up (congested)' if a['congested'] else '')
         + ('; signals kept off the inner planes' if any(
-            float(c) < 0 for c in a['layer_costs']) else ''))
+            float(c) < 0 for c in a['layer_costs']) else '')
+        + _matched(a, 'route'))
     for i in range(2, ROUTE_PASSES + 1):
         row(f'route_p{i}', 'route', f'route pass {i} on the best board so far',
             f'only while nets stay open, the last pass was kept, and the router '
@@ -1160,25 +1388,35 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
     rip, reroute = [], []
     if a['pair_nets']:
         before = ch.drc_nets(ch.cur)
-        out, s, _ = ch.run('diff', [
-            '{IN}', '{OUT}', '--nets', *[a['globs'][n] for n in a['pair_nets']],
-            '--track-width', str(max(0.1, a['track'])),
-            '--diff-pair-gap', str(max(0.1, a['clearance'])),
-            '--clearance-ceiling', str(a['clearance']),
-            '--via-size', str(a['via']), '--via-drill', str(a['drill']),
-            '--layers', *L, '--layer-costs', *costs,
-            '--grid-step', str(a['grid'])], 'diffpairs')
-        ch.accept(out)
-        # A pair it could not couple is left to the route step, with whatever
-        # stubs it laid; those stubs block the partner unless they may be ripped.
-        if out:
-            rip = [a['globs'][n] for n in (s or {}).get('single_ended_followup_nets') or []
-                   if n in a['globs']]
-            # A pair net the step left in a DRC violation is laid again, single-ended.
-            after = ch.drc_nets(out)
+        calls = diff_calls(a)
+        ran = False
+        for tag, ohms, nets in calls:
+            groups = [g for g in a.get('match_groups') or ()
+                      if g['step'] == 'route_diff' and g['impedance'] == ohms]
+            out, s, _ = ch.run('diff', [
+                '{IN}', '{OUT}', '--nets', *[a['globs'][n] for n in nets],
+                '--track-width', str(max(0.1, a['track'])),
+                '--diff-pair-gap', str(max(0.1, a['clearance'])),
+                '--clearance-ceiling', str(a['clearance']),
+                '--via-size', str(a['via']), '--via-drill', str(a['drill']),
+                '--layers', *L, '--layer-costs', *costs,
+                '--grid-step', str(a['grid'])]
+                + (['--impedance', str(ohms)] if ohms else [])
+                + match_args(a, groups), tag)
+            ch.accept(out)
+            # A pair it could not couple is left to the route step, with whatever
+            # stubs it laid; those stubs block the partner unless they may be ripped.
+            if out:
+                ran = True
+                rip += [a['globs'][n] for n in
+                        (s or {}).get('single_ended_followup_nets') or []
+                        if n in a['globs']]
+        if ran:
+            # A pair net the steps left in a DRC violation is laid again, single-ended.
+            after = ch.drc_nets(ch.cur)
             if None not in (before, after):
                 reroute = sorted((after - before) & set(a['pair_nets']))
-            ch.decide('diffpairs', True,
+            ch.decide(calls[0][0], True,
                       '; '.join(x for x in (
                           f"{len(rip)} uncoupled pair net(s) the route step may rip"
                           if rip else '',
@@ -1400,8 +1638,10 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     if quick:
         shared += ['--quick', str(quick)]
     order = a.get('route_first') or []
+    routed_groups = [g for g in a.get('match_groups') or () if g['step'] == 'route']
     base = (['{IN}', '{OUT}', '--nets', *_scope_args(a)]
-            + (['--route-first', *[_glob(n) for n in order]] if order else []) + shared)
+            + (['--route-first', *[_glob(n) for n in order]] if order else []) + shared
+            + match_args(a, routed_groups))
     best = None                        # (grade, board)
     passes = ['route' + (f'_p{i + 1}' if i else '') for i in range(ROUTE_PASSES)]
 
@@ -1432,13 +1672,20 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
         if g['open'] == 0:
             skip_rest(0, 'the input has no open net')
             return ch, ch.cur, g
+    for tag, ohms, nets in impedance_steps(a):
+        groups = [g for g in routed_groups if g['impedance'] == ohms]
+        out, _, _ = ch.run('route', ['{IN}', '{OUT}', '--nets', *[a['globs'][n] for n in nets],
+                                     '--impedance', str(ohms), *shared, '--layers', *L,
+                                     '--layer-costs', *costs] + match_args(a, groups),
+                           tag)
+        ch.accept(out)
     if reroute:
         # A net whose new route lays no copper gets its old copper back, and
         # the passes below route whatever is left open.
         out, _, _ = ch.run('route', ['{IN}', '{OUT}', '--nets', *[a['globs'][n] for n in reroute],
                                      '--force-reroute', *shared, '--layers', *L,
                                      '--layer-costs', *costs], 'reroute_pairs',
-                           parent='diffpairs')
+                           parent=diff_calls(a)[0][0])
         ch.accept(out)
     crossing = [str(PLANE_FALLBACK_COST) if float(c) < 0 else c for c in costs]
     first = spent = None
@@ -1523,6 +1770,54 @@ def route_first_record(log):
         if rec is not None:
             return rec
     return None
+
+
+def _member_value(pcb, net_id, mode):
+    from net_queries import net_match_length, net_pads_joined, net_pad_to_die_delay
+    if net_id is None:
+        return None
+    if mode == 'length':
+        return net_match_length(pcb, net_id, mode='total')
+    if not net_pads_joined(pcb, net_id):
+        return None
+    from impedance import calculate_route_propagation_time_ps
+    segs = [s for s in pcb.segments if s.net_id == net_id]
+    vias = [v for v in pcb.vias if v.net_id == net_id]
+    return calculate_route_propagation_time_ps(segs, vias, pcb) + net_pad_to_die_delay(pcb, net_id)
+
+
+def match_account(board, a):
+    groups = a.get('match_groups') or []
+    targets = a.get('net_impedance') or {}
+    if not board or not (groups or targets):
+        return None
+    out = {}
+    if groups:
+        from kicad_parser import parse_kicad_pcb
+        pcb = parse_kicad_pcb(board)
+        ids = {n.name: nid for nid, n in pcb.nets.items() if n.name}
+        rows = []
+        for g in groups:
+            vals = {n: _member_value(pcb, ids.get(n), g['mode']) for n in g['nets']}
+            got = {n: v for n, v in vals.items() if v is not None}
+            row = {k: g[k] for k in ('mode', 'patterns', 'nets', 'tolerance', 'unit',
+                                     'step', 'impedance')}
+            row['measured'] = {n: round(v, 4) for n, v in got.items()}
+            row['unmeasured'] = sorted(n for n, v in vals.items() if v is None)
+            spread = (max(got.values()) - min(got.values())
+                      if got and not row['unmeasured'] else None)
+            row['spread'] = None if spread is None else round(spread, 4)
+            row['within_tolerance'] = None if spread is None else spread <= g['tolerance']
+            rows.append(row)
+        out['match_groups'] = rows
+    if targets:
+        from protected_nets import pro_path_for_board, read_impedance_specs
+        recorded = read_impedance_specs(pro_path_for_board(board))
+        out['impedance'] = {n: {'requested_ohms': s['ohms'],
+                                'differential': s['differential'],
+                                'recorded': recorded.get(n)}
+                            for n, s in sorted(targets.items())}
+    return out
 
 
 #: The tags route_passes gives its passes; the diff-pair reroute is a route
@@ -1662,6 +1957,38 @@ def main():
                          'route.py\'s mps order. A pattern that selects no net, an '
                          'exclusion and a net outside --nets are refused before any '
                          'step runs')
+    ap.add_argument('--length-match-group', action='append', nargs='+', default=[],
+                    dest='length_match_groups', metavar='PATTERN',
+                    help='a group of nets to length-match (repeatable), read as '
+                         'route.py\'s --length-match-group reads its patterns: '
+                         'given to the one step that routes all its nets -- '
+                         'route_diff.py for pairs, route.py for single-ended '
+                         'nets -- or refused before any step runs')
+    ap.add_argument('--length-match-tolerance', type=_width, default=None, metavar='MM',
+                    help='the steps\' --length-match-tolerance for every length '
+                         'group (their default when omitted)')
+    ap.add_argument('--time-match-group', action='append', nargs='+', default=[],
+                    dest='time_match_groups', metavar='PATTERN',
+                    help='a group of nets to match by propagation delay (repeatable): '
+                         'given to its step as --length-match-group with '
+                         '--time-matching. A step carrying both a length and a '
+                         'time group is refused')
+    ap.add_argument('--time-match-tolerance', type=_width, default=None, metavar='PS',
+                    help='the steps\' --time-match-tolerance for every time group '
+                         '(their default when omitted)')
+    ap.add_argument('--net-impedance', action='append', nargs=2, default=[],
+                    metavar=('PATTERN', 'OHMS'),
+                    help='an impedance target for the nets PATTERN selects '
+                         '(repeatable): differential ohms for pair nets, given to '
+                         'their route_diff.py call as --impedance; single-ended '
+                         'ohms for other nets, routed by a route.py --impedance '
+                         'step of their own ahead of the route passes')
+    ap.add_argument('--diff-pair', action='append', nargs=2, default=None,
+                    dest='diff_pairs', metavar=('P', 'N'),
+                    help='a differential pair (repeatable): route_diff.py routes '
+                         'these pairs and no other, in place of the pairs found by '
+                         'name. Each must be one pair by its names, which is how '
+                         'route_diff.py finds it')
     ap.add_argument('--json-out', metavar='FILE',
                     help='also write FILE: the shipped route pass\'s route.py '
                          '--json-out summary, the step that produced the shipped '
@@ -1702,10 +2029,22 @@ def main():
             raise Refused(f"--power-nets gives {len(args.power_nets)} pattern(s) and "
                           f"--power-nets-widths {len(args.power_nets_widths)} "
                           f"width(s); give one width per pattern")
+        impedance = []
+        for pattern, ohms in args.net_impedance:
+            try:
+                impedance.append((pattern, _width(ohms)))
+            except argparse.ArgumentTypeError:
+                raise Refused(f'--net-impedance {pattern} {ohms}: the ohms must be a '
+                              f'finite number > 0') from None
         a = analyze(args.input_file, finish=args.finish, plane_cost=args.plane_layer_cost,
                     caller_power=list(zip(args.power_nets, args.power_nets_widths)),
                     keep_pours=args.keep_pours, fab_args=fab_args, only=args.nets,
-                    route_track=args.track_width, route_first=args.route_first)
+                    route_track=args.track_width, route_first=args.route_first,
+                    length_groups=args.length_match_groups,
+                    time_groups=args.time_match_groups,
+                    length_tol=args.length_match_tolerance,
+                    time_tol=args.time_match_tolerance,
+                    impedance=impedance, diff_pairs=args.diff_pairs)
     except Refused as exc:
         print(f"AUTOROUTE: refused: {exc}", flush=True)
         return 2
@@ -1749,10 +2088,11 @@ def main():
             emit('AUTOROUTE_STEP', {'tag': r['tag'], 'tool': r['tool'], 'parent': None,
                                     'state': 'skipped', 't': round(time.time(), 3),
                                     'reason': ch.skipped.get(r['tag'], 'not reached')})
+    account = match_account(final, a)
     with open(os.path.join(work, 'plan.json'), 'w') as fh:
         json.dump({'analysis': a, 'plan': plan, 'steps': ch.steps,
                    'decisions': ch.decisions, 'final': final,
-                   'grade': grade}, fh, indent=1)
+                   'grade': grade, 'match': account}, fh, indent=1)
     final_tag = None
     if final:
         final_tag = next((s['tag'] for s in ch.steps
@@ -1781,7 +2121,9 @@ def main():
             write_summary_file(json_out, {**shipped_record(ch, final), 'analysis': a,
                                           'plan': plan, 'steps': ch.steps,
                                           'decisions': ch.decisions, 'final': final,
-                                          'grade': grade})
+                                          'grade': grade, 'match': account})
+    if account:
+        summary.update(account)
     if not final:
         print("AUTOROUTE: no route pass produced a board", flush=True)
         summary['error'] = 'no route pass produced a board'
