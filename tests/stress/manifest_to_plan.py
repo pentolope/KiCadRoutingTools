@@ -868,8 +868,8 @@ def parse_command(argv, cwd=None):
     # it still did (26 kept bga_fanout steps on 18 corpus boards).
     for k in ('--power-nets', '--power-nets-widths', '--layer-costs',
               '--layers', '--via-span', '--polarity-swap-nets', '--coplanar-nets',
-              '--rip-existing-nets', '--route-first', '--plane-net-layers',
-              '--keep-away', '--diff-pair-intra-lane'):
+              '--rip-existing-nets', '--plane-net-layers', '--keep-away',
+              '--diff-pair-intra-lane', '--route-first'):
         if k in lists:
             step['params'][LIST_FLAGS[k]] = lists[k]
     return step
