@@ -227,8 +227,7 @@ plugin's **Auto › Autorouter** tab runs the same script on the open board.
 **Option D: A hand-built chain (the manual / expert path)**
 
 When a board needs steps `autoroute.py` does not take -- impedance control, length
-matching, keep-away rules, buses, a particular plane map, or a net class that is a
-real requirement rather than aspirational -- run the tools yourself, the kind of chain
+matching, keep-away rules, buses or a particular plane map -- run the tools yourself, the kind of chain
 `/plan-pcb-routing` plans:
 
 ```bash

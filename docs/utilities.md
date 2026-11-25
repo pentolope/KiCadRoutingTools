@@ -2695,11 +2695,20 @@ net names, layer count and the board's own design rules -- without an agent.
 It makes the same kinds of choices the plan-pcb-routing skill asks an agent
 to make, and runs each step as its own process in `<output>.autoroute/`:
 
-1. **Design rules**: the fab clearance floor for every step, as the route
-   steps' `--clearance-ceiling` (a finished board meets the fab floor; a net
-   class declared above it is aspirational, as in the plan-pcb-routing
-   skill's chains), the fab track floor, the working via, and the fine via
-   for fine-pitch escapes (`list_nets.read_design_rules`).
+1. **Design rules**: the fab clearance floor for every step, the Default
+   class's (`--clearance` on the route steps), the fab track floor, the
+   working via, and the fine via for fine-pitch escapes
+   (`list_nets.read_design_rules`). A net class declared above the floor
+   keeps its own clearance on every step: no step is given a clearance
+   ceiling and the decap step no `--clearance` (a ceiling there), and its
+   nets route in a `route.py` call of their own per class clearance, widest
+   first, ahead of the route passes, which leave them out, and again before
+   a later pass, at its layer costs, while one of them is open -- `route.py`
+   prices every obstacle of a call at the widest class the call routes, so
+   routed with the others they would hold every net of the call at their
+   clearance. `--cap-net-classes` caps every class at the floor instead
+   (`--clearance-ceiling` on every step that takes one, `--clearance` on the
+   decap step), as the plan-pcb-routing skill's chains do.
 2. **Planes first**: on 4+ layer boards, the fewest inner layers that put a
    plane next to every signal layer, so each signal layer has a reference:
    In1+In2 on 4 layers, In1+In4 on 6, In1+In3+In6 on 8
@@ -2794,6 +2803,22 @@ Options:
                      price lets every step cross them (the plan-pcb-routing
                      skill's route step uses 3.0), trading reference integrity
                      for routability.
+  --layer-costs COST [...]
+                     route.py's --layer-costs for every step that takes them
+                     (fanouts, diff pairs, route), one per copper layer in
+                     board order, in place of the chain's own (1.0 1.5 on 2
+                     layers, --plane-layer-cost on inner planes). Each in
+                     [1, 1000], or negative to keep tracks off the layer in
+                     the first pass; the later passes cross a negative layer
+                     at 3.0, as they cross a plane. Another count, another
+                     value and --plane-layer-cost with it are refused before
+                     any step (exit 2).
+  --via-cost N       route.py's and route_diff.py's --via-cost (a whole
+                     number >= 0) for every route and diff-pair step; without
+                     it, their own default.
+  --cap-net-classes  Cap every net class at the chain clearance on every step
+                     (the pre-existing behaviour). Without it a class declared
+                     above that clearance routes at its own (step 1).
   --keep-pours       Take the planes from the board's own pours, as --finish
                      does, in a full run, and pour none: step 2 does not run,
                      so every pour ships with the outline, clearance, pad
@@ -2880,7 +2905,7 @@ follow it (the plugin's Autorouter sub-tab reads nothing else):
 | `AUTOROUTE_PLAN` | after the analysis | the design rules and `rules_why`, planes, parts, pairs, power nets, and `steps`: one `{tag, tool, what, why, optional}` row per step it means to run; an optional row runs only if what comes before calls for it |
 | `AUTOROUTE_STEP` | each step start and end | `state` `running`, then `done` or `failed` (one of each per step run), or `skipped` with its `reason` for a planned step that never ran. An ending carries `seconds`, `rc`, a one-line `result`, the step's own `summary` (escapes, caps moved, pairs routed, routed/failed/vias), the `cmd` and `log`, a route pass's `grade` (open nets, real DRC) and whether it was `kept`, and on failure `error_tail`, the last lines of its log. A step the plan did not list (a fanout's next rung, a re-fan, the pair re-route) names its planned row as `parent` |
 | `AUTOROUTE_DECISION` | when the chain chooses | `{tag, kept, why}`: the fanout rung kept, a re-fan or a route pass kept or not, the pair nets ripped or re-routed |
-| `AUTOROUTE_SUMMARY` | last | the shipped step (`final_step`, `final_tag`), `output`, `open`, `open_nets`, `drc`, `drc_items`, `seconds`; with `error` when nothing shipped |
+| `AUTOROUTE_SUMMARY` | last | the shipped step (`final_step`, `final_tag`), `output`, `open`, `open_nets`, `drc`, `drc_items`, `seconds`, `routing_costs` (`via_cost`, the caller's or route.py's default, the first pass's `layer_costs` and the later passes' `crossing_layer_costs` by layer, and `from_caller`) and `net_classes` (`clearance`, the nets declared above it, `mode` `honoured`, `capped` or null when none is, and the route call of each class clearance); with `error` when nothing shipped. `--json-out` carries `routing_costs` and `net_classes` too |
 
 `KRT_AUTOROUTE_FAIL_STEPS` (step tags, comma separated) makes those steps run
 a stand-in that exits 3, so a test can drive the failure path on a real board.

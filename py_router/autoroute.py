@@ -10,9 +10,9 @@ footprints, net names, layer count and the board's own design rules -- and
 runs the chain, so routing without an agent gets the steps that remove most
 congestion before the router starts:
 
-  1. design rules  the fab clearance floor for every step (a net class above
-                   it is aspirational, so the route step caps every class
-                   at it), the fab track floor, the working via (fine via
+  1. design rules  the fab clearance floor for every step (the Default
+                   class routes at it, a net class declared above it at its
+                   own), the fab track floor, the working via (fine via
                    for fine-pitch escapes), all from
                    list_nets.read_design_rules
   2. planes        on 4+ layer boards the fewest inner layers that put a
@@ -95,6 +95,29 @@ else every net route.py's '*' selects). A pattern that selects no net, an
 exclusion, a wildcard that selects none of those nets and a name that selects
 a net outside them (an unqualified name selects every sheet's net of that
 leaf name) are refused before any step runs (exit 2).
+
+A net class the board declares above the chain clearance keeps its own on
+every step: no step is given a clearance ceiling, the decap step no
+clearance (its --clearance is a ceiling), and the route steps --clearance
+for the Default class. Its nets route in a route.py call of their own per
+class clearance, widest first, ahead of the route passes, which leave them
+out, and again before a later pass, at its layer costs, while one is open:
+route.py prices every obstacle of a call at the widest class the call
+routes. --cap-net-classes instead caps every class at the chain clearance on
+every step, as route.py --clearance-ceiling does. The analysis names the
+nets (`class_clearances`), and AUTOROUTE_SUMMARY and --json-out the mode
+and the calls (`net_classes`).
+
+--layer-costs COST [...] (one per copper layer, board order) replaces the
+chain's layer costs on every step that takes them, and --via-cost N is
+route.py's and route_diff.py's own --via-cost on every route and diff-pair
+step; a negative layer cost keeps tracks off that layer in the first pass,
+and the later passes cross it at PLANE_FALLBACK_COST, as they cross a
+plane. A count that is not the board's copper layer count, a cost outside
+[1, 1000] that is not negative, a via cost that is not a whole number >= 0,
+and --layer-costs with --plane-layer-cost are refused before any step runs
+(exit 2). AUTOROUTE_SUMMARY and --json-out give what the route steps ran
+with (`routing_costs`).
 
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
 routing CLI takes. autoroute's own floors (step 1) come from them, and it
@@ -480,11 +503,12 @@ def plane_layers(n):
 def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
             keep_pours=False, fab_args=(), only=(), route_track=None, route_first=(),
             length_groups=(), time_groups=(), length_tol=None, time_tol=None,
-            impedance=(), diff_pairs=None):
+            impedance=(), diff_pairs=None, cap_net_classes=False, layer_costs=None,
+            via_cost=None):
     from kicad_parser import parse_kicad_pcb, pour_zones
     from list_nets import (read_design_rules, effective_floors,
                            find_power_nets, find_differential_pairs,
-                           power_pin_parts, power_net_order)
+                           power_pin_parts, power_net_order, net_clearance_map_by_id)
 
     pcb = parse_kicad_pcb(board)
     layers = list(pcb.board_info.copper_layers)
@@ -492,8 +516,8 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     rules = read_design_rules(board)
     eff = rules.get('effective') or effective_floors(rules.get('constraints') or {}, n_layers)
 
-    # A finished board meets the fab floor everywhere; a declared net class
-    # above it is aspirational, so every step routes at the floor (#1522).
+    # The Default class routes at the fab floor (#1522); a net class declared
+    # above it keeps its own clearance unless the caller caps every class.
     clearance = _num(eff['drc_clearance'])
     track = _num(max(eff['fab_track_width'], 0.1))
     via, drill = _num(eff['working_via_diameter']), _num(eff['working_via_drill'])
@@ -549,7 +573,14 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         power_nets = plane_nets + [n for n, _ in rails if n not in plane_nets]
         power_nets += [n for n, _ in gnd if n not in power_nets]
     solid = {l for _, l in planes if l not in (layers[0], layers[-1])}
-    if n_layers == 2:
+    caller_costs = layer_costs
+    if caller_costs is not None:
+        if len(caller_costs) != n_layers:
+            raise Refused(f"--layer-costs gives {len(caller_costs)} value(s) for a board "
+                          f"of {n_layers} copper layer(s) ({' '.join(layers)}); give one "
+                          f"per layer, in that order")
+        layer_costs = [float(c) for c in caller_costs]
+    elif n_layers == 2:
         layer_costs = [1.0, 1.5]
     else:
         layer_costs = [plane_cost if l in solid else 1.0 for l in layers]
@@ -617,7 +648,11 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     pairs = [n for i in range(0, len(pairs) - 1, 2) for n in pairs[i:i + 2]
              if pairs[i] in globs and pairs[i + 1] in globs]
     first = steps_scope = None
-    if route_first or length_groups or time_groups or impedance:
+    declared = net_clearance_map_by_id(board, {nid: n.name for nid, n in pcb.nets.items()
+                                               if n.name})
+    above = {pcb.nets[nid].name: _num(c) for nid, c in declared.items()
+             if c > clearance + 1e-9}
+    if route_first or length_groups or time_groups or impedance or above:
         # Against the nets route.py's route steps route: the caller's --nets,
         # else '*' as route.py reads it (no single-pad unconnected-* net).
         from net_queries import expand_net_patterns
@@ -625,6 +660,12 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
             set(expand_net_patterns(pcb, ['*'], quiet=True)) & set(names))
     if route_first:
         first = _route_first(pcb, route_first, names, steps_scope)
+    above = {n: c for n, c in above.items() if n in set(steps_scope or ())}
+    for n in above:
+        if _selects_exactly(_glob(n), n, names):
+            globs.setdefault(n, _glob(n))
+        elif n not in unnamed:
+            unnamed.append(n)
     targets = _impedance_targets(pcb, impedance, steps_scope, pairs, names, finish,
                                  track, max(0.1, clearance)) if impedance else {}
     for n in targets:
@@ -632,7 +673,9 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
     groups = _match_groups(
         [('length', g) for g in length_groups] + [('time', g) for g in time_groups],
         {'length': length_tol, 'time': time_tol}, steps_scope, pairs, targets,
-        names, finish) if (length_groups or time_groups) else []
+        names, finish, tier_of=None if cap_net_classes else {
+            n: f'route_class_{c:g}' for n, c in above.items() if n in globs}
+    ) if (length_groups or time_groups) else []
 
     out = dict(layers=layers, clearance=clearance, track=track, via=via,
                drill=drill, fine_via=fine_via, fine_drill=fine_drill, planes=planes,
@@ -672,7 +715,39 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         out['keep_pours'] = True
     if fab_args:
         out['fab_args'] = list(fab_args)
+    if above:
+        out['class_clearances'] = dict(sorted(above.items()))
+    if cap_net_classes:
+        out['cap_net_classes'] = True
+    if caller_costs is not None:
+        out['caller_layer_costs'] = list(layer_costs)
+    if via_cost is not None:
+        out['via_cost'] = via_cost
     return out
+
+
+def honours_classes(a):
+    """True when the chain routes the net classes A declares above its
+    clearance at their own clearance: some class is, and the caller did not
+    cap every class (--cap-net-classes)."""
+    return bool(a.get('class_clearances')) and not a.get('cap_net_classes')
+
+
+def class_tiers(a):
+    """[(tag, clearance, nets)]: one route.py call per class clearance above
+    the chain's, widest first, for the nets of that class a pattern selects,
+    when the chain honours the classes; else []. route.py prices every
+    obstacle at the widest class it routes in one call, so a net of a wider
+    class routed with the others would hold every net of the call at its
+    clearance; routed in a call of its own, each pair is priced at the wider
+    of its two classes."""
+    if not honours_classes(a):
+        return []
+    by = {}
+    for n, c in a['class_clearances'].items():
+        if n in a['globs']:
+            by.setdefault(c, []).append(n)
+    return [(f'route_class_{c:g}', c, by[c]) for c in sorted(by, reverse=True)]
 
 
 def _route_first(pcb, patterns, names, scope):
@@ -776,11 +851,13 @@ def _owner_text(key):
     tool, ohms = key
     if tool == 'route_diff':
         return 'pairs by route_diff.py' + (f' at {ohms:g} ohm' if ohms else '')
+    if tool.startswith('route_class_'):
+        return f"single-ended by route.py's {tool} step"
     return ('single-ended by ' + (f"route.py's {ohms:g} ohm step" if ohms
                                   else "route.py's route passes"))
 
 
-def _match_groups(groups, tols, scope, pairs, targets, names, finish):
+def _match_groups(groups, tols, scope, pairs, targets, names, finish, tier_of=None):
     from length_matching import find_nets_matching_patterns
     import routing_defaults as defaults
     in_pair = set(pairs)
@@ -811,8 +888,9 @@ def _match_groups(groups, tols, scope, pairs, targets, names, finish):
             seen[n] = label
         owners = {}
         for n in nets:
-            key = ('route_diff' if n in in_pair else 'route',
-                   (targets.get(n) or {}).get('ohms'))
+            ohms = (targets.get(n) or {}).get('ohms')
+            key = ('route_diff' if n in in_pair else
+                   (tier_of or {}).get(n, 'route') if ohms is None else 'route', ohms)
             owners.setdefault(key, []).append(n)
         if len(owners) > 1:
             split = '; '.join(f"{_owner_text(k)}: {', '.join(v)}"
@@ -850,6 +928,8 @@ def _match_groups(groups, tols, scope, pairs, targets, names, finish):
         if grp['step'] == 'route_diff':
             recv = [f"route_diff.py's call" + (f" at {grp['impedance']:g} ohm"
                                                 if grp['impedance'] else '')]
+        elif grp['step'] != 'route':
+            recv = [f"route.py's {grp['step']} step"]
         else:
             recv = ["route.py's route passes"] + (
                 [f"route.py's {grp['impedance']:g} ohm step"] if grp['impedance'] else [])
@@ -1284,6 +1364,12 @@ def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
                 'a single-ended impedance target: route.py --impedance solves its '
                 'widths from the stackup, on its own ahead of the route passes'
                 + _matched(a, 'route', ohms))
+    for tag, clr, nets in class_tiers(a):
+        row(tag, 'route', f"route {', '.join(nets[:6])}" + (' ...' if len(nets) > 6 else '')
+            + f' at their net class clearance {clr:g} mm',
+            'a net class declared above the chain clearance, routed in a call of its '
+            'own ahead of the route passes, which leave its nets out: route.py holds '
+            'every net of a call at the widest class it routes' + _matched(a, tag))
     row('route', 'route', ('route the nets --nets selects' if a.get('nets') else
                            'route every net') + (' still open' if finish else ''),
         f"grid {a['grid']:g} mm"
@@ -1311,9 +1397,12 @@ def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
                                'fine_drill', 'grid')}
     return {'mode': 'finish' if finish else 'full', 'rules': rules,
             'rules_source': a.get('rules_source'),
-            'rules_why': ('the fab floor for every step: a net class above it is '
-                          'aspirational, so the route steps cap every class at it; '
-                          'read from ' + (a.get('rules_source') or
+            'rules_why': ('the fab floor for every step: '
+                          + ('each net class declared above it routes at its own '
+                             'clearance; ' if honours_classes(a) else
+                             'the route steps cap every class at it (--cap-net-classes); '
+                             if a.get('class_clearances') else '')
+                          + 'read from ' + (a.get('rules_source') or
                                           "the fab defaults (the board has no .kicad_pro)")
                           + (' under the caller\'s ' + ' '.join(a['fab_args'])
                              if a.get('fab_args') else '')),
@@ -1332,6 +1421,8 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
                fab_args=a.get('fab_args') or ())
     L = a['layers']
     costs = [str(c) for c in a['layer_costs']]
+    honour = honours_classes(a)
+    ceiling = [] if honour else ['--clearance-ceiling', str(a['clearance'])]
     if finish:
         return route_passes(ch, a, L, costs, effort_factor, finish=True,
                             route_json=route_json, quick=quick)
@@ -1358,9 +1449,10 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
                     '--nets', *scope, *excl, '--layers', *L, '--layer-costs', *costs,
                     '--track-width', tw, '--grid-step', str(a['grid']),
                     '--clearance', str(a['clearance']),
-                    # the ceiling too, as on the route steps: bga_fanout honours
-                    # and keeps the net classes without one (#1529)
-                    '--clearance-ceiling', str(a['clearance'])]
+                    # the ceiling too, as on the route steps, unless the chain
+                    # honours the classes: bga_fanout honours and keeps them
+                    # without one (#1529)
+                    *ceiling]
             # The working via, then the fine via (one rung when they are the
             # same via), then the fine via with dogbone escapes.
             vias = dict.fromkeys([(v, d), (a['fine_via'], a['fine_drill'])])
@@ -1373,9 +1465,10 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
             base = ['{IN}', '--output', '{OUT}', '--component', ref,
                     '--nets', *scope, *excl, '--width', tw,
                     '--grid-step', str(a['grid']), '--clearance', str(a['clearance']),
-                    # the ceiling too, as on the route steps: qfn_fanout honours
-                    # and keeps the net classes without one (#1529)
-                    '--clearance-ceiling', str(a['clearance'])]
+                    # the ceiling too, as on the route steps, unless the chain
+                    # honours the classes: qfn_fanout honours and keeps them
+                    # without one (#1529)
+                    *ceiling]
             ladder = [
                 base,
                 base + ['--escape-method', 'underpad',
@@ -1408,7 +1501,9 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
     # 4. decaps, once, after the fanouts -- and again after a re-fan that
     # holds the parts it left shorted
     if fanned:
-        decap = ['{IN}', '{OUT}', '--clearance', str(a['clearance'])]
+        # place_fanout_clearance's --clearance is a ceiling (#768): omitted, it
+        # prices each pair at its classes and keeps them in the project
+        decap = ['{IN}', '{OUT}'] + ([] if honour else ['--clearance', str(a['clearance'])])
         out, _, _ = ch.run('decap', decap, 'decap')
         ch.accept(out)
         if out:
@@ -1430,10 +1525,11 @@ def run_plan(board, output, a, work, finish=False, effort_factor=2.0, route_json
                 '{IN}', '{OUT}', '--nets', *[a['globs'][n] for n in nets],
                 '--track-width', str(max(0.1, a['track'])),
                 '--diff-pair-gap', str(max(0.1, a['clearance'])),
-                '--clearance-ceiling', str(a['clearance']),
+                '--clearance' if honour else '--clearance-ceiling', str(a['clearance']),
                 '--via-size', str(a['via']), '--via-drill', str(a['drill']),
                 '--layers', *L, '--layer-costs', *costs,
                 '--grid-step', str(a['grid'])]
+                + (['--via-cost', str(a['via_cost'])] if 'via_cost' in a else [])
                 + (['--impedance', str(ohms)] if ohms else [])
                 + match_args(a, groups), tag)
             ch.accept(out)
@@ -1644,7 +1740,10 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     budget. Only the first pass keeps signals off the solid planes; the later
     ones may cross them at PLANE_FALLBACK_COST, so a plane carries only what
     could not route without it. The REROUTE nets are first ripped and routed
-    again on their own. Every step routes the power nets at RAIL_WIDTH, with
+    again on their own. The nets of each class tier (`class_tiers`) route in
+    a call of their own before the passes, which leave them out, and again
+    before a later pass, at its layer costs, while one of them is open.
+    Every step routes the power nets at RAIL_WIDTH, with
     the caller's --power-nets ahead of them, so a net those select routes at
     their width. Each pass is given the caller's --route-first nets as
     route.py's own --route-first, a pattern per net in their order, and records
@@ -1654,27 +1753,43 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     def route_args(costs):
         return (base + ['--layers', *L, '--layer-costs', *costs]
                 + (['--json-out', '{JSON}'] if route_json else []))
-    shared = ['--no-bga-zones',
-              '--clearance-ceiling', str(a['clearance']),
-              '--track-width', str(a.get('route_track', a['track'])),
-              '--via-size', str(a['via']), '--via-drill', str(a['drill']),
-              '--grid-step', str(a['grid'])]
-    caller = a.get('caller_power_nets') or []
-    if caller or a['power_nets']:
-        shared += ['--power-nets', *[p for p, _ in caller],
-                   *[a['globs'][n] for n in a['power_nets']],
-                   '--power-nets-widths', *[str(w) for _, w in caller],
-                   *[str(RAIL_WIDTH)] * len(a['power_nets'])]
-    if a['congested']:
-        shared += ['--max-ripup', '5']
-    if rip:
-        shared += ['--rip-existing-nets', *rip]
-    if quick:
-        shared += ['--quick', str(quick)]
+    tiers = class_tiers(a)
+    tiered = {n for _, _, nets in tiers for n in nets}
+
+    def shared_args(rip):
+        shared = ['--no-bga-zones',
+                  '--clearance' if honours_classes(a) else '--clearance-ceiling',
+                  str(a['clearance']),
+                  '--track-width', str(a.get('route_track', a['track'])),
+                  '--via-size', str(a['via']), '--via-drill', str(a['drill']),
+                  '--grid-step', str(a['grid'])]
+        if 'via_cost' in a:
+            shared += ['--via-cost', str(a['via_cost'])]
+        caller = a.get('caller_power_nets') or []
+        if caller or a['power_nets']:
+            shared += ['--power-nets', *[p for p, _ in caller],
+                       *[a['globs'][n] for n in a['power_nets']],
+                       '--power-nets-widths', *[str(w) for _, w in caller],
+                       *[str(RAIL_WIDTH)] * len(a['power_nets'])]
+        if a['congested']:
+            shared += ['--max-ripup', '5']
+        if rip:
+            shared += ['--rip-existing-nets', *rip]
+        if quick:
+            shared += ['--quick', str(quick)]
+        return shared
+    shared = shared_args(rip)
     order = a.get('route_first') or []
     routed_groups = [g for g in a.get('match_groups') or () if g['step'] == 'route']
-    base = (['{IN}', '{OUT}', '--nets', *_scope_args(a)]
-            + (['--route-first', *[_glob(n) for n in order]] if order else []) + shared
+    # A tier's nets route in its own call; a pass leaves them out, and is
+    # given no rip authority over them, which would hold it at their class.
+    tier_globs = {a['globs'][n] for n in tiered}
+    untiered_first = [n for n in order if n not in tiered]
+    base = (['{IN}', '{OUT}', '--nets', *_scope_args(a),
+             *[f"!{a['globs'][n]}" for n in sorted(tiered)]]
+            + (['--route-first', *[_glob(n) for n in untiered_first]]
+               if untiered_first else [])
+            + shared_args([r for r in rip if r not in tier_globs])
             + match_args(a, routed_groups))
     best = None                        # (grade, board)
     passes = ['route' + (f'_p{i + 1}' if i else '') for i in range(ROUTE_PASSES)]
@@ -1722,6 +1837,25 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
                            parent=diff_calls(a)[0][0])
         ch.steps[-1]['nets'] = list(reroute)
         ch.accept(out)
+    def run_tiers(costs, suffix='', open_nets=None):
+        # Each class's own call; before a later pass, only a class with a
+        # net still open, at that pass's layer costs.
+        for tag, _clr, nets in tiers:
+            if open_nets is not None and not set(nets) & set(open_nets):
+                continue
+            globs = [a['globs'][n] for n in nets]
+            tier_first = [n for n in order if n in nets]
+            out, _, _ = ch.run('route', ['{IN}', '{OUT}', '--nets', *globs]
+                               + (['--route-first', *[_glob(n) for n in tier_first]]
+                                  if tier_first else [])
+                               + shared_args([r for r in rip if r in globs])
+                               + match_args(a, [g for g in a.get('match_groups') or ()
+                                                if g['step'] == tag])
+                               + ['--layers', *L, '--layer-costs', *costs],
+                               tag + suffix, parent=tag if suffix else None)
+            ch.steps[-1]['nets'] = list(nets)
+            ch.accept(out)
+    run_tiers(costs)
     crossing = [str(PLANE_FALLBACK_COST) if float(c) < 0 else c for c in costs]
     first = spent = None
     for i in range(ROUTE_PASSES):
@@ -1741,6 +1875,8 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
                              f"--effort-factor {effort_factor:g} x the first "
                              f"pass's {first}")
                 break
+        if i and best is not None and best[0] is not None:
+            run_tiers(crossing, f'_p{i + 1}', best[0]['open_nets'])
         out, _, _ = ch.run('route', route_args(crossing if i else costs),
                            passes[i], hold=True)
         if order:
@@ -1949,6 +2085,34 @@ def shipped_record(ch, final):
     return doc
 
 
+def routing_costs(a):
+    """What the route steps ran with for vias and layers: `via_cost` (the
+    caller's, else route.py's own default), the first pass's `layer_costs`
+    and the later passes' `crossing_layer_costs`, by layer, and
+    `from_caller`, the flags the caller set."""
+    from routing_defaults import VIA_COST
+    costs = a['layer_costs']
+    return {'via_cost': a.get('via_cost', VIA_COST),
+            'layer_costs': dict(zip(a['layers'], costs)),
+            'crossing_layer_costs': dict(zip(a['layers'], [
+                PLANE_FALLBACK_COST if c < 0 else c for c in costs])),
+            'from_caller': [f for f, k in (('--via-cost', 'via_cost'),
+                                           ('--layer-costs', 'caller_layer_costs'))
+                            if k in a]}
+
+
+def net_class_record(a):
+    """The net classes declared above the chain clearance, by net, and
+    whether the chain routed them at their own (`honoured`, with the route
+    call of each clearance) or capped every class (`capped`); `mode` is None
+    when no class is declared above it."""
+    return {'clearance': a['clearance'],
+            'above_clearance': a.get('class_clearances') or {},
+            'mode': (None if not a.get('class_clearances') else
+                     'capped' if a.get('cap_net_classes') else 'honoured'),
+            'calls': [{'tag': t, 'clearance': c, 'nets': n} for t, c, n in class_tiers(a)]}
+
+
 def _effort_factor(text):
     v = float(text)
     if not math.isfinite(v) or v < 0:
@@ -1960,6 +2124,27 @@ def _plane_layer_cost(text):
     v = float(text)
     if not math.isfinite(v) or v == 0:
         raise argparse.ArgumentTypeError(f'must be a finite nonzero number, not {text}')
+    return v
+
+
+def _layer_cost(text):
+    try:
+        v = float(text)
+    except ValueError:
+        v = math.nan
+    if not math.isfinite(v) or (v >= 0 and not 1.0 <= v <= 1000):
+        raise argparse.ArgumentTypeError(
+            f'must be a cost in [1, 1000] or negative (no tracks on the layer), not {text}')
+    return v
+
+
+def _via_cost(text):
+    try:
+        v = int(text)
+    except ValueError:
+        v = -1
+    if v < 0:
+        raise argparse.ArgumentTypeError(f'must be a whole number >= 0, not {text}')
     return v
 
 
@@ -2001,7 +2186,7 @@ def main():
                          'again, stay within this many times the first '
                          'pass\'s (default 2). A forecast, not a cap: a pass '
                          'that starts runs to its end')
-    ap.add_argument('--plane-layer-cost', type=_plane_layer_cost, default=PLANE_LAYER_COST,
+    ap.add_argument('--plane-layer-cost', type=_plane_layer_cost, default=None,
                     help='the --layer-costs entry of every inner plane layer in the '
                          'fanout, diff pair and first route steps. Negative (default -1) '
                          'keeps signals off the planes, so each stays a solid '
@@ -2009,6 +2194,22 @@ def main():
                          'at 3.0; a positive price lets every step cross them '
                          '(the skill\'s route step uses 3.0), trading reference '
                          'integrity for routability')
+    ap.add_argument('--layer-costs', type=_layer_cost, nargs='+', default=None,
+                    metavar='COST',
+                    help='route.py\'s --layer-costs for every step that takes them '
+                         '(fanouts, diff pairs, route), one per copper layer in board '
+                         'order, in place of the chain\'s own (1.0 and 1.5 on 2 layers, '
+                         'the --plane-layer-cost on inner planes): each in [1, 1000], or '
+                         'negative to keep tracks off the layer, which the later route '
+                         'passes may cross at 3.0. Not with --plane-layer-cost')
+    ap.add_argument('--via-cost', type=_via_cost, default=None, metavar='N',
+                    help='route.py\'s and route_diff.py\'s --via-cost for every route and '
+                         'diff-pair step (default: their own)')
+    ap.add_argument('--cap-net-classes', action='store_true',
+                    help='cap every net class at the chain clearance on every step '
+                         '(route.py --clearance-ceiling). Without it a net class '
+                         'declared above that clearance routes at its own, its nets '
+                         'in a route call of their own')
     ap.add_argument('--power-nets', nargs='+', default=[], metavar='PATTERN',
                     help='route.py\'s --power-nets, given to every route step ahead '
                          'of autoroute\'s rails: a net routes at the width of the '
@@ -2112,6 +2313,11 @@ def main():
     set_policy_from_args(args, args.input_file)
 
     try:
+        if args.layer_costs is not None and args.plane_layer_cost is not None:
+            raise Refused('--layer-costs gives every layer\'s cost; '
+                          'give it or --plane-layer-cost, not both')
+        if args.plane_layer_cost is None:
+            args.plane_layer_cost = PLANE_LAYER_COST
         if len(args.power_nets) != len(args.power_nets_widths):
             raise Refused(f"--power-nets gives {len(args.power_nets)} pattern(s) and "
                           f"--power-nets-widths {len(args.power_nets_widths)} "
@@ -2131,7 +2337,9 @@ def main():
                     time_groups=args.time_match_groups,
                     length_tol=args.length_match_tolerance,
                     time_tol=args.time_match_tolerance,
-                    impedance=impedance, diff_pairs=args.diff_pairs)
+                    impedance=impedance, diff_pairs=args.diff_pairs,
+                    cap_net_classes=args.cap_net_classes, layer_costs=args.layer_costs,
+                    via_cost=args.via_cost)
     except Refused as exc:
         print(f"AUTOROUTE: refused: {exc}", flush=True)
         return 2
@@ -2205,10 +2413,15 @@ def main():
     def write_json_out():
         if json_out:
             from route_summary import write_summary_file
-            write_summary_file(json_out, {**shipped_record(ch, final), 'analysis': a,
+            write_summary_file(json_out, {**shipped_record(ch, final),
+                                          'routing_costs': routing_costs(a),
+                                          'net_classes': net_class_record(a),
+                                          'analysis': a,
                                           'plan': plan, 'steps': ch.steps,
                                           'decisions': ch.decisions, 'final': final,
                                           'grade': grade, 'match': account})
+    summary['routing_costs'] = routing_costs(a)
+    summary['net_classes'] = net_class_record(a)
     if account:
         summary.update(account)
     if not final:
