@@ -101,9 +101,13 @@ every step: no step is given a clearance ceiling, the decap step no
 clearance (its --clearance is a ceiling), and the route steps --clearance
 for the Default class. Its nets route in a route.py call of their own per
 class clearance, widest first, ahead of the route passes, which leave them
-out, and again before a later pass, at its layer costs, while one is open:
-route.py prices every obstacle of a call at the widest class the call
-routes. --cap-net-classes instead caps every class at the chain clearance on
+out and take no rip authority over them, and again before a later pass and
+once after the last, at the later passes' costs, while one is open (in the
+effort budget): route.py prices every obstacle of a call at the widest
+class the call routes. A plane net, whose pour the passes' plane finalize
+serves, and a net no pattern selects alone route in the passes at their
+class. With every net of the run in a class call no pass runs, and each
+round's last class call is graded. --cap-net-classes instead caps every class at the chain clearance on
 every step, as route.py --clearance-ceiling does. The analysis names the
 nets (`class_clearances`), and AUTOROUTE_SUMMARY and --json-out the mode
 and the calls (`net_classes`).
@@ -114,9 +118,10 @@ route.py's and route_diff.py's own --via-cost on every route and diff-pair
 step; a negative layer cost keeps tracks off that layer in the first pass,
 and the later passes cross it at PLANE_FALLBACK_COST, as they cross a
 plane. A count that is not the board's copper layer count, a cost outside
-[1, 1000] that is not negative, a via cost that is not a whole number >= 0,
-and --layer-costs with --plane-layer-cost are refused before any step runs
-(exit 2). AUTOROUTE_SUMMARY and --json-out give what the route steps ran
+[1, 1000] that is not negative, every layer negative, a via cost that is
+not a whole number >= 0 or past what the router's 32-bit cost holds at the
+chain's grid (`max_via_cost`), and --layer-costs with --plane-layer-cost
+are refused before any step runs (exit 2). AUTOROUTE_SUMMARY and --json-out give what the route steps ran
 with (`routing_costs`).
 
 --fab-tier, --fab-overrides and --escalation are the shared fab flags every
@@ -580,6 +585,10 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
                           f"of {n_layers} copper layer(s) ({' '.join(layers)}); give one "
                           f"per layer, in that order")
         layer_costs = [float(c) for c in caller_costs]
+        if all(c < 0 for c in layer_costs):
+            raise Refused(f"--layer-costs {' '.join(f'{c:g}' for c in layer_costs)} "
+                          f"forbids tracks on every layer; give at least one layer a "
+                          f"cost in [1, 1000]")
     elif n_layers == 2:
         layer_costs = [1.0, 1.5]
     else:
@@ -674,7 +683,8 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         [('length', g) for g in length_groups] + [('time', g) for g in time_groups],
         {'length': length_tol, 'time': time_tol}, steps_scope, pairs, targets,
         names, finish, tier_of=None if cap_net_classes else {
-            n: f'route_class_{c:g}' for n, c in above.items() if n in globs}
+            n: f'route_class_{c:g}' for n, c in above.items()
+            if _tiered(n, globs, plane_nets)}
     ) if (length_groups or time_groups) else []
 
     out = dict(layers=layers, clearance=clearance, track=track, via=via,
@@ -717,19 +727,42 @@ def analyze(board, finish=False, plane_cost=PLANE_LAYER_COST, caller_power=(),
         out['fab_args'] = list(fab_args)
     if above:
         out['class_clearances'] = dict(sorted(above.items()))
+        out['tiers_cover_scope'] = all(_tiered(n, globs, plane_nets) if n in above
+                                       else False for n in steps_scope)
     if cap_net_classes:
         out['cap_net_classes'] = True
     if caller_costs is not None:
         out['caller_layer_costs'] = list(layer_costs)
     if via_cost is not None:
+        top = max_via_cost(grid)
+        if via_cost > top:
+            raise Refused(f"--via-cost {via_cost} is above {top}, the most whose "
+                          f"cost the router holds at the {grid:g} mm grid (route_diff "
+                          f"doubles it)")
         out['via_cost'] = via_cost
     return out
+
+
+def max_via_cost(grid):
+    """The largest --via-cost whose per-via cost (routing_config.
+    via_cost_units), doubled as route_diff.py doubles it for a pair, is a
+    32-bit signed integer, the router's cost type, at GRID mm."""
+    from routing_config import REFERENCE_GRID_STEP
+    return int((2 ** 31 - 1) // (2 * 1000 * REFERENCE_GRID_STEP / grid))
+
+
+def _tiered(net, globs, plane_nets):
+    """Whether a net of a class above the chain clearance routes in its
+    class's own call: a pattern selects it alone, and it is no plane net,
+    which the route passes route so that their plane finalize serves it."""
+    return net in globs and net not in plane_nets
 
 
 def honours_classes(a):
     """True when the chain routes the net classes A declares above its
     clearance at their own clearance: some class is, and the caller did not
-    cap every class (--cap-net-classes)."""
+    cap every class (--cap-net-classes). A class net outside every class
+    call (`class_tiers`) routes in the passes, at its own clearance."""
     return bool(a.get('class_clearances')) and not a.get('cap_net_classes')
 
 
@@ -745,7 +778,7 @@ def class_tiers(a):
         return []
     by = {}
     for n, c in a['class_clearances'].items():
-        if n in a['globs']:
+        if _tiered(n, a['globs'], a['plane_nets']):
             by.setdefault(c, []).append(n)
     return [(f'route_class_{c:g}', c, by[c]) for c in sorted(by, reverse=True)]
 
@@ -900,7 +933,10 @@ def _match_groups(groups, tols, scope, pairs, targets, names, finish, tier_of=No
                 f'{label}: its nets are routed by different steps ({split}). A step '
                 f'lengthens only the nets it routes -- copper an earlier step laid '
                 f'sets the target but is never lengthened -- so the group cannot be '
-                f'matched across steps; give each step\'s nets their own group')
+                f'matched across steps; give each step\'s nets their own group'
+                + ('' if not any(k[0].startswith('route_class_') for k in owners) else
+                   ', or pass --cap-net-classes, which routes the class\'s nets in '
+                   'the route passes with the others (capped at the chain clearance)'))
         (tool, ohms), = owners
         if tool == 'route_diff' and finish:
             raise Refused(f'{label}: --finish runs no diff-pair step, and the '
@@ -1364,21 +1400,28 @@ def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
                 'a single-ended impedance target: route.py --impedance solves its '
                 'widths from the stackup, on its own ahead of the route passes'
                 + _matched(a, 'route', ohms))
+    tiered = set()
+    first = a.get('route_first') or []
+
+    def firsts(nets):
+        return (', first ' + ', '.join(nets[:6]) + (' ...' if len(nets) > 6 else '')
+                + ' (--route-first)' if nets else '')
     for tag, clr, nets in class_tiers(a):
+        tiered |= set(nets)
         row(tag, 'route', f"route {', '.join(nets[:6])}" + (' ...' if len(nets) > 6 else '')
             + f' at their net class clearance {clr:g} mm',
             'a net class declared above the chain clearance, routed in a call of its '
-            'own ahead of the route passes, which leave its nets out: route.py holds '
-            'every net of a call at the widest class it routes' + _matched(a, tag))
+            'own ahead of the route passes, which leave its nets out, and again '
+            'while one of them is open: route.py holds every net of a call at the '
+            'widest class it routes' + firsts([n for n in first if n in nets])
+            + _matched(a, tag))
     row('route', 'route', ('route the nets --nets selects' if a.get('nets') else
                            'route every net') + (' still open' if finish else ''),
         f"grid {a['grid']:g} mm"
         + (f", tracks at {a['route_track']:g} mm (--track-width)"
            if a.get('route_track') is not None else '')
         + (f', route.py --quick {quick}' if quick else '')
-        + (', first ' + ', '.join(a['route_first'][:6])
-           + (' ...' if len(a['route_first']) > 6 else '') + ' (--route-first)'
-           if a.get('route_first') else '')
+        + firsts([n for n in first if n not in tiered])
         + (', power nets ' + ', '.join(a['power_nets'][:6])
            + (' ...' if len(a['power_nets']) > 6 else '') + f' at {RAIL_WIDTH:g} mm'
            if a['power_nets'] else '')
@@ -1400,8 +1443,10 @@ def plan_steps(a, finish=False, effort_factor=2.0, quick=0):
             'rules_why': ('the fab floor for every step: '
                           + ('each net class declared above it routes at its own '
                              'clearance; ' if honours_classes(a) else
-                             'the route steps cap every class at it (--cap-net-classes); '
-                             if a.get('class_clearances') else '')
+                             'the steps cap every class at it (--cap-net-classes); '
+                             if a.get('cap_net_classes') else
+                             'a net class above it is aspirational, so the route '
+                             'steps cap every class at it; ')
                           + 'read from ' + (a.get('rules_source') or
                                           "the fab defaults (the board has no .kicad_pro)")
                           + (' under the caller\'s ' + ' '.join(a['fab_args'])
@@ -1741,8 +1786,10 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
     ones may cross them at PLANE_FALLBACK_COST, so a plane carries only what
     could not route without it. The REROUTE nets are first ripped and routed
     again on their own. The nets of each class tier (`class_tiers`) route in
-    a call of their own before the passes, which leave them out, and again
-    before a later pass, at its layer costs, while one of them is open.
+    a call of their own before the passes, which leave them out, again
+    before a later pass and once after the last, at the later passes' costs,
+    while one of them is open; the budget counts those calls, and with no
+    net left for a pass each round's last class call is the graded board.
     Every step routes the power nets at RAIL_WIDTH, with
     the caller's --power-nets ahead of them, so a net those select routes at
     their width. Each pass is given the caller's --route-first nets as
@@ -1778,25 +1825,29 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
         if quick:
             shared += ['--quick', str(quick)]
         return shared
-    shared = shared_args(rip)
     order = a.get('route_first') or []
     routed_groups = [g for g in a.get('match_groups') or () if g['step'] == 'route']
-    # A tier's nets route in its own call; a pass leaves them out, and is
-    # given no rip authority over them, which would hold it at their class.
+    # A tier's nets route in its own call; no other call is given rip
+    # authority over them, which would hold it at their class.
     tier_globs = {a['globs'][n] for n in tiered}
+    shared = shared_args([r for r in rip if r not in tier_globs])
     untiered_first = [n for n in order if n not in tiered]
     base = (['{IN}', '{OUT}', '--nets', *_scope_args(a),
              *[f"!{a['globs'][n]}" for n in sorted(tiered)]]
             + (['--route-first', *[_glob(n) for n in untiered_first]]
                if untiered_first else [])
-            + shared_args([r for r in rip if r not in tier_globs])
-            + match_args(a, routed_groups))
+            + shared + match_args(a, routed_groups))
+    # Every net in scope is in a class call: no pass has a net to route, and
+    # each round's board is the last class call's.
+    no_pass = bool(tiers) and bool(a.get('tiers_cover_scope'))
     best = None                        # (grade, board)
     passes = ['route' + (f'_p{i + 1}' if i else '') for i in range(ROUTE_PASSES)]
 
     def skip_rest(i, why):
         for tag in passes[i:]:
             ch.skip(tag, why)
+    if no_pass:
+        skip_rest(0, 'every net this run routes is in a net class call of its own')
     if finish:
         ev = {'n': 0, 'tag': 'input', 'tool': 'grade', 'parent': None,
               'board': ch.cur, 'input': ch.cur, 'cmd': [], 'log': None}
@@ -1837,58 +1888,40 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
                            parent=diff_calls(a)[0][0])
         ch.steps[-1]['nets'] = list(reroute)
         ch.accept(out)
-    def run_tiers(costs, suffix='', open_nets=None):
-        # Each class's own call; before a later pass, only a class with a
-        # net still open, at that pass's layer costs.
-        for tag, _clr, nets in tiers:
-            if open_nets is not None and not set(nets) & set(open_nets):
-                continue
+
+    def run_tiers(costs, suffix='', open_nets=None, hold=False):
+        """Each class's own call, at COSTS, only a class with a net in
+        OPEN_NETS when that is given; HOLD keeps the last call's ending for
+        its grade. Returns (the last call's board or None, the router
+        iterations of the calls, or None when none ran)."""
+        run = [(tag, nets) for tag, _clr, nets in tiers
+               if open_nets is None or set(nets) & set(open_nets)]
+        out, iters = None, None
+        for k, (tag, nets) in enumerate(run):
             globs = [a['globs'][n] for n in nets]
             tier_first = [n for n in order if n in nets]
+            last = hold and k == len(run) - 1
             out, _, _ = ch.run('route', ['{IN}', '{OUT}', '--nets', *globs]
                                + (['--route-first', *[_glob(n) for n in tier_first]]
                                   if tier_first else [])
                                + shared_args([r for r in rip if r in globs])
                                + match_args(a, [g for g in a.get('match_groups') or ()
                                                 if g['step'] == tag])
-                               + ['--layers', *L, '--layer-costs', *costs],
-                               tag + suffix, parent=tag if suffix else None)
+                               + ['--layers', *L, '--layer-costs', *costs]
+                               + (['--json-out', '{JSON}'] if route_json and last else []),
+                               tag + suffix, parent=tag if suffix else None, hold=last)
             ch.steps[-1]['nets'] = list(nets)
+            if tier_first:
+                ch.steps[-1]['route_first'] = route_first_record(
+                    os.path.join(ch.work, ch.steps[-1]['log']))
+            iters = (iters or 0) + (ch.last_iterations or 0)
             ch.accept(out)
-    run_tiers(costs)
-    crossing = [str(PLANE_FALLBACK_COST) if float(c) < 0 else c for c in costs]
-    first = spent = None
-    for i in range(ROUTE_PASSES):
-        if i:
-            if ch.last_iterations is None:
-                print(f"  route pass {i + 1} not started: the last pass reported "
-                      f"no iterations to budget from", flush=True)
-                skip_rest(i, 'the last pass reported no router iterations to '
-                             'budget the next from')
-                break
-            if spent + ch.last_iterations > effort_factor * first:
-                print(f"  route pass {i + 1} not started: {spent} iterations "
-                      f"spent, the last pass took {ch.last_iterations}, budget "
-                      f"{effort_factor:g} x {first}", flush=True)
-                skip_rest(i, f"effort budget: {spent} router iterations spent and "
-                             f"the last pass took {ch.last_iterations}, over "
-                             f"--effort-factor {effort_factor:g} x the first "
-                             f"pass's {first}")
-                break
-        if i and best is not None and best[0] is not None:
-            run_tiers(crossing, f'_p{i + 1}', best[0]['open_nets'])
-        out, _, _ = ch.run('route', route_args(crossing if i else costs),
-                           passes[i], hold=True)
-        if order:
-            ch.steps[-1]['route_first'] = route_first_record(
-                os.path.join(ch.work, ch.steps[-1]['log']))
-        if ch.last_iterations is not None:
-            spent = (spent or 0) + ch.last_iterations
-            if first is None:
-                first = ch.last_iterations
-        if not out:
-            skip_rest(i + 1, f'{passes[i]} failed')
-            break
+        return out, iters
+
+    def judge(out, tag, last_round):
+        """Grade OUT, the board of round TAG, keep it when it improves on the
+        best; True when another round may follow."""
+        nonlocal best
         g = ch.grade(out)
         ch.steps[-1]['grade'] = g
         if g is None:
@@ -1897,27 +1930,96 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
                 ch.accept(out)
             ch.end_step(result='routed, but a checker could not grade it',
                         grade=None, kept=best[1] == out)
-            skip_rest(i + 1, f'{passes[i]} could not be graded')
-            break
+            skip_rest(last_round + 1, f'{tag} could not be graded')
+            return False
         print(f"  {os.path.basename(out)}: {g['open']} open, {g['drc']} DRC", flush=True)
-        if best is not None and not _improves(g, best[0]):
+        if best is not None and best[0] is not None and not _improves(g, best[0]):
             print(f"  not kept: no better than {os.path.basename(best[1])} "
                   f"({best[0]['open']} open, {best[0]['drc']} DRC)", flush=True)
             ch.end_step(result=f"{g['open']} open, {g['drc']} DRC: not kept",
                         grade=g, kept=False)
-            ch.decide(passes[i], False,
+            ch.decide(tag, False,
                       f"{g['open']} open, {g['drc']} DRC is no better than "
                       f"{os.path.basename(best[1])} ({best[0]['open']} open, "
                       f"{best[0]['drc']} DRC)")
-            skip_rest(i + 1, f'{passes[i]} was not kept, which ends the passes')
-            break
+            ch.cur = best[1]
+            skip_rest(last_round + 1, f'{tag} was not kept, which ends the passes')
+            return False
         best = (g, out)
         ch.accept(out)
         ch.end_step(result=f"{g['open']} open, {g['drc']} DRC: best so far",
                     grade=g, kept=True)
         if g['open'] == 0:
-            skip_rest(i + 1, 'no open net left')
+            skip_rest(last_round + 1, 'no open net left')
+            return False
+        return True
+
+    def open_tier_nets():
+        return (None if best is None or best[0] is None
+                else sorted(set(best[0]['open_nets']) & tiered))
+    crossing = [str(PLANE_FALLBACK_COST) if float(c) < 0 else c for c in costs]
+    first = spent = last_round = last_tiers = None
+    graded = False                     # the last board a call laid is graded
+    for i in range(ROUTE_PASSES):
+        if i:
+            if last_round is None:
+                print(f"  route pass {i + 1} not started: the last pass reported "
+                      f"no iterations to budget from", flush=True)
+                skip_rest(i, 'the last pass reported no router iterations to '
+                             'budget the next from')
+                break
+            if spent + last_round > effort_factor * first:
+                print(f"  route pass {i + 1} not started: {spent} iterations "
+                      f"spent, the last pass took {last_round}, budget "
+                      f"{effort_factor:g} x {first}", flush=True)
+                skip_rest(i, f"effort budget: {spent} router iterations spent and "
+                             f"the last pass took {last_round}, over "
+                             f"--effort-factor {effort_factor:g} x the first "
+                             f"pass's {first}")
+                break
+        want = None if (i == 0 and not finish) else open_tier_nets()
+        if tiers and (want is None or want):
+            out, last_tiers = run_tiers(crossing if i else costs,
+                                        f'_p{i + 1}' if i else '', want, hold=no_pass)
+            round_iters = last_tiers or 0
+        elif no_pass:
             break
+        else:
+            out, round_iters = None, 0
+        tag = ch.steps[-1]['tag'] if no_pass else passes[i]
+        if not no_pass:
+            out, _, _ = ch.run('route', route_args(crossing if i else costs),
+                               passes[i], hold=True)
+            if order:
+                ch.steps[-1]['route_first'] = route_first_record(
+                    os.path.join(ch.work, ch.steps[-1]['log']))
+            round_iters = (None if ch.last_iterations is None
+                           else round_iters + ch.last_iterations)
+        last_round = round_iters
+        if round_iters is not None:
+            spent = (spent or 0) + round_iters
+            if first is None:
+                first = round_iters
+        if not out:
+            skip_rest(i + 1, f'{tag} failed')
+            break
+        graded = True
+        if not judge(out, tag, i):
+            break
+    # A class net still open after the last pass gets one more class call on
+    # the best board, at the later passes' costs, within the effort budget.
+    rest = open_tier_nets() if not no_pass and graded else None
+    if rest and (first is None or (spent or 0) + (last_tiers or 0)
+                 <= effort_factor * first):
+        ch.cur = best[1]
+        out, iters = run_tiers(crossing, '_final', rest, hold=True)
+        spent = (spent or 0) + (iters or 0)
+        if out:
+            judge(out, ch.steps[-1]['tag'], ROUTE_PASSES)
+    elif rest:
+        print(f"  class call after the last pass not started: {spent} iterations "
+              f"spent, the last class call took {last_tiers}, budget "
+              f"{effort_factor:g} x {first}", flush=True)
     ch.end_step()
     return ch, (best[1] if best else None), (best[0] if best else None)
 
@@ -2045,7 +2147,7 @@ def match_account(board, a, steps=()):
 
 #: The tags route_passes gives its passes; the diff-pair reroute is a route
 #: step but not a pass.
-_PASS_TAG = re.compile(r'route(_p\d+)?')
+_PASS_TAG = re.compile(r'route(_class_[0-9.]+)?(_p\d+|_final)?')
 
 
 def _step_of(ch, board):
@@ -2104,13 +2206,19 @@ def routing_costs(a):
 def net_class_record(a):
     """The net classes declared above the chain clearance, by net, and
     whether the chain routed them at their own (`honoured`, with the route
-    call of each clearance) or capped every class (`capped`); `mode` is None
-    when no class is declared above it."""
+    call of each clearance, and `in_passes`, the class nets the route passes
+    route at their own: plane nets, and nets no pattern selects alone) or
+    capped every class (`capped`); `mode` is None when no class is declared
+    above it."""
+    calls = class_tiers(a)
+    called = {n for _, _, nets in calls for n in nets}
     return {'clearance': a['clearance'],
             'above_clearance': a.get('class_clearances') or {},
             'mode': (None if not a.get('class_clearances') else
                      'capped' if a.get('cap_net_classes') else 'honoured'),
-            'calls': [{'tag': t, 'clearance': c, 'nets': n} for t, c, n in class_tiers(a)]}
+            'calls': [{'tag': t, 'clearance': c, 'nets': n} for t, c, n in calls],
+            'in_passes': (sorted(set(a.get('class_clearances') or ()) - called)
+                          if honours_classes(a) else [])}
 
 
 def _effort_factor(text):

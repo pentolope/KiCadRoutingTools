@@ -3,19 +3,21 @@
 and the via and layer costs a caller gives the route steps.
 
 1. A real run on a synthetic 2-layer board at the chain clearance 0.15
-   (--fab-overrides, 0.15 tracks), with two channels 0.8 mm wide between
+   (--fab-overrides, 0.15 tracks), with three channels 1.0 mm wide between
    walls: HV_A and HV_B, of a 0.2 mm class, must pass one to take the short
-   way, SIG_C and SIG_D, of the Default class, the other. 0.8 mm holds two
-   0.15 tracks 0.15 apart and from the walls, and one at 0.2, never two.
+   way, SIG_C and SIG_D, of the Default class, the second, and HV_E and SIG_F
+   the third. A channel holds two 0.15 tracks 0.15 apart, never 0.2.
    Measured on the routed copper (segments and vias, by layer, with this
    file's own geometry): HV_A and HV_B end at least 0.2 apart, SIG_C and
-   SIG_D closer than 0.2 -- the class holds its own nets and no other -- and
-   every net is connected. No step is given a clearance ceiling, and one
-   route call routes exactly HV_A and HV_B and every route pass neither,
+   SIG_D closer than 0.2 -- the class holds its own nets and no other --
+   SIG_F, routed by a pass, at least 0.2 from HV_E's copper, and every net
+   is connected. No step is given a clearance ceiling, and one route call
+   routes exactly HV_A, HV_B and HV_E and every route pass none of them,
    read back by route.py's own selector.
 2. The same board with --cap-net-classes --via-cost 40 --layer-costs 1.0
-   3.0: HV_A and HV_B pass the channel together, closer than 0.2; every
-   route step is given the ceiling, the via cost and the layer costs, and
+   3.0: HV_A and HV_B, and HV_E and SIG_F, pass their channels together,
+   closer than 0.2; every route step is given the ceiling, the via cost and
+   the layer costs, and
    AUTOROUTE_SUMMARY and the --json-out document state the costs by layer,
    with the later passes', and that the classes were capped.
 3. The chain's other steps, for an analysis with a QFN fanned out and a
@@ -25,8 +27,13 @@ and the via and layer costs a caller gives the route steps.
    ceiling; capped, each is given the chain clearance as its ceiling.
 4. A cost count that is not the board's copper layer count, a cost in
    (0, 1), past 1000 or not a number, a via cost that is negative or not
-   whole, and --layer-costs with --plane-layer-cost are refused for their
-   reason, exit 2, before any step.
+   whole or past the router's 32-bit cost at the board's grid, a cost list
+   forbidding every layer, and --layer-costs with --plane-layer-cost are
+   refused for their reason, exit 2, before any step; route.py refuses a via
+   cost past its 32-bit cost.
+5. With --nets HV_*, every net of the run is in the class call: no route
+   pass runs, no step fails, and the class call's board ships graded, its
+   route.py summary in --json-out.
 """
 import json
 import math
@@ -47,11 +54,15 @@ from synth import RoutingBoard, write_board                  # noqa: E402
 
 RUN_ALL_TIMEOUT = 900
 SCRIPT = os.path.join(ROOT, 'py_router', 'autoroute.py')
+ROUTE = os.path.join(ROOT, 'py_router', 'route.py')
 CLASS_CLEARANCE = 0.2
 CHAIN_CLEARANCE = 0.15
 TRACK = 0.15
 HV = ('HV_A', 'HV_B')
 SIG = ('SIG_C', 'SIG_D')
+MIX = ('HV_E', 'SIG_F')
+CLASS_NETS = ('HV_A', 'HV_B', 'HV_E')
+DEFAULT_NETS = ('SIG_C', 'SIG_D', 'SIG_F')
 FAILS = []
 
 
@@ -73,9 +84,10 @@ def channel(b, y, names, tag):
 
 
 def board(path):
-    b = RoutingBoard(40, 40)
+    b = RoutingBoard(40, 60)
     channel(b, 10.0, HV, 'H')
     channel(b, 30.0, SIG, 'S')
+    channel(b, 50.0, MIX, 'M')
     write_board(b.text(), path)
     base = path[:-len('.kicad_pcb')]
     default = {'name': 'Default', 'clearance': CHAIN_CLEARANCE, 'track_width': TRACK,
@@ -156,18 +168,21 @@ def test_honoured(tmp):
     r = check([sys.executable, '-X', 'utf8', SCRIPT, src, out, '--fab-overrides', fab],
               accept=True)
     pcb = parse_kicad_pcb(evidence(out, 'routed board'))
-    g_hv, g_sig = gap(pcb, *HV), gap(pcb, *SIG)
+    g_hv, g_sig, g_mix = gap(pcb, *HV), gap(pcb, *SIG), gap(pcb, *MIX)
     expect(g_hv >= CLASS_CLEARANCE - 0.005,
            f"HV_A and HV_B end {g_hv:.3f} mm apart, at least their class {CLASS_CLEARANCE}")
     expect(g_sig < CLASS_CLEARANCE - 0.02 and g_sig >= CHAIN_CLEARANCE - 0.005,
            f"SIG_C and SIG_D end {g_sig:.3f} mm apart, at the Default class, "
            f"under {CLASS_CLEARANCE}: the class holds no other net")
+    expect(g_mix >= CLASS_CLEARANCE - 0.005,
+           f"SIG_F, routed by a pass, ends {g_mix:.3f} mm from HV_E's copper, at "
+           f"least HV_E's class {CLASS_CLEARANCE}")
     expect(_summary(r.stdout).get('open') == 0,
            f"every net is connected ({_summary(r.stdout).get('open')} open)")
 
     plan = json.load(open(evidence(out + '.autoroute/plan.json', 'plan.json')))
     src_pcb = parse_kicad_pcb(src)
-    expect(plan['analysis'].get('class_clearances') == {n: CLASS_CLEARANCE for n in HV},
+    expect(plan['analysis'].get('class_clearances') == {n: CLASS_CLEARANCE for n in CLASS_NETS},
            f"the analysis names the class's nets ({plan['analysis'].get('class_clearances')})")
     for s in plan['steps']:
         expect('--clearance-ceiling' not in (s.get('argv') or []),
@@ -175,13 +190,15 @@ def test_honoured(tmp):
     routes = [s for s in plan['steps'] if s['tool'] == 'route']
     tiers = [s for s in routes if s['tag'].startswith('route_class_')]
     expect(len(tiers) == 1 and sorted(expand_net_patterns(
-        src_pcb, _values(tiers[0]['argv'], '--nets'), quiet=True)) == list(HV),
-           f"one route call routes exactly {', '.join(HV)} ({[s['tag'] for s in tiers]})")
+        src_pcb, _values(tiers[0]['argv'], '--nets'), quiet=True)) == list(CLASS_NETS),
+           f"one route call routes exactly {', '.join(CLASS_NETS)} "
+           f"({[s['tag'] for s in tiers]})")
     passes = [s for s in routes if s not in tiers]
     for s in passes:
         sel = expand_net_patterns(src_pcb, _values(s['argv'], '--nets'), quiet=True)
-        expect(not set(sel) & set(HV) and set(SIG) <= set(sel),
-               f"{s['tag']}: routes {', '.join(SIG)} and no net of the class ({sel})")
+        expect(not set(sel) & set(CLASS_NETS) and set(DEFAULT_NETS) <= set(sel),
+               f"{s['tag']}: routes {', '.join(DEFAULT_NETS)} and no net of the class "
+               f"({sel})")
     assert len(FAILS) == n, FAILS[n:]
 
 
@@ -195,9 +212,11 @@ def test_capped(tmp):
                '--cap-net-classes', '--via-cost', '40', '--layer-costs', '1.0', '3.0',
                '--json-out', js], accept=True)
     pcb = parse_kicad_pcb(evidence(out, 'routed board'))
-    g_hv = gap(pcb, *HV)
+    g_hv, g_mix = gap(pcb, *HV), gap(pcb, *MIX)
     expect(g_hv < CLASS_CLEARANCE - 0.02,
            f"HV_A and HV_B end {g_hv:.3f} mm apart, under their class: capped")
+    expect(g_mix < CLASS_CLEARANCE - 0.02,
+           f"SIG_F ends {g_mix:.3f} mm from HV_E, under HV_E's class: capped")
     plan = json.load(open(evidence(out + '.autoroute/plan.json', 'plan.json')))
     routes = [s for s in plan['steps'] if s['tool'] == 'route']
     expect(routes and not any(s['tag'].startswith('route_class_') for s in routes),
@@ -219,7 +238,8 @@ def test_capped(tmp):
     expect(_summary(r.stdout).get('routing_costs') == want,
            f"AUTOROUTE_SUMMARY states the costs ({_summary(r.stdout).get('routing_costs')})")
     expect(doc.get('net_classes', {}).get('mode') == 'capped'
-           and doc['net_classes'].get('above_clearance') == {n: CLASS_CLEARANCE for n in HV},
+           and doc['net_classes'].get('above_clearance')
+           == {n: CLASS_CLEARANCE for n in CLASS_NETS},
            f"--json-out states the classes were capped ({doc.get('net_classes')})")
     assert len(FAILS) == n, FAILS[n:]
 
@@ -311,17 +331,61 @@ def test_refusals(tmp):
         (['--via-cost', '1.5'], 'must be a whole number >= 0', 'a via cost of 1.5'),
         (['--layer-costs', '1.0', '2.0', '--plane-layer-cost', '3'],
          'not both', '--layer-costs with --plane-layer-cost'),
+        (['--layer-costs', '-1', '-1'], 'forbids tracks on every layer',
+         'every layer forbidden'),
+        (['--via-cost', str((2 ** 31 - 1) // 2000 + 1)], 'the most whose cost the router holds',
+         'a via cost one past what the router holds at the 0.1 mm grid'),
     ]
     for extra, why, what in cases:
         check([sys.executable, '-X', 'utf8', SCRIPT, src, out, '--fab-overrides', fab,
                '--json-out', js, *extra], refuse=why, code=2, allow=('error: argument',))
         expect(not os.path.exists(out + '.autoroute') and not os.path.exists(js),
                f"{what}: refused for its reason, before any step")
+    # The bound is the router's: one more via-cost unit at the 0.1 mm grid,
+    # doubled for a pair, is past a 32-bit signed integer, the one before is not.
+    top = (2 ** 31 - 1) // (2 * 1000)
+    expect(getattr(AP, 'max_via_cost', lambda g: None)(0.1) == top,
+           f"the via cost bound at 0.1 mm is {top}")
+    check([sys.executable, '-X', 'utf8', ROUTE, src, out, '--nets', 'SIG_C',
+           '--via-cost', '2147484', '--grid-step', '0.1'],
+          refuse="past the router's 32-bit cost", code=2, allow=('error: argument',))
+    expect(True, "route.py refuses a via cost past its 32-bit cost, by reason")
+    assert len(FAILS) == n, FAILS[n:]
+
+
+def test_empty_pass(tmp):
+    print("a real run: --nets HV_*, every net in a class call")
+    n = len(FAILS)
+    src, fab = board(os.path.join(tmp, 'board.kicad_pcb'))
+    out = os.path.join(tmp, 'hv.kicad_pcb')
+    js = os.path.join(tmp, 'hv.json')
+    r = check([sys.executable, '-X', 'utf8', SCRIPT, src, out, '--fab-overrides', fab,
+               '--nets', 'HV_*', '--json-out', js], accept=True)
+    summary = _summary(r.stdout)
+    plan = json.load(open(evidence(out + '.autoroute/plan.json', 'plan.json')))
+    expect(sorted(summary.get('open_nets') or ['?']) == sorted(DEFAULT_NETS)
+           and summary.get('drc') == 0,
+           f"the shipped board is graded: open only the nets --nets leaves out "
+           f"({summary.get('open_nets')}), {summary.get('drc')} DRC")
+    expect(all(s.get('ok', True) for s in plan['steps']),
+           f"no step failed ({[(s['tag'], s.get('rc')) for s in plan['steps']]})")
+    expect(not any(AP._PASS_TAG.fullmatch(s['tag']) and not s['tag'].startswith('route_class')
+                   for s in plan['steps']),
+           "no route pass runs with no net to route")
+    expect((summary.get('final_tag') or '').startswith('route_class_')
+           and plan['grade'] and not set(plan['grade']['open_nets']) & set(CLASS_NETS),
+           f"the class call's board ships, graded ({summary.get('final_tag')})")
+    doc = json.load(open(evidence(js, '--json-out document')))
+    expect(doc.get('status') == 'route_pass' and doc.get('route_summary'),
+           f"--json-out carries the class call's route.py summary ({doc.get('status')})")
+    pcb = parse_kicad_pcb(evidence(out, 'routed board'))
+    expect(gap(pcb, *HV) >= CLASS_CLEARANCE - 0.005,
+           f"HV_A and HV_B end {gap(pcb, *HV):.3f} mm apart")
     assert len(FAILS) == n, FAILS[n:]
 
 
 def main():
-    for t in (test_commands, test_refusals, test_honoured, test_capped):
+    for t in (test_commands, test_refusals, test_empty_pass, test_honoured, test_capped):
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 t(tmp)

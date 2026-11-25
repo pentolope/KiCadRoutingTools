@@ -2702,11 +2702,19 @@ to make, and runs each step as its own process in `<output>.autoroute/`:
    keeps its own clearance on every step: no step is given a clearance
    ceiling and the decap step no `--clearance` (a ceiling there), and its
    nets route in a `route.py` call of their own per class clearance, widest
-   first, ahead of the route passes, which leave them out, and again before
-   a later pass, at its layer costs, while one of them is open -- `route.py`
-   prices every obstacle of a call at the widest class the call routes, so
-   routed with the others they would hold every net of the call at their
-   clearance. `--cap-net-classes` caps every class at the floor instead
+   first, ahead of the route passes, which leave them out and take no rip
+   authority over them, again before a later pass and once after the last,
+   at the later passes' layer costs, while one of them is open (graded, and
+   counted in the `--effort-factor` budget) -- `route.py` prices every
+   obstacle of a call at the widest class the call routes, so routed with
+   the others they would hold every net of the call at their clearance.
+   A plane net and a net no pattern selects alone route in the passes, at
+   their class (a plane net so that the pass's plane finalize serves its
+   pour; `route.py` prices every pour net's class in every call). With every
+   net of the run in a class call no pass runs, and each round's last class
+   call is graded. Under `--finish` only a class with a net open on the
+   input is called. A length group across a class and other nets is
+   refused (`--cap-net-classes` keeps it). `--cap-net-classes` caps every class at the floor instead
    (`--clearance-ceiling` on every step that takes one, `--clearance` on the
    decap step), as the plan-pcb-routing skill's chains do.
 2. **Planes first**: on 4+ layer boards, the fewest inner layers that put a
@@ -2811,10 +2819,12 @@ Options:
                      [1, 1000], or negative to keep tracks off the layer in
                      the first pass; the later passes cross a negative layer
                      at 3.0, as they cross a plane. Another count, another
-                     value and --plane-layer-cost with it are refused before
-                     any step (exit 2).
+                     value, every layer negative and --plane-layer-cost with
+                     it are refused before any step (exit 2).
   --via-cost N       route.py's and route_diff.py's --via-cost (a whole
-                     number >= 0) for every route and diff-pair step; without
+                     number >= 0, at most what the router's 32-bit cost holds
+                     at the chain's grid, doubled for a pair: 1073741 at
+                     0.1 mm) for every route and diff-pair step; without
                      it, their own default.
   --cap-net-classes  Cap every net class at the chain clearance on every step
                      (the pre-existing behaviour). Without it a class declared

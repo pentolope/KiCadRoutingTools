@@ -11156,6 +11156,12 @@ For differential pair routing, use route_diff.py:
         parser.error(f"--power-nets ({len(args.power_nets)}) and "
                      f"--power-nets-widths ({len(args.power_nets_widths)}) "
                      f"must have the same length")
+    from routing_config import REFERENCE_GRID_STEP
+    if args.grid_step > 0 and \
+            args.via_cost * 1000 * (REFERENCE_GRID_STEP / args.grid_step) > 2 ** 31 - 1:
+        parser.error(f"--via-cost {args.via_cost} at --grid-step {args.grid_step:g} is "
+                     f"past the router's 32-bit cost: at most "
+                     f"{int((2 ** 31 - 1) * args.grid_step / (1000 * REFERENCE_GRID_STEP))}")
     # #530: --clearance-ceiling is the clamp switch (#439 used the PRESENCE of
     # --clearance). Given -> non-Default classes are capped at min(class, ceiling)
     # and the output .kicad_pro clamps them to the routed floor. Omitted -> honor
