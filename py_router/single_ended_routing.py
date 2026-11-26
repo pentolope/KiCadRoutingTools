@@ -4380,14 +4380,7 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
     of that side and route again. Returns _route_with_via_unblock's tuple with
     the used stub as its segments (none when the retry ends on the original
     terminals), or None when no escape exists or the retry fails."""
-    from pad_escape import escape_launches
-    from fab_tiers import may_narrow
-    if not may_narrow() and any(
-            config.get_net_track_width(net_id, l) > config.track_width + 1e-9
-            for l in config.layers):
-        # --escalation off: a wide net narrows only through the pad-entry
-        # neck (#1452), which measures from the pad, not from a launch cell
-        return None
+    from pad_escape import escape_launches, stub_width
     stubs = {}
     new_sources, new_targets = list(sources), list(targets)
     for stuck, cells, is_source in ((bwd_i, targets, False),
@@ -4398,8 +4391,11 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
             for li in sorted({c[2] for c in cells}):
                 if config.layers[li] not in pad.layers:
                     continue
+                w = stub_width(config, net_id, config.layers[li])
+                if w is None:
+                    continue
                 for cell, segs in escape_launches(obstacles, config, pcb_data,
-                                                  net_id, pad, li, cells, coord):
+                                                  net_id, pad, li, cells, coord, w):
                     if cell in stubs:
                         continue
                     stubs[cell] = segs
@@ -4427,6 +4423,11 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
         pcb_data._copper_epoch = getattr(pcb_data, '_copper_epoch', 0) + 1
     print(f"{print_prefix}{GREEN}Pad escape: {len(used)} exact-clear stub "
           f"segment(s) out of a boxed pad{RESET}")
+    from fab_tiers import note_narrowing
+    for sg in used:
+        _nw = config.get_net_track_width(net_id, sg.layer)
+        if sg.width < _nw - 1e-9:
+            note_narrowing(net_id, 'track_width', _nw, sg.width, 'pad escape')
     return res + ([], used)
 
 

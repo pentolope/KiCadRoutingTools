@@ -188,8 +188,31 @@ def _simplify(cells):
     return out
 
 
+def stub_width(config, net_id, layer) -> Optional[float]:
+    """The width an escape stub of `net_id` is laid at on `layer`, as the
+    neck-down ladder of `_route_main_connection` would narrow the net: a
+    power-wide net to the layer width, an impedance-wide net to the nominal
+    width only when KICAD_IMPEDANCE_NECKDOWN allows (else at its own width),
+    any other net at its width. None when the stub would be narrower than the
+    net and ``--escalation off`` forbids it (the pad-entry neck alone may
+    narrow there, #1452)."""
+    from fab_tiers import may_narrow
+    from single_ended_routing import _impedance_neckdown_allowed
+    net_w = config.get_net_track_width(net_id, layer)
+    layer_w = config.get_track_width(layer)
+    if net_w > layer_w + 1e-9:
+        w = layer_w if config.power_tap_neckdown else net_w
+    elif net_w > config.track_width + 1e-9 and _impedance_neckdown_allowed():
+        w = config.track_width
+    else:
+        w = net_w
+    if w < net_w - 1e-9 and not may_narrow():
+        return None
+    return w
+
+
 def escape_launches(obstacles, config, pcb_data, net_id, pad, layer_idx,
-                    side_cells, coord) -> List[Tuple[Tuple[int, int, int], list]]:
+                    side_cells, coord, w) -> List[Tuple[Tuple[int, int, int], list]]:
     """[((gx, gy, layer_idx), [Segment, ...]), ...]: free cells outside the
     stuck pocket of `side_cells` around `pad` on layer `layer_idx`, each with
     the exact-clear straight segments joining it to the pad's copper. Empty
@@ -197,7 +220,6 @@ def escape_launches(obstacles, config, pcb_data, net_id, pad, layer_idx,
     from check_drc import point_to_pad_distance
     layer = config.layers[layer_idx]
     step = coord.grid_step
-    w = min(config.track_width, config.get_net_track_width(net_id, layer))
     test = _ExactTest(pcb_data, config, net_id, w)
 
     hx, hy = pad.size_x / 2.0, pad.size_y / 2.0
@@ -237,9 +259,12 @@ def escape_launches(obstacles, config, pcb_data, net_id, pad, layer_idx,
     store = getattr(pcb_data, '_pad_escape_memo', None)
     if store is None or len(store) > 64:
         store = pcb_data._pad_escape_memo = {}
+    # keyed by the pad too: a cell's verdict depends on the pad (the reach
+    # bound is measured from it)
     exact_memo: Dict[Tuple[int, int], bool] = store.setdefault(
         (getattr(pcb_data, '_copper_epoch', 0), len(pcb_data.segments),
-         len(pcb_data.vias), net_id, layer, w, step, config.clearance,
+         len(pcb_data.vias), net_id, pad.component_ref, pad.pad_number,
+         pad.global_x, pad.global_y, layer, w, step, config.clearance,
          hash(frozenset((getattr(config, 'net_clearances', None) or {}).items()))), {})
 
     def to_mm(c):
