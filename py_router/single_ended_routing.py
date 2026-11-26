@@ -187,7 +187,8 @@ def _foreign_pad_arrays(pcb_data, layer):
 
 
 def _custom_pad_min_dist(custom, net_id, pts, base_clearance=None,
-                         net_clearances=None, area=None):
+                         net_clearances=None, area=None, config=None, layer=None,
+                         own_type='track'):
     """Exact min edge distance from sample points to the CUSTOM pads of other
     nets (check_drc.point_to_pad_distance -- the model kicad-cli agrees with to
     ~0.1um). Windowed by each pad's bbox + _FOREIGN_PAD_WINDOW; same
@@ -230,7 +231,8 @@ def _custom_pad_min_dist(custom, net_id, pts, base_clearance=None,
                 if net_clearances:
                     adj = max(adj, net_clearances.get(nid, base_clearance)
                               - base_clearance)
-                adj = _area_adj(pad, adj)
+                adj = _area_adj(pad, _custom_pad_excess(config, net_id, pad, layer,
+                                                        base_clearance, adj, own_type))
             for (px, py) in pts:
                 if abs(px - pad.global_x) > R + ex or abs(py - pad.global_y) > R + ey:
                     continue
@@ -250,7 +252,8 @@ def _custom_pad_min_dist(custom, net_id, pts, base_clearance=None,
             if net_clearances:
                 adj = max(adj, net_clearances.get(nid, base_clearance)
                           - base_clearance)
-            adj = _area_adj(pad, adj)
+            adj = _area_adj(pad, _custom_pad_excess(config, net_id, pad, layer,
+                                                    base_clearance, adj, own_type))
         if PX is None:
             P = np.asarray(pts, dtype=float).reshape(-1, 2)
             PX, PY = P[:, 0], P[:, 1]
@@ -323,7 +326,8 @@ def _pt_foreign_pad_dist(pcb_data, net_id, x, y, layer, base_clearance=None,
         _foreign_pad_arrays(pcb_data, layer)
     best_custom = _custom_pad_min_dist(custom, net_id, ((x, y),), base_clearance,
                                        net_clearances,
-                                       area=_custom_area_ctx(config, x, y, x, y, layer))
+                                       area=_custom_area_ctx(config, x, y, x, y, layer),
+                                       config=config, layer=layer, own_type=own_type)
     if cx.size == 0:
         return best_custom
     R = _FOREIGN_PAD_WINDOW
@@ -357,6 +361,25 @@ def _pt_foreign_pad_dist(pcb_data, net_id, x, y, layer, base_clearance=None,
     return min(float(np.min(d)), best_custom)
 
 
+def _foreign_pad_rows(pcb_data, layer):
+    """The pads of `_foreign_pad_arrays(pcb_data, layer)`'s rows, in its
+    order, cached on the same signature."""
+    _sig = (id(pcb_data.pads_by_net),
+            sum(len(v) for v in pcb_data.pads_by_net.values()))
+    cache = getattr(pcb_data, '_foreign_pad_row_cache', None)
+    if cache is None or cache[0] != _sig:
+        cache = (_sig, {})
+        pcb_data._foreign_pad_row_cache = cache
+    got = cache[1].get(layer)
+    if got is None:
+        from net_queries import expand_pad_layers
+        got = cache[1][layer] = [
+            pad for _nid, pads in pcb_data.pads_by_net.items() for pad in pads
+            if layer in expand_pad_layers(pad.layers, [layer])
+            and not getattr(pad, 'polygons', None)]
+    return got
+
+
 def _foreign_pad_types(pcb_data, layer, config):
     """The scoped obstacle keys (`GridRouteConfig.scoped_pad_key`) of
     `_foreign_pad_arrays(pcb_data, layer)`'s rows, in its order (#1491: a
@@ -372,12 +395,8 @@ def _foreign_pad_types(pcb_data, layer, config):
     key = (layer, id(sc) if sc.fp_patterns else None)
     got = cache[1].get(key)
     if got is None or got[0] is not (sc if sc.fp_patterns else None):
-        from net_queries import expand_pad_layers
         got = cache[1][key] = (sc if sc.fp_patterns else None, [
-            config.scoped_pad_key(pad)
-            for _nid, pads in pcb_data.pads_by_net.items() for pad in pads
-            if layer in expand_pad_layers(pad.layers, [layer])
-            and not getattr(pad, 'polygons', None)])
+            config.scoped_pad_key(pad) for pad in _foreign_pad_rows(pcb_data, layer)])
     return got[1]
 
 
@@ -529,14 +548,16 @@ def _raise_excess(excess, more):
     return np.where(np.isnan(more), base, np.maximum(base, more))
 
 
-def _coupled_excess(config, net_id, nids, kind, base_clearance, layer=None):
+def _coupled_excess(config, net_id, nids, kind, base_clearance, layer=None, pads=None):
     """#1630: per foreign item, where it is `net_id`'s own diff-pair partner
     and a rule binding the pair sets their clearance (config.
     coupled_pair_clearances: #1293, #1526, #1542), that value minus
     `base_clearance` (negative where it relaxes); NaN elsewhere. `kind` is
     'track' (a track), 'layer' (a via) or 'pad', as `coupled_pair_value`
     reads it. All NaN without such a rule -- the router builds the pair at
-    that value, so a pass that measures it at the class moves it off."""
+    that value, so a pass that measures it at the class moves it off. With
+    `pads` (one per row, kind 'pad') a partner pad another rule binds by its
+    part or pad type is NaN (`GridRouteConfig.coupled_pad_value`)."""
     out = np.full(len(nids), np.nan)
     cpc = getattr(config, 'coupled_pair_clearances', None) if config is not None else None
     if not cpc or not len(nids):
@@ -547,10 +568,37 @@ def _coupled_excess(config, net_id, nids, kind, base_clearance, layer=None):
         if own not in key or len(key) != 2:
             continue
         other = next(iter(key - {own}))
+        if kind == 'pad' and pads is not None:
+            for i in np.nonzero(nids == other)[0]:
+                v = config.coupled_pad_value(pads[i], own, layer)
+                if v is not None:
+                    out[i] = v - base_clearance
+            continue
         v = config.coupled_pair_value(own, other, kind, layer)
         if v is not None:
             out[nids == other] = v - base_clearance
     return out
+
+
+def _custom_pad_excess(config, net_id, pad, layer, base_clearance, adj, own_type='track'):
+    """`adj` (a custom pad's class term over `base_clearance`) with the
+    scoped rule binding the pad (#1491, by its `scoped_pad_key`), then the
+    pair rule where it is the partner's pad (#1630); a pad's own override
+    outranks both, as in `_fold_scoped_pad_excess`."""
+    if config is None or base_clearance is None:
+        return adj
+    lc = getattr(pad, 'local_clearance', 0.0) or 0.0
+    nid = np.array([int(getattr(pad, 'net_id', 0) or 0)])
+    if getattr(config, 'scoped_clearance', None) is not None:
+        sx = _scoped_excess(config, net_id, nid, 'pad', base_clearance, layer,
+                            pad_types=[config.scoped_pad_key(pad)], own_type=own_type)[0]
+        if not math.isnan(sx):
+            adj = lc - base_clearance if lc > 0 else sx
+    if getattr(config, 'coupled_pair_clearances', None) and lc <= 0:
+        cx = _coupled_excess(config, net_id, nid, 'pad', base_clearance, layer, pads=[pad])[0]
+        if not math.isnan(cx):
+            adj = cx
+    return adj
 
 
 def _fold_scoped_excess(excess, scoped):
@@ -631,7 +679,8 @@ def _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     sy = y1 + (y2 - y1) * _t
     best_custom = _custom_pad_min_dist(
         custom, net_id, list(zip(sx, sy)), base_clearance, net_clearances,
-        area=_custom_area_ctx(config, x1, y1, x2, y2, layer))
+        area=_custom_area_ctx(config, x1, y1, x2, y2, layer),
+        config=config, layer=layer, own_type=own_type)
     if cx.size == 0:
         return best_custom
     R = _FOREIGN_PAD_WINDOW
@@ -656,7 +705,8 @@ def _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
                                        near, plc, excess, base_clearance, own_type)
         # #1630: the partner's pad at the rule binding the pair; a pad's own
         # override still outranks it
-        cx_ = _coupled_excess(config, net_id, nids[near], 'pad', base_clearance, layer)
+        cx_ = _coupled_excess(config, net_id, nids[near], 'pad', base_clearance, layer,
+                              pads=_object_rows(_foreign_pad_rows(pcb_data, layer))[near])
         excess = _fold_scoped_excess(
             excess, np.where(plc[near] > 0, np.nan, cx_))
     if need is not None:

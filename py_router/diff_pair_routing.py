@@ -3536,9 +3536,14 @@ def _connector_grazes_foreign_copper(new_segments, pcb_data, p_net_id, n_net_id,
                 continue  # the connector legitimately lands on its own-net pad
             # the partner's pad: at a rule binding P against N where one
             # does (#1293 / #1526 / #1542), as check_drc grades it
-            _cv = (_pair_value(seg.net_id, pad_net, 'pad', seg.layer)
+            _pv = (_pair_value(seg.net_id, pad_net, 'pad', seg.layer)
                    if pad_net in own else None)
             for pad in pads:
+                # a partner pad another rule binds by its part or pad type is
+                # priced as itself
+                _cv = (config.coupled_pad_value(pad, seg.net_id, seg.layer)
+                       if _pv is not None and hasattr(config, 'coupled_pad_value')
+                       else _pv)
                 # Coarse bounding-box reject before pricing the pad and the
                 # exact rect-distance test.
                 pm = (max(_pad_reach, config.pad_override_clearance(0.0, pad))

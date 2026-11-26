@@ -842,6 +842,32 @@ class GridRouteConfig:
         return (cp.get('stack') if kind == 'stack'
                 else (cp.get(kind) or {}).get(layer))
 
+    def coupled_pad_value(self, pad, other_net: int,
+                          layer: Optional[str] = None) -> Optional[float]:
+        """`coupled_pair_value` of 'pad' kind for THIS partner pad against
+        `other_net`'s track: the pair map prices a pad with no part and no pad
+        type, so where the pad's own part, pad type or number makes another
+        rule KiCad's last match, None -- the caller prices the pad itself
+        (`pad_pair_clearance`, the scoped channel's per-pad key)."""
+        pad_net = int(getattr(pad, 'net_id', 0) or 0)
+        v = self.coupled_pair_value(pad_net, other_net, 'pad', layer)
+        dr = self.rules
+        if v is None or dr is None:
+            return v
+        ref = getattr(pad, 'component_ref', None)
+        fp_ref, fp_lib = dr.footprint_ids.get(ref, (ref, None))
+        trk = dr.item_for_net(other_net, 'track', layer)
+        bare = dr.item_for_net(pad_net, 'pad', layer)
+        own = dr.item_for_net(pad_net, 'pad', layer,
+                              pad_type=getattr(pad, 'pad_type', None),
+                              pad_number=getattr(pad, 'pad_number', None),
+                              footprint_ref=fp_ref, footprint_lib=fp_lib)
+        for (a, b), (c, d) in (((trk, bare), (trk, own)), ((bare, trk), (own, trk))):
+            if (dr.resolve('clearance', a, b, layer).min_rule
+                    != dr.resolve('clearance', c, d, layer).min_rule):
+                return None
+        return v
+
     def pair_clearance(self, net_a: int, net_b: int,
                        layer: Optional[str] = None, *, kind: str = 'layer',
                        base: Optional[float] = None, types=None) -> float:
