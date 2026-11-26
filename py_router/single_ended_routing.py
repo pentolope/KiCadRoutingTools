@@ -706,7 +706,9 @@ def _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
         # #1630: the partner's pad at the rule binding the pair; a pad's own
         # override still outranks it
         cx_ = _coupled_excess(config, net_id, nids[near], 'pad', base_clearance, layer,
-                              pads=_object_rows(_foreign_pad_rows(pcb_data, layer))[near])
+                              pads=(_object_rows(_foreign_pad_rows(pcb_data, layer))[near]
+                                    if getattr(config, 'coupled_pair_clearances', None)
+                                    else None))
         excess = _fold_scoped_excess(
             excess, np.where(plc[near] > 0, np.nan, cx_))
     if need is not None:
