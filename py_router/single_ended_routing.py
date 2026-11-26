@@ -357,9 +357,10 @@ def _pt_foreign_pad_dist(pcb_data, net_id, x, y, layer, base_clearance=None,
     return min(float(np.min(d)), best_custom)
 
 
-def _foreign_pad_types(pcb_data, layer):
-    """The pad types of `_foreign_pad_arrays(pcb_data, layer)`'s rows, in its
-    order (#1491: a class/type-scoped rule may bind pads of one type), cached
+def _foreign_pad_types(pcb_data, layer, config):
+    """The scoped obstacle keys (`GridRouteConfig.scoped_pad_key`) of
+    `_foreign_pad_arrays(pcb_data, layer)`'s rows, in its order (#1491: a
+    class/type-scoped rule may bind pads of one type, or of one part), cached
     on the same signature."""
     _sig = (id(pcb_data.pads_by_net),
             sum(len(v) for v in pcb_data.pads_by_net.values()))
@@ -367,15 +368,24 @@ def _foreign_pad_types(pcb_data, layer):
     if cache is None or cache[0] != _sig:
         cache = (_sig, {})
         pcb_data._foreign_pad_type_cache = cache
-    got = cache[1].get(layer)
-    if got is None:
+    sc = config.scoped_clearance.sc
+    key = (layer, id(sc) if sc.fp_patterns else None)
+    got = cache[1].get(key)
+    if got is None or got[0] is not (sc if sc.fp_patterns else None):
         from net_queries import expand_pad_layers
-        got = [getattr(pad, 'pad_type', None) or 'smd'
-               for _nid, pads in pcb_data.pads_by_net.items() for pad in pads
-               if layer in expand_pad_layers(pad.layers, [layer])
-               and not getattr(pad, 'polygons', None)]
-        cache[1][layer] = got
-    return got
+        got = cache[1][key] = (sc if sc.fp_patterns else None, [
+            config.scoped_pad_key(pad)
+            for _nid, pads in pcb_data.pads_by_net.items() for pad in pads
+            if layer in expand_pad_layers(pad.layers, [layer])
+            and not getattr(pad, 'polygons', None)])
+    return got[1]
+
+
+def _object_rows(items):
+    out = np.empty(len(items), dtype=object)
+    for i, v in enumerate(items):
+        out[i] = v
+    return out
 
 
 def _scoped_excess(config, net_id, nids, foreign_type, base_clearance, layer=None,
@@ -562,7 +572,7 @@ def _fold_scoped_pad_excess(config, pcb_data, net_id, layer, near, nids, plc,
     or a binding rule."""
     if config is None or getattr(config, 'scoped_clearance', None) is None:
         return excess
-    types = np.asarray(_foreign_pad_types(pcb_data, layer), dtype=object)[near]
+    types = _object_rows(_foreign_pad_types(pcb_data, layer, config))[near]
     sx_ = _scoped_excess(config, net_id, nids[near], 'pad', base_clearance, layer,
                          pad_types=types, own_type=own_type)
     bound = ~np.isnan(sx_)
@@ -582,7 +592,7 @@ def _fold_area_pad_excess(config, pcb_data, net_id, x1, y1, x2, y2, layer, near,
         return excess
     types = None
     if getattr(config, 'scoped_clearance', None) is not None:
-        types = np.asarray(_foreign_pad_types(pcb_data, layer), dtype=object)[near]
+        types = _object_rows(_foreign_pad_types(pcb_data, layer, config))[near]
     ax = _area_excess(config, pcb_data, net_id, x1, y1, x2, y2, layer, 'pad',
                       _foreign_pad_arrays(pcb_data, layer), near, base_clearance, 'pad',
                       own_type=own_type, pad_types=types, plc=plc[near])

@@ -7876,7 +7876,8 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
                 _need = same_net_pad_clearance  # #581 (only gathered when > 0)
             else:
                 _need = max(_area_need(pair_clr(own, p.net_id, v.net_id, 'pad',
-                                                getattr(p, 'pad_type', None) or 'smd',
+                                                _scoped.sc.pad_key(p) if _scoped is not None
+                                                else getattr(p, 'pad_type', None) or 'smd',
                                                 layers=_pad_layers1897(p)),
                                        x, y, 'pad', p),
                             getattr(p, 'local_clearance', 0.0) or 0.0)

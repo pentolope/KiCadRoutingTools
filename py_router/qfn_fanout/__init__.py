@@ -1447,7 +1447,7 @@ def _underpad_via_escape(footprint, pcb_data, pad_infos, layout, layer,
             # what the grader's tolerance would flag. The via spans the stack,
             # so an SMD pad on any one layer still conflicts. A pad override
             # RAISES the floor, as the stub half prices it.
-            _pcl = _pc(net_id, pad.net_id, (('via',), (('pad', pad.pad_type or 'smd'),)))
+            _pcl = _pc(net_id, pad.net_id, (('via',), (('pad', _rules.cfg.scoped_pad_key(pad)),)))
             _eff = max(_pcl, getattr(pad, 'local_clearance', 0.0) or 0.0)
             if math.hypot(vx - gx, vy - gy) - reach >= via_size / 2 + _eff:
                 continue        # the pad's copper lies inside `reach` of its centre
@@ -1559,7 +1559,7 @@ def _underpad_via_escape(footprint, pcb_data, pad_infos, layout, layer,
                 # real short 2-3mm away, which is exactly the geometry the
                 # ladder produces. `id(p) in _tie` alone is NOT the rule.
                 _pcl = _spc(net_id, p.net_id,
-                            types=(('track',), (('pad', p.pad_type or 'smd'),)))
+                            types=(('track',), (('pad', _rules.cfg.scoped_pad_key(p)),)))
                 if id(p) in _tie and _tie_span_waived(pcb_data, seg, net_id,
                                                      p, _pcl):
                     continue
@@ -2904,7 +2904,7 @@ def _generate_qfn_fanout_all(footprint: Footprint,
                 continue
             if _segment_pad_gap(p1[0], p1[1], p2[0], p2[1], pad) - width / 2 \
                     < _pad_need(pad, _pair(cl, net_id, pad.net_id, types=(
-                        ('track',), (('pad', pad.pad_type or 'smd'),)))) - 1e-9:
+                        ('track',), (('pad', _rules.cfg.scoped_pad_key(pad)),)))) - 1e-9:
                 return True
         # Existing copper of the part's other fanned nets (issue #257).
         for s in _fanned_existing_segs:

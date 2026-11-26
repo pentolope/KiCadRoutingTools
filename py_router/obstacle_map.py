@@ -196,7 +196,7 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
         if config.scoped_clearance is None:
             return v
         return config.scoped_stamp(
-            net_id, (getattr(pad, 'pad_type', None) or 'smd') if pad is not None
+            net_id, config.scoped_pad_key(pad) if pad is not None
             else config._graphic_key(graphic), v)
 
     # #1843: a board with a clearance rule scoped by a rule area is stamped
