@@ -3151,11 +3151,12 @@ def _try_route_direction(src, tgt, pcb_data, config, obstacles, base_obstacles,
         s_theta = direction_to_theta_idx(s_dx, s_dy)
         t_theta = direction_to_theta_idx(-t_dx, -t_dy)
 
-        path, iters, blocked, gnd_via_dirs = pose_router.route_pose_with_frontier(
-            obstacles, s_gx, s_gy, src_layer, s_theta,
-            t_gx, t_gy, tgt_layer, t_theta,
-            max_iters, diff_pair_via_spacing=via_spacing_grid
-        )
+        path, iters, blocked, gnd_via_dirs = _pose_search_clear_of_via_sites(
+            lambda: pose_router.route_pose_with_frontier(
+                obstacles, s_gx, s_gy, src_layer, s_theta,
+                t_gx, t_gy, tgt_layer, t_theta,
+                max_iters, diff_pair_via_spacing=via_spacing_grid),
+            obstacles, coord, config, spacing_mm, p_net_id, n_net_id, pcb_data)
         return path, iters, blocked, (s_dx, s_dy), (t_dx, t_dy), s_ang, t_ang, gnd_via_dirs
 
     # Select best angles - during probe, try angles sequentially until one works
@@ -3982,9 +3983,11 @@ def _route_direct_coupled_middle(pcb_data, diff_pair, config, obstacles, layer_n
             # so call the non-frontier variant and skip the tracker inserts +
             # the 10k-cell sort/marshal every failed probe used to pay. Same
             # search, same path/iterations (both wrap the same Rust core).
-            return pr.route_pose(
-                obstacles, s_gx, s_gy, a_layer, st, t_gx, t_gy, b_layer, tt,
-                budget, diff_pair_via_spacing=via_spacing_grid)
+            return _pose_search_clear_of_via_sites(
+                lambda: pr.route_pose(
+                    obstacles, s_gx, s_gy, a_layer, st, t_gx, t_gy, b_layer, tt,
+                    budget, diff_pair_via_spacing=via_spacing_grid),
+                obstacles, coord, config, spacing_mm, p_net_id, n_net_id, pcb_data)
         path, iters, _g = _pose(straight_t, straight_t, max_iters)
         iters = iters or 0
         if path is None:
@@ -4122,6 +4125,9 @@ def _route_direct_coupled_middle(pcb_data, diff_pair, config, obstacles, layer_n
                 if _gz[0] == 'pad' and getattr(_gz[1], 'net_id', None) in (p_net_id, n_net_id):
                     _partner_pad_graze[0] = _gz[2]
                 return None, "coupled middle " + _graze_reason(_gz)
+            _vr = _pair_vias_refusal(p_vias + n_vias, pcb_data, config, p_net_id, n_net_id)
+            if _vr:
+                return None, f"coupled middle via at ({_vr[0].x:.4f},{_vr[0].y:.4f}): {_vr[1]}"
 
             # Attach each terminal to its middle near-end with point-to-point single-ended
             # legs. The partner net's copper (its middle + already-committed legs + fanout
@@ -6690,7 +6696,60 @@ def _route_diff_pair_with_obstacles_impl(pcb_data: PCBData, diff_pair: DiffPairN
             'graze_net_id': getattr(obj, 'net_id', None),
         }
 
+    via_refusal = _pair_vias_refusal(result.get('new_vias', []), swap_view, config,
+                                     p_net_id, n_net_id)
+    if via_refusal:
+        v, why = via_refusal
+        print(f"  {_net_label(pcb_data, v.net_id)} via at ({v.x:.4f},{v.y:.4f}): {why} - "
+              f"rejecting pair route")
+        return {
+            'failed': True,
+            'iterations': result.get('iterations', 0),
+            'via_refused': why,
+        }
+
     return result
+
+
+def _via_change_axis(simplified_path, i, coord):
+    gx1, gy1, _ = simplified_path[i]
+    cx, cy = coord.to_float(gx1, gy1)
+
+    # Get incoming direction (from previous point to via)
+    if i > 0:
+        prev_gx, prev_gy, _ = simplified_path[i - 1]
+        prev_x, prev_y = coord.to_float(prev_gx, prev_gy)
+        in_dir_x, in_dir_y = cx - prev_x, cy - prev_y
+        in_len = math.sqrt(in_dir_x**2 + in_dir_y**2)
+        if in_len > 0.001:
+            in_dir_x, in_dir_y = in_dir_x / in_len, in_dir_y / in_len
+        else:
+            in_dir_x, in_dir_y = 1.0, 0.0
+    else:
+        in_dir_x, in_dir_y = 1.0, 0.0
+
+    # Get outgoing direction (from via to next point after layer change)
+    if i + 2 < len(simplified_path):
+        next_gx, next_gy, _ = simplified_path[i + 2]
+        next_x, next_y = coord.to_float(next_gx, next_gy)
+        out_dir_x, out_dir_y = next_x - cx, next_y - cy
+        out_len = math.sqrt(out_dir_x**2 + out_dir_y**2)
+        if out_len > 0.001:
+            out_dir_x, out_dir_y = out_dir_x / out_len, out_dir_y / out_len
+        else:
+            out_dir_x, out_dir_y = in_dir_x, in_dir_y
+    else:
+        out_dir_x, out_dir_y = in_dir_x, in_dir_y
+
+    # Calculate perpendicular direction for via-via axis (average of in/out perpendiculars)
+    perp_x = (-in_dir_y + -out_dir_y) / 2
+    perp_y = (in_dir_x + out_dir_x) / 2
+    perp_len = math.sqrt(perp_x**2 + perp_y**2)
+    if perp_len > 0.001:
+        perp_x, perp_y = perp_x / perp_len, perp_y / perp_len
+    else:
+        perp_x, perp_y = -in_dir_y, in_dir_x
+    return cx, cy, (in_dir_x, in_dir_y), (out_dir_x, out_dir_y), (perp_x, perp_y)
 
 
 def _process_via_positions(simplified_path, p_float_path, n_float_path, coord, config,
@@ -6743,43 +6802,8 @@ def _process_via_positions(simplified_path, p_float_path, n_float_path, coord, c
         gx1, gy1, layer1 = simplified_path[i]
         gx2, gy2, layer2 = simplified_path[i + 1]
 
-        # Layer change detected - calculate centerline position
-        cx, cy = coord.to_float(gx1, gy1)
-
-        # Get incoming direction (from previous point to via)
-        if i > 0:
-            prev_gx, prev_gy, _ = simplified_path[i - 1]
-            prev_x, prev_y = coord.to_float(prev_gx, prev_gy)
-            in_dir_x, in_dir_y = cx - prev_x, cy - prev_y
-            in_len = math.sqrt(in_dir_x**2 + in_dir_y**2)
-            if in_len > 0.001:
-                in_dir_x, in_dir_y = in_dir_x / in_len, in_dir_y / in_len
-            else:
-                in_dir_x, in_dir_y = 1.0, 0.0
-        else:
-            in_dir_x, in_dir_y = 1.0, 0.0
-
-        # Get outgoing direction (from via to next point after layer change)
-        if i + 2 < len(simplified_path):
-            next_gx, next_gy, _ = simplified_path[i + 2]
-            next_x, next_y = coord.to_float(next_gx, next_gy)
-            out_dir_x, out_dir_y = next_x - cx, next_y - cy
-            out_len = math.sqrt(out_dir_x**2 + out_dir_y**2)
-            if out_len > 0.001:
-                out_dir_x, out_dir_y = out_dir_x / out_len, out_dir_y / out_len
-            else:
-                out_dir_x, out_dir_y = in_dir_x, in_dir_y
-        else:
-            out_dir_x, out_dir_y = in_dir_x, in_dir_y
-
-        # Calculate perpendicular direction for via-via axis (average of in/out perpendiculars)
-        perp_x = (-in_dir_y + -out_dir_y) / 2
-        perp_y = (in_dir_x + out_dir_x) / 2
-        perp_len = math.sqrt(perp_x**2 + perp_y**2)
-        if perp_len > 0.001:
-            perp_x, perp_y = perp_x / perp_len, perp_y / perp_len
-        else:
-            perp_x, perp_y = -in_dir_y, in_dir_x
+        cx, cy, (in_dir_x, in_dir_y), (out_dir_x, out_dir_y), (perp_x, perp_y) = \
+            _via_change_axis(simplified_path, i, coord)
 
         # Use larger spacing for vias if needed
         via_spacing = _pair_via_offset(config, spacing_mm, p_net_id, n_net_id)
@@ -6861,3 +6885,164 @@ def _process_via_positions(simplified_path, p_float_path, n_float_path, coord, c
         n_float_path.insert(i + 3, (n_exit_x, n_exit_y, layer2))
 
     return p_float_path, n_float_path
+
+
+_VIA_SITE_EPS = 1e-6
+_VIA_SITE_RETRIES = 12
+
+
+def _net_label(pcb_data, net_id):
+    net = (getattr(pcb_data, 'nets', None) or {}).get(net_id)
+    return net.name if net is not None and net.name else f'net {net_id}'
+
+
+def _pair_via_refusal(x, y, net_id, pcb_data, config, exclude_net_ids=()):
+    if pcb_data is None:
+        return ''
+    from check_drc import (board_edge_geometry, check_via_board_edge_poly,
+                           filled_graphic_refusal, hole_rule_refusal, keepout_refusal,
+                           npth_via_clearance, pad_copper_layers, point_to_pad_distance)
+    from geometry_utils import point_to_segment_distance, point_to_segment_distance_seg, via_on_layer
+    from kicad_parser import pad_drill_capsule
+    from obstacle_map import _pad_has_copper, resolve_hole_clearance
+    probe = Via(x=x, y=y, size=config.via_size, drill=config.via_drill,
+                layers=_via_layer_pair(config), net_id=net_id, via_type=_via_kind(config))
+    skip = set(exclude_net_ids) | {net_id}
+    r = config.via_size / 2
+    reach = r + config.max_pair_clearance()
+    for seg in getattr(pcb_data, 'segments', None) or ():
+        if seg.net_id in skip or not via_on_layer(probe, seg.layer):
+            continue
+        d = point_to_segment_distance_seg(x, y, seg)
+        if d >= reach + seg.width / 2:
+            continue
+        gap = d - r - seg.width / 2
+        need = config.pair_clearance(net_id, seg.net_id, seg.layer)
+        if gap < need - _VIA_SITE_EPS:
+            return (f"its copper would sit {gap:.4f}mm from a {_net_label(pcb_data, seg.net_id)} "
+                    f"track on {seg.layer} (clearance {need:g}mm)")
+    for v in getattr(pcb_data, 'vias', None) or ():
+        if v.net_id in skip:
+            continue
+        d = math.hypot(v.x - x, v.y - y)
+        if d >= reach + v.size / 2:
+            continue
+        gap = d - r - v.size / 2
+        need = config.pair_clearance(net_id, v.net_id, kind='stack')
+        if gap < need - _VIA_SITE_EPS:
+            return (f"its copper would sit {gap:.4f}mm from the {_net_label(pcb_data, v.net_id)} "
+                    f"via at ({v.x:.4f},{v.y:.4f}) (clearance {need:g}mm)")
+    copper = list(getattr(getattr(pcb_data, 'board_info', None), 'copper_layers', None)
+                  or config.layers)
+    hole_clr = None
+    for pnid, pads in (getattr(pcb_data, 'pads_by_net', None) or {}).items():
+        for pad in pads:
+            half = max(pad.size_x or 0.0, pad.size_y or 0.0, pad.drill or 0.0)
+            if abs(pad.global_x - x) > reach + half + 2.0 or abs(pad.global_y - y) > reach + half + 2.0:
+                continue
+            if not _pad_has_copper(pad):
+                if not (pad.drill and pad.drill > 0):
+                    continue
+                if hole_clr is None:
+                    hole_clr = resolve_hole_clearance(pcb_data, config)
+                need = npth_via_clearance(getattr(pad, 'local_clearance', 0.0) or 0.0,
+                                          config.clearance, hole_clr)
+                (ax, ay), (bx, by), hr = pad_drill_capsule(pad)
+                gap = point_to_segment_distance(x, y, ax, ay, bx, by) - hr - r
+                if gap < need - _VIA_SITE_EPS:
+                    return (f"its copper would sit {gap:.4f}mm from the hole of "
+                            f"{pad.component_ref}.{pad.pad_number} (clearance {need:g}mm)")
+                continue
+            if pnid in skip:
+                continue
+            if not any(via_on_layer(probe, l) for l in pad_copper_layers(pad, copper)):
+                continue
+            gap = point_to_pad_distance(x, y, pad) - r
+            need = config.pad_pair_clearance(pad, net_id, other_type='via')
+            if gap < need - _VIA_SITE_EPS:
+                return (f"its copper would sit {gap:.4f}mm from {_net_label(pcb_data, pnid)} pad "
+                        f"{pad.component_ref}.{pad.pad_number} (clearance {need:g}mm)")
+    ignore = {(round(x, 6), round(y, 6), n) for n in skip}
+    why = _gnd_via_drill_conflict(x, y, config, pcb_data, (), ignore)
+    if why:
+        return why
+    bi = getattr(pcb_data, 'board_info', None)
+    if bi is not None:
+        rings, outer, cutouts = board_edge_geometry(bi, rect_ring=True)
+        floors = getattr(config, 'edge_floors', None)
+        edge = (floors.via.get(net_id, config.board_edge_clearance) if floors is not None
+                else config.board_edge_clearance) or config.clearance
+        if rings:
+            hit, overlap, kind = check_via_board_edge_poly(probe, rings, outer, cutouts, edge, 0.0)
+            if hit:
+                return (f"its copper would sit {overlap:.4f}mm inside the board edge clearance "
+                        f"{edge:g}mm" if kind == 'edge' else "it would sit off the board")
+    why = (keepout_refusal(pcb_data, vias=[probe])
+           or filled_graphic_refusal(pcb_data, vias=[probe],
+                                     clearance=lambda sh: config.pair_clearance(net_id, sh.net_id, sh.layer))
+           or hole_rule_refusal(pcb_data, getattr(config, 'rules', None), vias=[probe]))
+    return why or ''
+
+
+def _pose_path_via_site_refusals(pose_path, coord, config, spacing_mm, p_net_id, n_net_id,
+                                 pcb_data):
+    path = []
+    for gx, gy, _theta, layer in pose_path:
+        if path and path[-1] == (gx, gy, layer):
+            continue
+        path.append((gx, gy, layer))
+    simplified = simplify_path(path)
+    off = _pair_via_offset(config, spacing_mm, p_net_id, n_net_id)
+    pair = (p_net_id, n_net_id)
+    out = []
+    for i in range(len(simplified) - 1):
+        if simplified[i][2] == simplified[i + 1][2]:
+            continue
+        cx, cy, _in, _out, (ux, uy) = _via_change_axis(simplified, i, coord)
+        for sgn in (1, -1):
+            x, y = cx + ux * sgn * off, cy + uy * sgn * off
+            why = ''
+            for net in pair:
+                why = _pair_via_refusal(x, y, net, pcb_data, config, pair)
+                if why:
+                    break
+            if why:
+                out.append((simplified[i][0], simplified[i][1], x, y, why))
+                break
+    return out
+
+
+def _pose_search_clear_of_via_sites(search, obstacles, coord, config, spacing_mm,
+                                    p_net_id, n_net_id, pcb_data):
+    blocked = []
+    spent = 0
+    try:
+        while True:
+            res = tuple(search())
+            spent += res[1] or 0
+            res = (res[0], spent) + res[2:]
+            if res[0] is None or pcb_data is None:
+                return res
+            bad = _pose_path_via_site_refusals(res[0], coord, config, spacing_mm,
+                                               p_net_id, n_net_id, pcb_data)
+            if not bad or len(blocked) >= _VIA_SITE_RETRIES:
+                return res
+            for gx, gy, x, y, why in bad:
+                print(f"  pair via at ({x:.4f},{y:.4f}) refused: {why}; "
+                      f"searching again without a layer change at ({gx * coord.grid_step:.3f},"
+                      f"{gy * coord.grid_step:.3f})")
+                obstacles.add_blocked_via(gx, gy)
+                blocked.append((gx, gy))
+    finally:
+        if blocked:
+            obstacles.remove_blocked_vias_batch(np.array(blocked, dtype=np.int32))
+
+
+def _pair_vias_refusal(new_vias, pcb_data, config, p_net_id, n_net_id):
+    for v in new_vias or ():
+        if v.net_id not in (p_net_id, n_net_id):
+            continue
+        why = _pair_via_refusal(v.x, v.y, v.net_id, pcb_data, config)
+        if why:
+            return v, why
+    return None
