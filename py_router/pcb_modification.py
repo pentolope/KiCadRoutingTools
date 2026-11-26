@@ -5847,7 +5847,8 @@ def copper_clearance_probe(pcb_data: PCBData, clearance: float,
                                  net_clearances=net_clearances, base_clearance=eff, config=config) < need:
             return False
         hd = _seg_foreign_hole_dist(pcb_data, net_id, x1, y1, x2, y2,
-                                    base_clearance=npth_clr)  # #1038, per-hole #760
+                                    base_clearance=npth_clr, config=config,
+                                    layer=layer)  # #1038, per-hole #760, rules #1853
         if hd < npth_clr + w / 2.0 - 1e-4:
             return False
         pd = _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,

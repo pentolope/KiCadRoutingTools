@@ -642,17 +642,21 @@ def _window_geometry(nl, pts, segs, i, j, path, start_override=False,
 
 
 def _enters_early(nl, target, others):
-    """Does any of `others` already lie in the via barrel or pad `target` is in?"""
+    """Does any of `others` already lie in the via barrel or pad `target` is
+    in? Both read as the strict removal model reads a track end (its width
+    clamped to COINCIDENCE_TOL), so a vertex on a barrel's rim is in it."""
+    from connectivity import COINCIDENCE_TOL
+    reach = COINCIDENCE_TOL / 2.0
     for v in nl.vias:
-        if math.hypot(target[0] - v.x, target[1] - v.y) <= v.size / 2.0 and \
-                any(math.hypot(p[0] - v.x, p[1] - v.y) <= v.size / 2.0 for p in others):
+        if math.hypot(target[0] - v.x, target[1] - v.y) <= v.size / 2.0 + reach and \
+                any(math.hypot(p[0] - v.x, p[1] - v.y) <= v.size / 2.0 + reach
+                    for p in others):
             return True
-    if nl.inside_pad(target):
-        from check_drc import point_to_pad_distance
-        for pd in nl.near_pads(target, 0.0):
-            if point_to_pad_distance(target[0], target[1], pd) <= _EPS and \
-                    any(point_to_pad_distance(p[0], p[1], pd) <= _EPS for p in others):
-                return True
+    from check_drc import point_to_pad_distance
+    for pd in nl.near_pads(target, reach):
+        if point_to_pad_distance(target[0], target[1], pd) <= reach and \
+                any(point_to_pad_distance(p[0], p[1], pd) <= reach for p in others):
+            return True
     return False
 
 

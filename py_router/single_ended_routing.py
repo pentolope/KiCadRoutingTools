@@ -1324,7 +1324,7 @@ def _foreign_hole_capsules(pcb_data):
     sig = sum(map(len, pcb_data.pads_by_net.values()))
     cache = getattr(pcb_data, '_foreign_hole_cap_cache', None)
     if cache is None or cache[0] != sig:
-        nid, ax, ay, bx, by, r, lc = [], [], [], [], [], [], []
+        nid, ax, ay, bx, by, r, lc, rows = [], [], [], [], [], [], [], []
         for pad_net, pads in pcb_data.pads_by_net.items():
             for pad in pads:
                 if (getattr(pad, 'drill', 0) or 0) <= 0:
@@ -1341,16 +1341,31 @@ def _foreign_hole_capsules(pcb_data):
                 ax.append(p1x); ay.append(p1y); bx.append(p2x); by.append(p2y)
                 r.append(hr)
                 lc.append(getattr(pad, 'local_clearance', 0.0) or 0.0)
+                rows.append(pad)
         cache = (sig, (np.asarray(nid, dtype=np.int64), np.asarray(ax, dtype=float),
                        np.asarray(ay, dtype=float), np.asarray(bx, dtype=float),
                        np.asarray(by, dtype=float), np.asarray(r, dtype=float),
-                       np.asarray(lc, dtype=float)))
+                       np.asarray(lc, dtype=float)), rows, {})
         pcb_data._foreign_hole_cap_cache = cache
     return cache[1]
 
 
+def _hole_rule_pad_hole_values(pcb_data, hr, layer):
+    """#1853: per row of `_foreign_hole_capsules`, the board's hole_clearance
+    rule between another net's track on `layer` and that hole (NaN where no
+    rule binds it). Cached with the capsules, per rule set and layer."""
+    _foreign_hole_capsules(pcb_data)
+    _sig, _arrays, rows, memo = pcb_data._foreign_hole_cap_cache
+    got = memo.get((id(hr), layer))
+    if got is None or got[0] is not hr:
+        vals = [hr.pad_value(pad, layer) for pad in rows]
+        got = memo[(id(hr), layer)] = (hr, np.asarray(
+            [math.nan if v is None else v for v in vals], dtype=float))
+    return got[1]
+
+
 def _seg_foreign_hole_dist(pcb_data, net_id, x1, y1, x2, y2,
-                           base_clearance=None):
+                           base_clearance=None, config=None, layer=None):
     """Min edge distance from a segment to any OTHER-net NPTH drill hole (the
     hole analogue of _seg_foreign_via_dist). Exact segment-to-capsule distance
     minus the hole radius; a negative result (segment over the hole) is returned
@@ -1363,7 +1378,11 @@ def _seg_foreign_hole_dist(pcb_data, net_id, x1, y1, x2, y2,
     returned number stays directly comparable against the flat floor while
     honoring check_drc's per-hole `max(npth_clr, lc)`. Omitted (the default)
     keeps every existing caller bit-identical, so the sites #617 deliberately
-    left flat stay flat."""
+    left flat stay flat.
+
+    #1853: with `config` carrying the board's hole_clearance rules and the
+    track's `layer`, a hole a rule binds there is held at the larger of that
+    rule and its own override, the same excess over `base_clearance`."""
     nid, hax, hay, hbx, hby, hr, hlc = _foreign_hole_capsules(pcb_data)
     if nid.size == 0:
         return 1e9
@@ -1377,7 +1396,11 @@ def _seg_foreign_hole_dist(pcb_data, net_id, x1, y1, x2, y2,
     ax, ay, bx, by, rr = hax[near], hay[near], hbx[near], hby[near], hr[near]
     d = _seg_capsule_axis_dist(x1, y1, x2, y2, ax, ay, bx, by) - rr
     if base_clearance is not None:
-        d = d - np.maximum(0.0, hlc[near] - base_clearance)
+        floor = hlc[near]
+        rules = getattr(config, 'hole_rules', None) if config is not None else None
+        if rules is not None and layer is not None:
+            floor = np.fmax(floor, _hole_rule_pad_hole_values(pcb_data, rules, layer)[near])
+        d = d - np.maximum(0.0, floor - base_clearance)
     return float(np.min(d))
 
 

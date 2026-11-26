@@ -43,8 +43,8 @@ TEST = os.path.join(ROOT, 'tests/test_760_hole_local_clearance.py')
 
 ROWS = [
   ('distance-fn-ignores-the-override', SER,
-   "        d = d - np.maximum(0.0, hlc[near] - base_clearance)",
-   "        d = d - 0.0 * np.maximum(0.0, hlc[near] - base_clearance)"),
+   "        floor = hlc[near]\n",
+   "        floor = 0.0 * hlc[near]\n"),
   ('detector-drops-the-excess', PCM,
    "            d = d - hex_[None, :]  # #760 per-hole local_clearance excess",
    "            d = d - 0.0 * hex_[None, :]"),

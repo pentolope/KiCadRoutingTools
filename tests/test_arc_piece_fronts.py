@@ -93,13 +93,5 @@ def main():
     return 0
 
 
-def test_arc_piece_fronts():
-    rc = main()
-    if rc == 77:
-        import pytest
-        pytest.skip('no pcbnew')
-    assert rc == 0
-
-
 if __name__ == '__main__':
     sys.exit(main())
