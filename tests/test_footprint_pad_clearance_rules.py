@@ -33,8 +33,9 @@ Checks:
      goes round it 0.6 mm off, on F.Cu closer; kicad-cli clean on both;
   7. route_diff, qfn_csi_underpad_diff (test_1526's staging): a rule holding
      a pair's partner pad on J1 off its partner's track, by the part and by
-     the pad type; the run names it and kicad-cli finds no row of it (the
-     pair price for the partner's pad stood in for the pad's own);
+     the pad type; the run names it, reports CSI_D0 deferred to single-ended,
+     and kicad-cli finds no row of it (the pair price for the partner's pad
+     stood in for the pad's own);
   8. a custom (polygon) pad is priced by the rule naming its part.
 
     python3 tests/test_footprint_pad_clearance_rules.py
@@ -295,13 +296,18 @@ def pair(cli, td):
                 "(A.NetName == 'CSI_D0_P' && B.NetName == 'CSI_D0_N'))\"))\n")
         sub = os.path.join(td, 'pair_' + label.replace(' ', '_'))
         os.makedirs(sub)
-        log, _pairs, out = t1526.route(sub, 'p', rule)
-        line = next((ln for ln in log.splitlines() if ln.startswith('JSON_SUMMARY: ')), None)
+        log, pairs, out = t1526.route(sub, 'p', rule)
+        line = next((ln for ln in reversed(log.splitlines())
+                     if ln.startswith('JSON_SUMMARY: ')), None)
         if line is None:
             raise AssertionError('BROKEN TEST: route_diff printed no JSON_SUMMARY')
         doc = json.loads(line[len('JSON_SUMMARY: '):])
         ok(name in ((doc.get('design_rules') or {}).get('scoped_clearance') or {}).get('rules', []),
            f'{label}: the run names the rule')
+        ok('CSI_D0' in (doc.get('single_ended_diff_pairs') or [])
+           and (pairs.get('CSI_D0') or (None,))[0] == 'deferred',
+           f'{label}: the run reports CSI_D0, which the rule keeps from coupling, as '
+           f'deferred to single-ended', (doc.get('single_ended_diff_pairs'), pairs))
         rows = [d for d, _i in clearance_rows(cli, out) if name in d]
         ok(not rows, f'{label}: kicad-cli finds no row of it', rows)
 
