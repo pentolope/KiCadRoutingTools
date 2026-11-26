@@ -5,9 +5,11 @@ another track's vertex or centreline); no piece is shorter than
 MIN_TRACK_FRAGMENT unless it enters a pad or a via; every corner turns by
 0, 45 or 90 degrees, except on the net's own pad. `legalize_track_geometry`
 repairs a board towards that by re-laying short runs of a track chain as
-octolinear paths that clear foreign copper at the smoother's rules, removes
-dangling dead ends, and keeps a net's edit only when the net is no less
-connected. Locked, sense-held and read-only copper is never touched.
+octolinear paths that clear foreign copper at the smoother's rules and grow
+no foreign pour's carve, and keeps a net's edit only when the net is no
+less connected. Locked, sense-held, arc and read-only copper is never
+touched. The work is bounded by counts: a window search per defect, and a
+number of edits per chain proportional to its length.
 """
 
 import math
@@ -111,10 +113,10 @@ def _split_offsets(total):
     return out
 
 
-def octolinear_paths(A, B):
+def octolinear_paths(A, B, z_paths=True):
     """Candidate octolinear polylines from A to B: the straight run, the two
-    diagonal+axis elbows, the two axis+axis elbows, and Z paths whose middle
-    leg sits at a few offsets along the run."""
+    diagonal+axis elbows, the two axis+axis elbows, and (`z_paths`) Z paths
+    whose middle leg sits at a few offsets along the run."""
     dx, dy = B[0] - A[0], B[1] - A[1]
     if math.hypot(dx, dy) < _EPS:
         return []
@@ -127,6 +129,8 @@ def octolinear_paths(A, B):
            [A, (B[0] - sx * m, B[1] - sy * m), B],
            [A, (B[0], A[1]), B],
            [A, (A[0], B[1]), B]]
+    if not z_paths:
+        return [[_snap(p) for p in path] for path in out]
     rest = abs(ax - ay)
     along_x = ax > ay
     for a in _split_offsets(rest):
@@ -145,43 +149,118 @@ def octolinear_paths(A, B):
     return [[_snap(p) for p in path] for path in out]
 
 
-class _NetLayer:
-    """One net's tracks on one layer, with what anchors them."""
+_CELL = 1.0
 
-    def __init__(self, board, net_id, layer, segs, vias, pads, copper_layers):
+
+def _cells(x0, y0, x1, y1):
+    for cx in range(int(math.floor(x0 / _CELL)), int(math.floor(x1 / _CELL)) + 1):
+        for cy in range(int(math.floor(y0 / _CELL)), int(math.floor(y1 / _CELL)) + 1):
+            yield (cx, cy)
+
+
+class _Grid:
+    """Items bucketed by bounding box, for near-point and near-segment queries."""
+
+    def __init__(self):
+        self.cells = defaultdict(dict)
+        self.where = {}
+
+    def add(self, obj, box):
+        cs = list(_cells(*box))
+        self.where[id(obj)] = cs
+        for c in cs:
+            self.cells[c][id(obj)] = obj
+
+    def remove(self, obj):
+        for c in self.where.pop(id(obj), ()):
+            self.cells[c].pop(id(obj), None)
+
+    def near(self, x0, y0, x1, y1):
+        seen = {}
+        for c in _cells(x0, y0, x1, y1):
+            seen.update(self.cells.get(c, {}))
+        return list(seen.values())
+
+
+def _seg_box(s, grow=0.0):
+    r = s.width / 2.0 + grow
+    return (min(s.start_x, s.end_x) - r, min(s.start_y, s.end_y) - r,
+            max(s.start_x, s.end_x) + r, max(s.start_y, s.end_y) + r)
+
+
+class _NetLayer:
+    """One net's tracks on one layer, with what anchors them; edited in place."""
+
+    def __init__(self, net_id, layer, segs, vias, pads, copper_layers):
         from connectivity import via_copper_layers
-        self.board, self.net_id, self.layer = board, net_id, layer
-        self.segs = segs
-        self.vias = [v for v in vias
-                     if layer in via_copper_layers(v, copper_layers)]
+        self.net_id, self.layer = net_id, layer
+        self.vias = [v for v in vias if layer in via_copper_layers(v, copper_layers)]
         self.via_keys = {_key(v.x, v.y): v for v in self.vias}
         self.pads = [p for p in pads
                      if layer in p.layers or any('*' in L for L in p.layers)]
+        self.pad_grid = _Grid()
+        for pd in self.pads:
+            r = math.hypot(pd.size_x, pd.size_y) / 2.0
+            self.pad_grid.add(pd, (pd.global_x - r, pd.global_y - r,
+                                   pd.global_x + r, pd.global_y + r))
+        self.seg_grid = _Grid()
+        self.segs = {}
         self.adj = defaultdict(list)
-        for s in segs:
-            self.adj[_key(s.start_x, s.start_y)].append(s)
-            self.adj[_key(s.end_x, s.end_y)].append(s)
         self._inside = {}
-        self._custody = None
+        self._reached = {}
+        self.custody_map = defaultdict(set)
+        for s in segs:
+            self._add(s)
+
+    # -- incremental edits -------------------------------------------------
+    def _touch(self, k):
+        for oid in self._reached.pop(k, ()):
+            self.custody_map[oid].discard(k)
+
+    def _add(self, s):
+        self.segs[id(s)] = s
+        self.seg_grid.add(s, _seg_box(s))
+        for k in (_key(s.start_x, s.start_y), _key(s.end_x, s.end_y)):
+            self._touch(k)
+            self.adj[k].append(s)
+
+    def _drop(self, s):
+        self.segs.pop(id(s), None)
+        self.seg_grid.remove(s)
+        for k in (_key(s.start_x, s.start_y), _key(s.end_x, s.end_y)):
+            self._touch(k)
+            lst = [t for t in self.adj.get(k, ()) if t is not s]
+            if lst:
+                self.adj[k] = lst
+            else:
+                self.adj.pop(k, None)
+
+    def apply(self, old, new):
+        for s in old:
+            self._drop(s)
+        for s in new:
+            self._add(s)
+
+    # -- geometry queries --------------------------------------------------
+    def near_pads(self, p, r):
+        return self.pad_grid.near(p[0] - r, p[1] - r, p[0] + r, p[1] + r)
+
+    def near_segs(self, p, r):
+        return self.seg_grid.near(p[0] - r, p[1] - r, p[0] + r, p[1] + r)
 
     def inside_pad(self, p):
         k = _key(*p)
         hit = self._inside.get(k)
         if hit is None:
             from check_drc import point_to_pad_distance
-            hit = any(abs(p[0] - pd.global_x) <= max(pd.size_x, pd.size_y)
-                      and abs(p[1] - pd.global_y) <= max(pd.size_x, pd.size_y)
-                      and point_to_pad_distance(p[0], p[1], pd) <= _EPS
-                      for pd in self.pads)
+            hit = any(point_to_pad_distance(p[0], p[1], pd) <= _EPS
+                      for pd in self.near_pads(p, 0.0))
             self._inside[k] = hit
         return hit
 
     def _pads_reaching(self, p, w):
         from check_drc import point_to_pad_distance
-        for pd in self.pads:
-            r = max(pd.size_x, pd.size_y) + w
-            if abs(p[0] - pd.global_x) > r or abs(p[1] - pd.global_y) > r:
-                continue
+        for pd in self.near_pads(p, w):
             if point_to_pad_distance(p[0], p[1], pd) <= w / 2.0:
                 yield pd
 
@@ -196,18 +275,20 @@ class _NetLayer:
                 if math.hypot(p[0] - v.x, p[1] - v.y) <= v.size / 2.0 + w / 2.0}
 
     def reached(self, k):
-        p = (k[0] / 1e6, k[1] / 1e6)
-        w = max(s.width for s in self.adj[k])
-        return self.pads_reached(p, w) | self.vias_reached(p, w)
+        got = self._reached.get(k)
+        if got is None:
+            p = (k[0] / 1e6, k[1] / 1e6)
+            w = max(s.width for s in self.adj[k])
+            got = self._reached[k] = self.pads_reached(p, w) | self.vias_reached(p, w)
+            for oid in got:
+                self.custody_map[oid].add(k)
+        return got
 
     def custody(self):
         """pad or via id -> the vertex keys whose caps reach it."""
-        if self._custody is None:
-            self._custody = defaultdict(set)
-            for k in self.adj:
-                for oid in self.reached(k):
-                    self._custody[oid].add(k)
-        return self._custody
+        for k in list(self.adj):
+            self.reached(k)
+        return self.custody_map
 
     def reaches_via(self, p, w):
         for v in self.vias:
@@ -221,7 +302,7 @@ class _NetLayer:
 
     def body_host(self, p, exclude):
         """A same-net segment whose centreline passes within half its width of p."""
-        for o in self.segs:
+        for o in self.near_segs(p, 0.0):
             if o is exclude:
                 continue
             if _pt_seg(p[0], p[1], o.start_x, o.start_y, o.end_x, o.end_y) <= o.width / 2.0:
@@ -250,7 +331,7 @@ class _NetLayer:
         if self.in_via_disc(p):
             return None
         ex = {id(x) for x in exclude}
-        for o in self.segs:
+        for o in self.near_segs(p, 0.0):
             if o is seg or id(o) in ex:
                 continue
             a, b = (o.start_x, o.start_y), (o.end_x, o.end_y)
@@ -262,13 +343,15 @@ class _NetLayer:
             return [fwd, (2 * p[0] - fwd[0], 2 * p[1] - fwd[1])]
         return None
 
-    def anchor(self, k):
-        if len(self.adj.get(k, ())) != 2 or k in self.via_keys:
+    def anchor(self, k, widths=True):
+        ss = self.adj.get(k, ())
+        if len(ss) != 2 or k in self.via_keys or (widths and ss[0].width != ss[1].width):
             return True
-        custody = self.custody()
+        custody = self.custody_map
         return any(len(custody[oid]) == 1 for oid in self.reached(k))
 
     def chains(self):
+        self.custody()
         seen = set()
         out = []
         for k0 in list(self.adj):
@@ -315,62 +398,139 @@ class _Editor:
         self.added = {}
         self.removed = {}
         self.copper_layers = list(getattr(board.board_info, 'copper_layers', None) or ())
+        self.by_nl = defaultdict(list)
+        for s in board.segments:
+            self.by_nl[(s.net_id, s.layer)].append(s)
+        self.vias_by_net = defaultdict(list)
+        for v in board.vias:
+            self.vias_by_net[v.net_id].append(v)
+        self._copper = None
+        self.gone = {}               # id -> segment: held, so no id is reused
+        self.fresh = []
+        self._pours = {}
 
     def editable(self, s):
         return (id(s) not in self.readonly_ids and not is_immutable_copper(s)
-                and not getattr(s, 'graphic', False))
+                and not getattr(s, 'graphic', False) and not getattr(s, 'arc', False))
 
     def view(self, net_id, layer):
-        segs = [s for s in self.board.segments
-                if s.net_id == net_id and s.layer == layer]
-        vias = [v for v in self.board.vias if v.net_id == net_id]
-        pads = self.board.pads_by_net.get(net_id, [])
-        return _NetLayer(self.board, net_id, layer, segs, vias, pads,
-                         self.copper_layers)
+        segs = [s for s in self.by_nl.get((net_id, layer), ()) if id(s) not in self.gone]
+        return _NetLayer(net_id, layer, segs, self.vias_by_net.get(net_id, []),
+                         self.board.pads_by_net.get(net_id, []), self.copper_layers)
 
-    def replace(self, old, new_pts, width, layer, net_id):
+    def sync(self):
+        """Fold the edits into board.segments (the clearance probe reads it)."""
+        if self.gone or self.fresh:
+            self.board.segments = [s for s in self.board.segments
+                                   if id(s) not in self.gone] + self.fresh
+            for s in self.fresh:
+                self.by_nl[(s.net_id, s.layer)].append(s)
+            if self._copper is not None:
+                for s in self.gone.values():
+                    self._copper[s.layer].remove(s)
+                for s in self.fresh:
+                    self._copper[s.layer].add(s, _seg_box(s))
+            self.by_nl = defaultdict(list, {k: [s for s in v if id(s) not in self.gone]
+                                            for k, v in self.by_nl.items()})
+            self.gone, self.fresh = {}, []
+            self.board._foreign_seg_arr_cache = None
+
+    def replace(self, nl, old, new_pts, width):
         new = [Segment(start_x=a[0], start_y=a[1], end_x=b[0], end_y=b[1],
-                       width=width, layer=layer, net_id=net_id)
-               for a, b in zip(new_pts, new_pts[1:])
-               if math.hypot(b[0] - a[0], b[1] - a[1]) >= _EPS]
-        gone = {id(s) for s in old}
-        self.board.segments = [s for s in self.board.segments
-                               if id(s) not in gone] + new
+                       width=width, layer=nl.layer, net_id=nl.net_id)
+               for a, b in zip(new_pts, new_pts[1:])]
         for s in old:
+            self.gone[id(s)] = s
             if id(s) in self.added:
                 del self.added[id(s)]
             else:
                 self.removed[id(s)] = s
+        self.fresh = [s for s in self.fresh if id(s) not in self.gone]
+        self.fresh.extend(new)
         for s in new:
             self.added[id(s)] = s
-        if hasattr(self.board, '_foreign_seg_arr_cache'):
-            self.board._foreign_seg_arr_cache = None
+        nl.apply(old, new)
         return new
+
+    def copper_near(self, layer, bounds, grow):
+        """(net, id, shape) of the copper on `layer` near `bounds`, each grown by
+        `grow`: tracks as committed (ed.sync), vias, pads."""
+        from shapely.geometry import LineString, Point, box as _box
+        if self._copper is None:
+            self._copper = defaultdict(_Grid)
+            for s in self.board.segments:
+                self._copper[s.layer].add(s, _seg_box(s))
+            for v in self.board.vias:
+                for L in self.copper_layers or ('F.Cu', 'B.Cu'):
+                    from connectivity import via_copper_layers
+                    if L in via_copper_layers(v, self.copper_layers):
+                        r = v.size / 2.0
+                        self._copper[L].add(v, (v.x - r, v.y - r, v.x + r, v.y + r))
+            for pads in self.board.pads_by_net.values():
+                for pd in pads:
+                    r = math.hypot(pd.size_x, pd.size_y) / 2.0
+                    for L in self.copper_layers or ('F.Cu', 'B.Cu'):
+                        if L in pd.layers or any('*' in x for x in pd.layers):
+                            self._copper[L].add(pd, (pd.global_x - r, pd.global_y - r,
+                                                     pd.global_x + r, pd.global_y + r))
+        out = []
+        for o in self._copper[layer].near(*bounds):
+            if hasattr(o, 'start_x'):
+                g = LineString([(o.start_x, o.start_y), (o.end_x, o.end_y)]).buffer(o.width / 2.0 + grow)
+            elif hasattr(o, 'drill') and hasattr(o, 'size') and not hasattr(o, 'size_x'):
+                g = Point(o.x, o.y).buffer(o.size / 2.0 + grow)
+            else:
+                hx, hy = o.size_x / 2.0, o.size_y / 2.0
+                g = _box(o.global_x - hx, o.global_y - hy, o.global_x + hx, o.global_y + hy)
+                if getattr(o, 'rect_rotation', 0):
+                    from shapely import affinity
+                    g = affinity.rotate(g, -o.rect_rotation, origin=(o.global_x, o.global_y))
+                g = g.buffer(grow)
+            out.append((o.net_id, id(o), g))
+        return out
+
+    def pours(self, layer, net_id):
+        """Foreign pours on `layer`: (outline polygon, fill clearance)."""
+        if layer not in self._pours:
+            from shapely.geometry import Polygon
+            rows = []
+            for z in getattr(self.board, 'zones', None) or ():
+                if z.layer != layer or not z.net_id or len(z.polygon) < 3:
+                    continue
+                poly = Polygon(z.polygon)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                clr = z.clearance if z.clearance is not None else \
+                    getattr(self.config, 'clearance', 0.0) or 0.0
+                rows.append((z.net_id, poly, clr))
+            self._pours[layer] = rows
+        return [(nid, p, c) for nid, p, c in self._pours[layer] if nid != net_id]
 
 
 def _pinned(nl, segs):
-    """Chain segments another same-net track touches away from their ends
-    (pads and vias are held by _keeps_custody)."""
+    """Chain segments another same-net track's end lands on away from their
+    own ends, or that another same-net track crosses (pads and vias are held
+    by _keeps_custody)."""
+    from geometry_utils import segments_intersect
     pinned = set()
     mine = {id(s) for s in segs}
-    others = [o for o in nl.segs if id(o) not in mine]
+    ends = [(segs[0].start_x, segs[0].start_y), (segs[0].end_x, segs[0].end_y),
+            (segs[-1].start_x, segs[-1].start_y), (segs[-1].end_x, segs[-1].end_y)]
     for s in segs:
         a, b = (s.start_x, s.start_y), (s.end_x, s.end_y)
         ka, kb = _key(*a), _key(*b)
-        for o in others:
-            if o is s:
+        box = _seg_box(s, 0.5)
+        for o in nl.seg_grid.near(*box):
+            if id(o) in mine:
                 continue
-            for p in ((o.start_x, o.start_y), (o.end_x, o.end_y)):
-                kp = _key(*p)
-                if kp in (ka, kb):
-                    continue
-                if _pt_seg(p[0], p[1], *a, *b) <= s.width / 2.0 + _EPS:
-                    pinned.add(id(s))
-                    break
-            if id(s) in pinned:
-                break
-            from geometry_utils import segments_intersect
             oa, ob = (o.start_x, o.start_y), (o.end_x, o.end_y)
+            # the track a chain end lands on is the chain's own anchor
+            if any(_pt_seg(e[0], e[1], *oa, *ob) <= o.width / 2.0 + _EPS for e in ends):
+                continue
+            if any(_key(*p) not in (ka, kb) and
+                   _pt_seg(p[0], p[1], *a, *b) <= (s.width + o.width) / 2.0 for p in (oa, ob)):
+                pinned.add(id(s))
+                break
             if (_key(*oa) not in (ka, kb) and _key(*ob) not in (ka, kb)
                     and segments_intersect(*a, *b, *oa, *ob)):
                 pinned.add(id(s))
@@ -468,7 +628,7 @@ def _enters_early(nl, target, others):
             return True
     if nl.inside_pad(target):
         from check_drc import point_to_pad_distance
-        for pd in nl.pads:
+        for pd in nl.near_pads(target, 0.0):
             if point_to_pad_distance(target[0], target[1], pd) <= _EPS and \
                     any(point_to_pad_distance(p[0], p[1], pd) <= _EPS for p in others):
                 return True
@@ -496,7 +656,9 @@ def _body_reached(nl, a, b, w):
            if _pt_seg(v.x, v.y, *a, *b) <= v.size / 2.0 + w / 2.0}
     L = math.hypot(b[0] - a[0], b[1] - a[1])
     n = max(1, int(L / 0.025) + 1)
-    for pd in nl.pads:
+    r0 = w / 2.0
+    for pd in nl.pad_grid.near(min(a[0], b[0]) - r0, min(a[1], b[1]) - r0,
+                               max(a[0], b[0]) + r0, max(a[1], b[1]) + r0):
         r = max(pd.size_x, pd.size_y) + w
         if _pt_seg(pd.global_x, pd.global_y, *a, *b) > r:
             continue
@@ -548,43 +710,118 @@ def _clears_path(nl, ed, segs, i, j, path, width):
     return True
 
 
-_MAX_WINDOW = 40
+def _splits_pours(ed, nl, old, path, width):
+    """Would the new copper split a foreign pour where the copper it replaces
+    did not? The pass runs after the plane finalize, so nothing after it
+    would rejoin a pour it cut. Judged on the pour's fill model around the
+    edit (the outline less every other net's copper at the pour's
+    clearance): the fill pieces there may not grow in number."""
+    pours = ed.pours(nl.layer, nl.net_id)
+    if not pours:
+        return False
+    from shapely.geometry import LineString, box as _box
+    from shapely.ops import unary_union
+    xs = [p[0] for p in path]
+    ys = [p[1] for p in path]
+    for zone_net, poly, clr in pours:
+        bx0, by0, bx1, by1 = poly.bounds
+        r = width / 2.0 + clr
+        if max(xs) + r < bx0 or min(xs) - r > bx1 or max(ys) + r < by0 or min(ys) - r > by1:
+            continue
+        new = LineString(path).buffer(width / 2.0 + clr)
+        was = unary_union([LineString([(s.start_x, s.start_y), (s.end_x, s.end_y)])
+                           .buffer(s.width / 2.0 + clr + _POUR_SLACK) for s in old])
+        grown = new.difference(was).intersection(poly)
+        if grown.area <= _POUR_AREA:
+            continue
+        x0, y0, x1, y1 = grown.bounds
+        win = _box(x0 - _POUR_WINDOW, y0 - _POUR_WINDOW, x1 + _POUR_WINDOW, y1 + _POUR_WINDOW)
+        mine = {id(s) for s in old}
+        blocks = [g for nid, oid, g in ed.copper_near(nl.layer, win.bounds, clr)
+                  if nid != zone_net and oid not in mine]
+        region = poly.intersection(win)
+        rest = unary_union(blocks) if blocks else None
+
+        def pieces(carve):
+            fill = region.difference(carve if rest is None else rest.union(carve))
+            return sum(1 for g in getattr(fill, 'geoms', [fill])
+                       if not g.is_empty and g.area > _POUR_AREA)
+        if pieces(new) > pieces(was):
+            return True
+    return False
+
+
+_POUR_WINDOW = 0.3
+_POUR_SLACK = 0.001
+_POUR_AREA = 1e-6
+
+
+def _clears_path(nl, ed, segs, i, j, path, width):
+    old = {(_key(s.start_x, s.start_y), _key(s.end_x, s.end_y)): s.width
+           for s in segs[i:j]}
+    for a, b in zip(path, path[1:]):
+        ka, kb = _key(*a), _key(*b)
+        was = old.get((ka, kb), old.get((kb, ka)))
+        if was is not None and was >= width:
+            continue
+        if not ed.clears(a[0], a[1], b[0], b[1], nl.layer, nl.net_id, width):
+            return False
+    return True
+
+
+_MAX_WINDOW = 8
+_MAX_EVALS = 1000
+_MAX_TARGETS = 6
 _LOCAL_WINDOW = 6
-_GLOBAL_PROBES = 30
-_LOCAL_PROBES = 60
+_GLOBAL_PROBES = 12
+_LOCAL_PROBES = 24
+_POUR_PROBES = 4
 
 
 def _try_windows(nl, ed, pts, segs, lo, hi, pinned, start_targets=None,
                  end_targets=None, bound=None):
     """Re-lay a window [i, j] around pts[lo..hi] with an octolinear path the
-    gate's rules allow and that clears foreign copper. First the paths that
-    leave the chain fewest defects, straying least from the copper they
-    replace; failing those, windows of a few segments around the defect,
-    fewest defects left first. Returns the new segments or None."""
+    gate's rules allow, that clears foreign copper and grows no foreign
+    pour's carve. First the paths that leave the chain fewest defects,
+    straying least from the copper they replace; failing those, windows of
+    a few segments around the defect, fewest defects left first. At most
+    _MAX_WINDOW segments either side and _MAX_EVALS paths are weighed.
+    Returns (i, j, path, new segments) or None."""
     n = len(segs)
     bad = [0] * (2 * n + 1)          # leg k at 2k+1, vertex k at 2k
-    for k in range(n):
+    for k in range(max(0, lo - _MAX_WINDOW - 1), min(n, hi + _MAX_WINDOW + 1)):
         a, b = pts[k], pts[k + 1]
         bad[2 * k + 1] = int(math.hypot(b[0] - a[0], b[1] - a[1])
                              < MIN_TRACK_FRAGMENT - _EPS and not nl.entry(a, b))
-    for k in range(1, n):
-        bad[2 * k] = int(not nl.inside_pad(pts[k]) and
-                         not legal_turn(turn(pts[k], pts[k - 1], pts[k + 1])))
+        if k:
+            bad[2 * k] = int(not nl.inside_pad(pts[k]) and
+                             not legal_turn(turn(pts[k], pts[k - 1], pts[k + 1])))
     cum = [0]
     for v in bad:
         cum.append(cum[-1] + v)
     cands = []
-    for i in range(max(0, lo - _MAX_WINDOW), lo + 1):
-        for j in range(max(hi, i + 1), min(n, i + _MAX_WINDOW) + 1):
+    evals = 0
+    q0, q1 = max(0, lo - _MAX_WINDOW), min(n, hi + _MAX_WINDOW)
+    # another chain's edit may have landed on a vertex of this one
+    held = {q for q in range(q0 + 1, q1) if nl.anchor(_key(*pts[q]))}
+    for span in range(max(1, hi - lo), 2 * _MAX_WINDOW + hi - lo + 1):
+        for i in range(max(0, hi - span), lo + 1):
+            j = i + span
+            if j < hi or j > n or i < lo - _MAX_WINDOW or j > hi + _MAX_WINDOW:
+                continue
             window = segs[i:j]
             if any(not ed.editable(s) or id(s) in pinned for s in window):
                 continue
-            starts = list(start_targets) if (i == 0 and start_targets) else [pts[i]]
-            ends = list(end_targets) if (j == n and end_targets) else [pts[j]]
+            if any(i < q < j for q in held):
+                continue
+            starts = list(start_targets)[:_MAX_TARGETS] if (i == 0 and start_targets) else [pts[i]]
+            ends = list(end_targets)[:_MAX_TARGETS] if (j == n and end_targets) else [pts[j]]
             for A in starts:
                 for B in ends:
                     so, eo = A is not pts[i], B is not pts[j]
-                    for path in octolinear_paths(_snap(A), _snap(B)):
+                    near = i >= lo - _LOCAL_WINDOW and j <= hi + _LOCAL_WINDOW
+                    for path in octolinear_paths(_snap(A), _snap(B), z_paths=near):
+                        evals += 1
                         entries = _window_geometry(nl, pts, segs, i, j, path, so, eo)
                         if entries is None:
                             continue
@@ -596,10 +833,16 @@ def _try_windows(nl, ed, pts, segs, lo, hi, pinned, start_targets=None,
                         cands.append((left + tilted, entries,
                                       round(_deviation(path, pts[i:j + 1]), 6),
                                       int(so) + int(eo), j - i, i, j, path))
+            if evals >= _MAX_EVALS:
+                break
+        if evals >= _MAX_EVALS:
+            break
+    ed.stats['paths_weighed'] += evals
     local = [c for c in cands if c[5] >= lo - _LOCAL_WINDOW and c[6] <= hi + _LOCAL_WINDOW]
     cands.sort(key=lambda c: (c[0], c[2], c[3], c[1], c[4]))
     local.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4]))
     tried = set()
+    pour_checks = 0
     for c in cands[:_GLOBAL_PROBES] + local[:_LOCAL_PROBES]:
         i, j, path = c[5], c[6], c[7]
         sig = (i, j, tuple(path))
@@ -610,7 +853,13 @@ def _try_windows(nl, ed, pts, segs, lo, hi, pinned, start_targets=None,
         width = max(s.width for s in window)
         if _keeps_custody(nl, pts, segs, i, j, path, width) and \
                 _clears_path(nl, ed, segs, i, j, path, width):
-            return ed.replace(window, path, width, nl.layer, nl.net_id)
+            if pour_checks >= _POUR_PROBES:
+                continue
+            pour_checks += 1
+            if _splits_pours(ed, nl, window, path, width):
+                ed.stats['pour_refused'] += 1
+                continue
+            return i, j, path, ed.replace(nl, window, path, width)
     return None
 
 
@@ -634,7 +883,7 @@ def _end_targets(nl, p, seg):
                     out.append(q)
                     break
     if not out and not nl.supported(p, seg):
-        for o in nl.segs:
+        for o in nl.near_segs(p, w):
             if o is seg:
                 continue
             a, b = (o.start_x, o.start_y), (o.end_x, o.end_y)
@@ -694,139 +943,150 @@ def _tee_slides(nl, pts, segs):
     return out
 
 
-def _repair_net_layer(ed, net_id, layer):
-    failed = set()
-    for _round in range(2000):
-        nl = ed.view(net_id, layer)
-        progress = False
-        for pts, segs in nl.chains():
-            n = len(segs)
-            if not any(ed.editable(s) for s in segs):
-                continue
-            pinned = None
-            now = _residual(nl, pts)
-            for at_start in (True, False):
-                p = pts[0] if at_start else pts[-1]
-                seg = segs[0] if at_start else segs[-1]
-                if len(nl.adj.get(_key(*p), ())) != 1:
-                    continue
-                memo = ('end', _key(*p), _key(*nl.far(seg, _key(*p))))
-                if memo in failed:
-                    continue
-                targets = _end_targets(nl, p, seg)
-                if not targets:
-                    continue
-                if pinned is None:
-                    pinned = _pinned(nl, segs)
-                r_pts, r_segs = (pts[::-1], segs[::-1]) if at_start else (pts, segs)
-                if _try_windows(nl, ed, r_pts, r_segs, n, n, pinned,
-                                end_targets=targets, bound=now):
-                    ed.stats['ends_landed'] += 1
-                    progress = True
-                    break
-                failed.add(memo)
-            if progress:
-                break
-            defects = _chain_defects(nl, pts, segs)
-            for kind, k in defects:
-                memo = (kind, _key(*pts[k]), _key(*pts[min(k + 1, n)]))
-                if memo in failed:
-                    continue
-                if pinned is None:
-                    pinned = _pinned(nl, segs)
-                lo, hi = (k, k + 1) if kind == 'leg' else (k, k)
-                targets_s = _pad_slides(nl, pts, segs) or _tee_slides(nl, pts, segs)
-                targets_e = (_pad_slides(nl, pts[::-1], segs[::-1])
-                             or _tee_slides(nl, pts[::-1], segs[::-1]))
-                at_anchor = kind == 'vertex' and k in (0, n)
-                if _try_windows(nl, ed, pts, segs, lo, hi, pinned,
-                                start_targets=targets_s, end_targets=targets_e,
-                                bound=now if at_anchor else now - 1):
-                    ed.stats['legs_relaid' if kind == 'leg' else 'corners_relaid'] += 1
-                    progress = True
-                    break
-                failed.add(memo)
-            if progress:
-                break
-        if not progress:
+def _repair_chain(ed, nl, pts, segs, failed):
+    """Repair one chain in place; at most a number of edits proportional to
+    its length. `failed` holds the defects no window fixed, across sweeps."""
+    budget = 2 * len(segs) + 8
+    while budget > 0 and segs:
+        budget -= 1
+        n = len(segs)
+        if not any(ed.editable(s) for s in segs):
             return
-
-
-def _merge_collinear(ed, net_id, layer):
-    merged = 0
-    while True:
-        nl = ed.view(net_id, layer)
+        pinned = None
+        now = _residual(nl, pts)
         done = False
-        for k, ss in list(nl.adj.items()):
-            if len(ss) != 2 or nl.anchor(k):
-                continue
-            s1, s2 = ss
-            if not (ed.editable(s1) and ed.editable(s2)):
-                continue
-            a, c = nl.far(s1, k), nl.far(s2, k)
-            p = (k[0] / 1e6, k[1] / 1e6)
-            if _key(*a) == _key(*c):
-                continue
-            if (p[0] - a[0]) * (c[0] - p[0]) + (p[1] - a[1]) * (c[1] - p[1]) <= 0:
-                continue
-            dev = _pt_seg(p[0], p[1], *a, *c)
-            if dev > _MERGE_DEVIATION:
-                continue
-            width = s1.width
-            if s1.width != s2.width:
-                # a width step shorter than a track piece may be takes the
-                # width of the piece it steps from
-                l1 = math.hypot(p[0] - a[0], p[1] - a[1])
-                l2 = math.hypot(p[0] - c[0], p[1] - c[1])
-                short = min(l1, l2)
-                if short >= MIN_TRACK_FRAGMENT - _EPS or nl.entry(*((a, p) if l1 < l2 else (p, c))):
-                    continue
-                width = s1.width if l1 > l2 else s2.width
-            if dev > _EPS or width > min(s1.width, s2.width):
-                if not ed.clears(a[0], a[1], c[0], c[1], layer, net_id, width):
-                    continue
-                if any(not joint_ok(e, nl.legs_at(_key(*e), exclude=(s1, s2)) + [f])
-                       for e, f in ((a, c), (c, a))
-                       if not nl.inside_pad(e)
-                       and len(nl.legs_at(_key(*e), exclude=(s1, s2))) >= 1):
-                    continue
-            ed.replace([s1, s2], [a, c], width, layer, net_id)
-            merged += 1
-            done = True
-            break
-        if not done:
-            return merged
-
-
-def _in_own_zone(board, net_id, layer, p):
-    from obstacle_map import point_in_polygon
-    return any(z.net_id == net_id and z.layer == layer and len(z.polygon) >= 3
-               and point_in_polygon(p[0], p[1], z.polygon)
-               for z in (getattr(board, 'zones', None) or ()))
-
-
-def _dangling_spurs(ed, net_id, layer):
-    """Unsupported lone ends no landing reached: the chain back to its anchor."""
-    nl = ed.view(net_id, layer)
-    spurs = []
-    for pts, segs in nl.chains():
         for at_start in (True, False):
             p = pts[0] if at_start else pts[-1]
             seg = segs[0] if at_start else segs[-1]
-            if len(nl.adj.get(_key(*p), ())) != 1 or nl.supported(p, seg):
+            if len(nl.adj.get(_key(*p), ())) != 1:
                 continue
-            if nl.reaches_pad(p, seg.width) or nl.reaches_via(p, seg.width):
+            memo = ('end', _key(*p), _key(*nl.far(seg, _key(*p))))
+            if memo in failed:
                 continue
-            if _in_own_zone(ed.board, net_id, layer, p):
+            targets = _end_targets(nl, p, seg)
+            if not targets:
                 continue
-            if not all(ed.editable(s) for s in segs):
+            if pinned is None:
+                pinned = _pinned(nl, segs)
+            r_pts, r_segs = (pts[::-1], segs[::-1]) if at_start else (pts, segs)
+            got = _try_windows(nl, ed, r_pts, r_segs, n, n, pinned,
+                               end_targets=targets, bound=now)
+            if got:
+                i, j, path, new = got
+                r_pts = r_pts[:i] + path + r_pts[j + 1:]
+                r_segs = r_segs[:i] + new + r_segs[j:]
+                pts, segs = (r_pts[::-1], r_segs[::-1]) if at_start else (r_pts, r_segs)
+                ed.stats['ends_landed'] += 1
+                done = True
+                break
+            failed.add(memo)
+        if done:
+            continue
+        for kind, k in _chain_defects(nl, pts, segs):
+            memo = (kind, _key(*pts[k]), _key(*pts[min(k + 1, n)]))
+            if memo in failed:
                 continue
-            far = pts[-1] if at_start else pts[0]
-            if len(nl.adj.get(_key(*far), ())) == 1 and not nl.supported(far, segs[-1 if at_start else 0]):
-                continue
-            spurs.append(segs)
+            if pinned is None:
+                pinned = _pinned(nl, segs)
+            lo, hi = (k, k + 1) if kind == 'leg' else (k, k)
+            targets_s = _pad_slides(nl, pts, segs) or _tee_slides(nl, pts, segs)
+            targets_e = (_pad_slides(nl, pts[::-1], segs[::-1])
+                         or _tee_slides(nl, pts[::-1], segs[::-1]))
+            at_anchor = kind == 'vertex' and k in (0, n)
+            got = _try_windows(nl, ed, pts, segs, lo, hi, pinned,
+                               start_targets=targets_s, end_targets=targets_e,
+                               bound=now if at_anchor else now - 1)
+            if got:
+                i, j, path, new = got
+                pts = pts[:i] + path + pts[j + 1:]
+                segs = segs[:i] + new + segs[j:]
+                ed.stats['legs_relaid' if kind == 'leg' else 'corners_relaid'] += 1
+                done = True
+                break
+            failed.add(memo)
+        if not done:
+            return
+
+
+_SWEEPS = 3
+
+
+def _repair_net_layer(ed, net_id, layer):
+    nl = ed.view(net_id, layer)
+    failed = set()
+    for _sweep in range(_SWEEPS):
+        edits = len(ed.added) + len(ed.removed)
+        for pts, segs in nl.chains():
+            _repair_chain(ed, nl, pts, segs, failed)
+        if len(ed.added) + len(ed.removed) == edits:
             break
-    return spurs
+    return nl
+
+
+def _tees_kept(nl, old, a, c, width):
+    """Does every other track end that reached the old pieces' copper still
+    reach the merged track's?"""
+    mine = {id(x) for x in old}
+    for s in old:
+        for o in nl.seg_grid.near(*_seg_box(s, 0.5)):
+            if id(o) in mine:
+                continue
+            for p in ((o.start_x, o.start_y), (o.end_x, o.end_y)):
+                if _pt_seg(p[0], p[1], s.start_x, s.start_y, s.end_x, s.end_y) <= \
+                        (s.width + o.width) / 2.0 and \
+                        _pt_seg(p[0], p[1], *a, *c) > (width + o.width) / 2.0:
+                    return False
+    return True
+
+
+def _merge_collinear(ed, nl):
+    merged = 0
+    todo = list(nl.adj)
+    while todo:
+        k = todo.pop()
+        ss = nl.adj.get(k, ())
+        if len(ss) != 2:
+            continue
+        s1, s2 = ss
+        if not (ed.editable(s1) and ed.editable(s2)) or k in nl.via_keys:
+            continue
+        if nl.anchor(k, widths=False):
+            continue
+        a, c = nl.far(s1, k), nl.far(s2, k)
+        p = (k[0] / 1e6, k[1] / 1e6)
+        if _key(*a) == _key(*c):
+            continue
+        if (p[0] - a[0]) * (c[0] - p[0]) + (p[1] - a[1]) * (c[1] - p[1]) <= 0:
+            continue
+        dev = _pt_seg(p[0], p[1], *a, *c)
+        if dev > _MERGE_DEVIATION:
+            continue
+        width = s1.width
+        if s1.width != s2.width:
+            # a width step shorter than a track piece may be takes the
+            # width of the piece it steps from
+            l1 = math.hypot(p[0] - a[0], p[1] - a[1])
+            l2 = math.hypot(p[0] - c[0], p[1] - c[1])
+            if min(l1, l2) >= MIN_TRACK_FRAGMENT - _EPS or \
+                    nl.entry(*((a, p) if l1 < l2 else (p, c))):
+                continue
+            width = s1.width if l1 > l2 else s2.width
+        if dev > _EPS or width > min(s1.width, s2.width):
+            if not ed.clears(a[0], a[1], c[0], c[1], nl.layer, nl.net_id, width):
+                continue
+            if any(not joint_ok(e, nl.legs_at(_key(*e), exclude=(s1, s2)) + [f])
+                   for e, f in ((a, c), (c, a))
+                   if not nl.inside_pad(e)
+                   and len(nl.legs_at(_key(*e), exclude=(s1, s2))) >= 1):
+                continue
+            if _splits_pours(ed, nl, [s1, s2], [a, c], width):
+                continue
+        if not _tees_kept(nl, [s1, s2], a, c, width):
+            continue
+        ed.replace(nl, [s1, s2], [a, c], width)
+        merged += 1
+        todo.extend((_key(*a), _key(*c)))
+    return merged
 
 
 def legalize_track_geometry(board, scope_net_ids, config, clears,
@@ -844,19 +1104,16 @@ def legalize_track_geometry(board, scope_net_ids, config, clears,
 
     def grade(nid):
         return check_net_connectivity(
-            nid, [s for s in board.segments if s.net_id == nid],
-            [v for v in board.vias if v.net_id == nid],
+            nid, [s for L in {k[1] for k in ed.by_nl if k[0] == nid}
+                  for s in ed.by_nl[(nid, L)] if id(s) not in ed.gone]
+            + [s for s in ed.fresh if s.net_id == nid],
+            ed.vias_by_net.get(nid, []),
             board.pads_by_net.get(nid, []), [], pcb_data=board)
 
     def worse(before, after):
         return ((before.get('connected') and not after.get('connected')) or
                 len(after.get('disconnected_pads') or []) > len(before.get('disconnected_pads') or []) or
                 (after.get('num_components') or 1) > (before.get('num_components') or 1))
-
-    def restore(segments, added, removed):
-        board.segments = segments
-        ed.added, ed.removed = added, removed
-        board._foreign_seg_arr_cache = None
 
     layers_of = defaultdict(set)
     for s in board.segments:
@@ -867,30 +1124,20 @@ def legalize_track_geometry(board, scope_net_ids, config, clears,
     board._foreign_seg_arr_trust = True
     try:
         for nid in sorted(layers_of):
-            snapshot = (list(board.segments), dict(ed.added), dict(ed.removed))
             before = grade(nid)
+            added0, removed0 = dict(ed.added), dict(ed.removed)
             for layer in sorted(layers_of[nid]):
-                _repair_net_layer(ed, nid, layer)
-                stats['collinear_merged'] += _merge_collinear(ed, nid, layer)
-            complete = before.get('connected') and not before.get('disconnected_pads')
-            for layer in sorted(layers_of[nid]) if complete else ():
-                for _round in range(50):
-                    spurs = _dangling_spurs(ed, nid, layer)
-                    if not spurs:
-                        break
-                    trial = (list(board.segments), dict(ed.added), dict(ed.removed))
-                    g0 = grade(nid)
-                    for chain in spurs:
-                        ed.replace(chain, [], 0, layer, nid)
-                    if worse(g0, grade(nid)):
-                        restore(*trial)
-                        break
-                    stats['spurs_removed'] += len(spurs)
+                nl = _repair_net_layer(ed, nid, layer)
+                stats['collinear_merged'] += _merge_collinear(ed, nl)
             if worse(before, grade(nid)):
-                restore(*snapshot)
+                # the net's edits are all still pending (ed.sync folds them
+                # in per net): dropping them restores the net
+                ed.gone, ed.fresh = {}, []
+                ed.added, ed.removed = added0, removed0
                 stats['nets_reverted'] += 1
-            elif set(ed.added) != set(snapshot[1]) or set(ed.removed) != set(snapshot[2]):
+            elif set(ed.added) != set(added0) or set(ed.removed) != set(removed0):
                 stats['nets'] += 1
+            ed.sync()
     finally:
         board._foreign_seg_arr_trust = trust
         board._foreign_seg_arr_cache = None
