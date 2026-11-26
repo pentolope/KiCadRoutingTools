@@ -4377,9 +4377,10 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
     (pad_escape.escape_launches): for each side whose probe was stuck
     (frontier exhausted below the probe limit) at one of the net's SMD pads,
     add the free cells an exact-clear stub reaches from the pad as terminals
-    of that side and route again. Returns _route_with_via_unblock's tuple with
-    the used stub as its segments (none when the retry ends on the original
-    terminals), or None when no escape exists or the retry fails."""
+    of that side and route again, within the probe budget. Returns (result,
+    iterations the retry spent): result is _route_with_via_unblock's tuple
+    with the used stub as its segments (none when the retry ends on the
+    original terminals), or None when no escape exists or the retry fails."""
     from pad_escape import escape_launches, stub_width
     stubs = {}
     new_sources, new_targets = list(sources), list(targets)
@@ -4401,21 +4402,25 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
                     stubs[cell] = segs
                     (new_sources if is_source else new_targets).append(cell)
     if not stubs:
-        return None
-    res = _route_main_connection(router, obstacles, config, new_sources,
-                                 new_targets, track_margin, pcb_data, net_id,
-                                 print_prefix, direction_labels,
-                                 single_direction, waypoints,
+        return None, 0
+    # Capped at the probe budget, as the via-in-pad retries are (a count,
+    # no #529 extension): a launch that opened the pad finds its way within
+    # it; one that did not fails fast.
+    res = _route_main_connection(router, obstacles,
+                                 replace(config, max_iterations=lim),
+                                 new_sources, new_targets, track_margin,
+                                 pcb_data, net_id, print_prefix,
+                                 direction_labels, single_direction, waypoints,
                                  pad_sources=pad_sources)
     path = res[0]
     if path is None:
-        return None
+        return None, res[1]
     used = []
     for end in (tuple(path[0][:3]), tuple(path[-1][:3])):
         if end in stubs:
             used.extend(stubs.pop(end))
     if not used:
-        return res + ([], [])       # routed between the original terminals
+        return res + ([], []), res[1]   # routed between the original terminals
     if not getattr(config, 'plan_probe', False):
         # Committed now, as the #189 unblock copper is (#803).
         _have = {id(sg) for sg in pcb_data.segments}
@@ -4428,7 +4433,7 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
         _nw = config.get_net_track_width(net_id, sg.layer)
         if sg.width < _nw - 1e-9:
             note_narrowing(net_id, 'track_width', _nw, sg.width, 'pad escape')
-    return res + ([], used)
+    return res + ([], used), res[1]
 
 
 def _route_with_via_unblock(router, obstacles, config, sources, targets, track_margin,
@@ -4462,12 +4467,14 @@ def _route_with_via_unblock(router, obstacles, config, sources, targets, track_m
 
     # A boxed pad whose exit the map closes but exact clearance leaves open
     # (pad_escape): retry with the exit's far cell as a terminal of that side.
-    _esc = _route_with_pad_escape(router, obstacles, config, sources, targets,
-                                  track_margin, pcb_data, net_id, print_prefix,
-                                  direction_labels, single_direction, waypoints,
-                                  pad_sources, fwd_i, bwd_i, lim, coord)
+    _esc, _esc_iters = _route_with_pad_escape(
+        router, obstacles, config, sources, targets, track_margin, pcb_data,
+        net_id, print_prefix, direction_labels, single_direction, waypoints,
+        pad_sources, fwd_i, bwd_i, lim, coord)
     if _esc is not None:
-        return _esc
+        return (_esc[0], res[1] + _esc_iters) + _esc[2:]
+    # the failed escape search is effort this connection spent
+    res = (res[0], res[1] + _esc_iters) + res[2:]
     if len(layer_names) < 2:
         return res + ([], [])
 
