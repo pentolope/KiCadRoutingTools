@@ -2294,6 +2294,7 @@ def _ship(src, dst):
 
 def main():
     from redo_record import record_invocation
+    from routing_defaults import VIA_COST
     record_invocation()  # stress-test redo manifest (#132); no-op unless REDO_MANIFEST set
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('input_file')
@@ -2327,7 +2328,7 @@ def main():
                          'passes may cross at 3.0. Not with --plane-layer-cost')
     ap.add_argument('--via-cost', type=_via_cost, default=None, metavar='N',
                     help='route.py\'s and route_diff.py\'s --via-cost for every route and '
-                         'diff-pair step (default: their own)')
+                         f'diff-pair step (default: their own, {VIA_COST})')
     ap.add_argument('--cap-net-classes', action='store_true',
                     help='cap every net class at the chain clearance on every step '
                          '(route.py --clearance-ceiling). Without it a net class '
