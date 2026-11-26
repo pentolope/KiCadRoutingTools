@@ -4369,6 +4369,67 @@ def _pending_now(pending_vias, placed):
     return out or None
 
 
+def _route_with_pad_escape(router, obstacles, config, sources, targets,
+                           track_margin, pcb_data, net_id, print_prefix,
+                           direction_labels, single_direction, waypoints,
+                           pad_sources, fwd_i, bwd_i, lim, coord):
+    """The same-layer exact escape rung of _route_with_via_unblock
+    (pad_escape.escape_launches): for each side whose probe was stuck
+    (frontier exhausted below the probe limit) at one of the net's SMD pads,
+    add the free cells an exact-clear stub reaches from the pad as terminals
+    of that side and route again. Returns _route_with_via_unblock's tuple with
+    the used stub as its segments (none when the retry ends on the original
+    terminals), or None when no escape exists or the retry fails."""
+    from pad_escape import escape_launches
+    from fab_tiers import may_narrow
+    if not may_narrow() and any(
+            config.get_net_track_width(net_id, l) > config.track_width + 1e-9
+            for l in config.layers):
+        # --escalation off: a wide net narrows only through the pad-entry
+        # neck (#1452), which measures from the pad, not from a launch cell
+        return None
+    stubs = {}
+    new_sources, new_targets = list(sources), list(targets)
+    for stuck, cells, is_source in ((bwd_i, targets, False),
+                                    (fwd_i, sources, True)):
+        if not stuck or stuck >= lim:
+            continue
+        for pad in _net_pads_near(pcb_data, net_id, cells, coord):
+            for li in sorted({c[2] for c in cells}):
+                if config.layers[li] not in pad.layers:
+                    continue
+                for cell, segs in escape_launches(obstacles, config, pcb_data,
+                                                  net_id, pad, li, cells, coord):
+                    if cell in stubs:
+                        continue
+                    stubs[cell] = segs
+                    (new_sources if is_source else new_targets).append(cell)
+    if not stubs:
+        return None
+    res = _route_main_connection(router, obstacles, config, new_sources,
+                                 new_targets, track_margin, pcb_data, net_id,
+                                 print_prefix, direction_labels,
+                                 single_direction, waypoints,
+                                 pad_sources=pad_sources)
+    path = res[0]
+    if path is None:
+        return None
+    used = []
+    for end in (tuple(path[0][:3]), tuple(path[-1][:3])):
+        if end in stubs:
+            used.extend(stubs.pop(end))
+    if not used:
+        return res + ([], [])       # routed between the original terminals
+    if not getattr(config, 'plan_probe', False):
+        # Committed now, as the #189 unblock copper is (#803).
+        _have = {id(sg) for sg in pcb_data.segments}
+        pcb_data.segments.extend(sg for sg in used if id(sg) not in _have)
+        pcb_data._copper_epoch = getattr(pcb_data, '_copper_epoch', 0) + 1
+    print(f"{print_prefix}{GREEN}Pad escape: {len(used)} exact-clear stub "
+          f"segment(s) out of a boxed pad{RESET}")
+    return res + ([], used)
+
+
 def _route_with_via_unblock(router, obstacles, config, sources, targets, track_margin,
                             pcb_data, net_id, print_prefix="",
                             direction_labels=("forward", "backward"), single_direction=False,
@@ -4394,11 +4455,20 @@ def _route_with_via_unblock(router, obstacles, config, sources, targets, track_m
     if res[0] is not None:
         return res + ([], [])
     layer_names = config.layers
-    if len(layer_names) < 2:
-        return res + ([], [])
     fwd_i, bwd_i = res[5], res[6]
     lim = config.max_probe_iterations
     coord = GridCoord(config.grid_step)
+
+    # A boxed pad whose exit the map closes but exact clearance leaves open
+    # (pad_escape): retry with the exit's far cell as a terminal of that side.
+    _esc = _route_with_pad_escape(router, obstacles, config, sources, targets,
+                                  track_margin, pcb_data, net_id, print_prefix,
+                                  direction_labels, single_direction, waypoints,
+                                  pad_sources, fwd_i, bwd_i, lim, coord)
+    if _esc is not None:
+        return _esc
+    if len(layer_names) < 2:
+        return res + ([], [])
 
     # #568 rust mode: before COMMITTING copper (the #189 pre-placed in-pad
     # via), let the search itself try the small rung -- a boxed pad is often
