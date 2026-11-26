@@ -70,6 +70,7 @@ PR #555). Retagging them would have removed the one accurate pointer.
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 # value with unit suffix; KiCad writes e.g. 0.3mm / 12mil / 0.012in
@@ -368,7 +369,13 @@ def _parse_dru_full(text: str, copper_layers: List[str]):
                              f"net class / item type / net name -- handled by the "
                              f"scoped channel (#1491)")
                 continue
-            if 'Area(' in str(condition):
+            if copper_clause and condition and _condition_is_footprint_pad(condition):
+                notes.append(f"rule '{name}': clearance {clearance_mm}mm at the pads of "
+                             f"the parts it names"
+                             f"{f' on {layer_clause}' if layer_clause else ''} -- "
+                             f"handled by the router's scoped channel; check_drc does "
+                             f"not grade it")
+            elif 'Area(' in str(condition):
                 # #1843: read by position (area_clearance, design_rules.AreaIndex)
                 notes.append(f"rule '{name}': clearance {clearance_mm}mm scoped by "
                              f"a rule area -- handled by position (#1843)")
@@ -1222,8 +1229,9 @@ def install_track_clearances(config, track_clearances, input_file,
 # literal a wildcard), joined by && || !. A rule with a layer clause, a layer,
 # area, diff-pair or coupled term stays out (layer and coupled rules have their
 # own channels; the rest is #865), and so does a pad-scoped term, memberOfFootprint
-# or Pad_Number: this channel prices a net and a pad type, never one pad. Such a
-# rule is NOT GRADED by check_drc, which tags the violations it may make legal
+# or Pad_Number: this channel prices a net and a pad type, never one pad (the
+# router's install adds the memberOfFootprint() rules `is_footprint_pad_rule`
+# takes, priced per part). Such a rule is NOT GRADED by check_drc, which tags the violations it may make legal
 # `unverified`, reading the pad's own number (`design_rules.rule_may_match`).
 #
 # The grader reads it PAIR-EXACT (`ScopedClearanceRules.pair_value`). The
@@ -1252,15 +1260,15 @@ def _netname_literals(node, out: set) -> set:
 _SCOPED_FUNCS = frozenset({'hasnetclass', 'hasexactnetclass'})
 
 
-def _scoped_node_ok(node) -> bool:
+def _scoped_node_ok(node, funcs=_SCOPED_FUNCS) -> bool:
     """Does a parsed condition read only the two items' classes and types?"""
     if not isinstance(node, tuple) or not node:
         return False
     op = node[0]
     if op in ('and', 'or'):
-        return all(_scoped_node_ok(c) for c in node[1:])
+        return all(_scoped_node_ok(c, funcs) for c in node[1:])
     if op == 'not':
-        return _scoped_node_ok(node[1])
+        return _scoped_node_ok(node[1], funcs)
     if op == 'cmp':
         sides = (node[2], node[3])
         props = [s for s in sides if s[0] == 'prop']
@@ -1268,8 +1276,80 @@ def _scoped_node_ok(node) -> bool:
         return (len(props) == 1 and len(lits) == 1 and props[0][1] in ('A', 'B')
                 and props[0][2] in _SCOPED_PROPS)
     if op == 'call':
-        return node[1] in ('A', 'B') and node[2] in _SCOPED_FUNCS
+        return node[1] in ('A', 'B') and node[2] in funcs
     return False
+
+
+# A rule scoped to named parts' pads (`A.Type == 'Pad' && A.memberOfFootprint('TP6')
+# && A.NetName == 'CANH' && B.NetName == 'DO1'`) joins the router's scoped
+# channel when every memberOfFootprint() term reads the item a top-level
+# `X.Type == 'Pad'` term makes a pad: it then binds pads alone, and a pad's
+# stamp carries its part (`FootprintPad`). The graders' channel stays without
+# it; check_drc tags what it may make legal `unverified`.
+_FOOTPRINT_FUNCS = _SCOPED_FUNCS | {'memberoffootprint'}
+
+
+@dataclass(frozen=True)
+class FootprintPad:
+    """The scoped channel's obstacle key for a pad of a part a rule names."""
+    pad_type: str
+    ref: Optional[str]
+    lib: Optional[str]
+
+
+def _footprint_calls(node, out: list) -> list:
+    if isinstance(node, tuple) and node:
+        if node[0] == 'call':
+            if node[2] == 'memberoffootprint':
+                out.append((node[1], tuple(node[3])))
+        elif node[0] in ('and', 'or', 'not'):
+            for c in node[1:]:
+                _footprint_calls(c, out)
+    return out
+
+
+def _conjuncts(node) -> list:
+    if isinstance(node, tuple) and node and node[0] == 'and':
+        return [t for c in node[1:] for t in _conjuncts(c)]
+    return [node]
+
+
+def _is_pad_term(node, which: str) -> bool:
+    if not (isinstance(node, tuple) and node and node[0] == 'cmp' and node[1] == '=='):
+        return False
+    sides = (node[2], node[3])
+    return (('prop', which, 'type') in sides
+            and any(s[0] == 'lit' and str(s[1]).lower() == 'pad' for s in sides))
+
+
+def _footprint_pad_node(node) -> bool:
+    if node is None or not _scoped_node_ok(node, _FOOTPRINT_FUNCS):
+        return False
+    calls = _footprint_calls(node, [])
+    items = {w for w, _a in calls}
+    return (len(items) == 1 and all(len(a) == 1 for _w, a in calls)
+            and any(_is_pad_term(t, next(iter(items))) for t in _conjuncts(node)))
+
+
+def _condition_is_footprint_pad(src: str) -> bool:
+    try:
+        from design_rules import parse_condition, _coupled_terms
+        node = parse_condition(src)
+    except Exception:                                            # noqa: BLE001
+        return False
+    return (_coupled_terms(node) == (False, False) and _footprint_pad_node(node)
+            and _parse_track_condition(src) is None)
+
+
+def is_footprint_pad_rule(rule) -> bool:
+    """A `design_rules.Rule` scoped to named parts' pads that the router's
+    scoped channel applies exactly."""
+    spec = rule.constraints.get('clearance') or {}
+    return ('min' in spec and not rule.unsupported and rule.coupled is False
+            and rule.keep_apart is False
+            and (rule.layer_clause is None or _copper_layer_clause(rule.layer_clause))
+            and _footprint_pad_node(rule.condition)
+            and _parse_track_condition(rule.condition_src or '') is None)
 
 
 def strip_keep_apart(node):
@@ -1343,6 +1423,18 @@ def is_scoped_clearance_rule(rule) -> bool:
             and _parse_track_condition(rule.condition_src or '') is None)
 
 
+def mark_footprint_pad_rules(rules) -> None:
+    """Name, for the rules report, the rules scoped to named parts' pads that
+    the route steps' scoped channel applies (`is_footprint_pad_rule`)."""
+    for r in getattr(rules, 'rules', None) or ():
+        if not r.honoured and is_footprint_pad_rule(r):
+            r.honoured = (f"clearance min {r.constraints['clearance']['min']:g} mm at the "
+                          f"pads of the parts it names"
+                          f"{f' on {r.layer_clause}' if r.layer_clause else ''}: each such "
+                          f"pad is stamped at it against the routed nets it binds")
+            r.router_unhonoured = None
+
+
 def board_has_scoped_clearance_rules(board_path: str) -> bool:
     """Does the sibling ``<board>.kicad_dru`` carry a rule the scoped channel
     honours (#1491)? For an engine that installs the channel per parse only
@@ -1352,7 +1444,7 @@ def board_has_scoped_clearance_rules(board_path: str) -> bool:
         return False
     try:
         from design_rules import parse_dru
-        return any(is_scoped_clearance_rule(r)
+        return any(is_scoped_clearance_rule(r) or is_footprint_pad_rule(r)
                    for r in parse_dru(open(dru, encoding="utf-8").read())[0])
     except Exception:                                            # noqa: BLE001
         return False
@@ -1398,18 +1490,28 @@ class ScopedClearanceRules:
         self._apart = {id(r): strip_keep_apart(r.condition)
                        for r in self.rules if r.keep_apart}
         self._partner_memo: Dict[tuple, bool] = {}
+        self.fp_names = frozenset(r.name for r in self.rules
+                                  if _footprint_calls(r.condition, []))
+        self.fp_patterns = tuple(sorted({a[0] for r in self.rules
+                                         for _w, a in _footprint_calls(r.condition, [])
+                                         if len(a) == 1}))
+        self._pad_keys: Dict[tuple, object] = {}
 
     @classmethod
     def for_board(cls, pcb_data, board_path: Optional[str] = None,
-                  copper_layers=None) -> Optional['ScopedClearanceRules']:
-        """None without a .kicad_dru or a rule in the subset."""
+                  copper_layers=None, footprint_pads: bool = False
+                  ) -> Optional['ScopedClearanceRules']:
+        """None without a .kicad_dru or a rule in the subset.
+        ``footprint_pads``: the rules scoped to named parts' pads too
+        (`is_footprint_pad_rule`), for the router's stamps."""
         path = board_path or getattr(pcb_data, 'source_path', '') or ''
         dru = os.path.splitext(path)[0] + '.kicad_dru' if path else ''
         if not dru or not os.path.isfile(dru):
             return None
         from design_rules import DesignRules
         dr = DesignRules.from_project(pcb_data, path, copper_layers=copper_layers)
-        sel = [r for r in dr.rules if is_scoped_clearance_rule(r)]
+        sel = [r for r in dr.rules if is_scoped_clearance_rule(r)
+               or (footprint_pads and is_footprint_pad_rule(r))]
         if not sel:
             return None
         board_cu = list(getattr(getattr(pcb_data, 'board_info', None),
@@ -1434,7 +1536,8 @@ class ScopedClearanceRules:
             return self
         try:
             again = ScopedClearanceRules.for_board(pcb_data, self.dr.source or None,
-                                                   copper_layers=copper_layers)
+                                                   copper_layers=copper_layers,
+                                                   footprint_pads=bool(self.fp_patterns))
         except Exception:                                        # noqa: BLE001
             again = None
         return again if again is not None else self
@@ -1449,9 +1552,31 @@ class ScopedClearanceRules:
         caller pricing many pairs keys its own memo on it (#1575)."""
         return self._sig(net_id)
 
-    def _item(self, net_id: int, type: str, pad_type: Optional[str] = None):
+    def _item(self, net_id: int, type: str, pad_type=None):
+        if isinstance(pad_type, FootprintPad):
+            return self.dr.item_for_net(int(net_id or 0), type, pad_type=pad_type.pad_type,
+                                        footprint_ref=pad_type.ref,
+                                        footprint_lib=pad_type.lib)
         return self.dr.item_for_net(int(net_id or 0), type,
                                     **({'pad_type': pad_type} if pad_type else {}))
+
+    def pad_key(self, pad):
+        """A foreign pad's obstacle key: its pad type, or a `FootprintPad`
+        when a rule names its part."""
+        pt = getattr(pad, 'pad_type', None) or 'smd'
+        if not self.fp_patterns:
+            return pt
+        ref = getattr(pad, 'component_ref', None)
+        key = (pt, ref)
+        got = self._pad_keys.get(key)
+        if got is None:
+            from design_rules import _footprint_named
+            fp_ref, fp_lib = self.dr.footprint_ids.get(ref, (ref, None))
+            got = self._pad_keys[key] = (
+                FootprintPad(pt, fp_ref, fp_lib)
+                if any(_footprint_named(p, fp_ref, fp_lib) for p in self.fp_patterns)
+                else pt)
+        return got
 
     def _sig(self, net_id: int):
         nid = int(net_id or 0)
@@ -1864,7 +1989,8 @@ def install_scoped_clearances(config, input_file, pcb_data, routed_net_ids=None,
     try:
         sc = (given.rebind(pcb_data, copper_layers=copper) if given is not None
               else ScopedClearanceRules.for_board(pcb_data, input_file or None,
-                                                  copper_layers=copper))
+                                                  copper_layers=copper,
+                                                  footprint_pads=True))
     except Exception as e:                                       # noqa: BLE001
         print(f"  .kicad_dru: class/type-scoped clearance rules not read ({e})")
         return
@@ -1893,6 +2019,7 @@ def install_scoped_clearances(config, input_file, pcb_data, routed_net_ids=None,
                   f"(#1491): '{r.name}' {r.constraints['clearance']['min']:g}mm "
                   f"when {r.condition_src!r}"
                   f"{f' on {r.layer_clause}' if r.layer_clause else ''}"
+                  f"{' at the pads of the parts it names' if r.name in sc.fp_names else ''}"
                   f" -- replaces the class value; "
                   f"a relaxing one only as far as every routed net allows")
 

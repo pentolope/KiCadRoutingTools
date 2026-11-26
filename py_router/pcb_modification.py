@@ -6873,6 +6873,7 @@ def _seg_worst_offender(pcb_data, net_id, s, clearance, net_clearances=None,
     from single_ended_routing import (_foreign_pad_arrays, _foreign_seg_arrays,
                                       _foreign_via_arrays, _foreign_hole_capsules,
                                       _scoped_excess, _coupled_excess,
+                                      _custom_pad_excess, _foreign_pad_rows, _object_rows,
                                       _fold_scoped_excess, _fold_scoped_pad_excess,
                                       _area_excess, _fold_area_pad_excess,
                                       _hole_via_excess, _raise_excess)
@@ -6956,7 +6957,10 @@ def _seg_worst_offender(pcb_data, net_id, s, clearance, net_clearances=None,
         for _cnid, _cpad in _custom:
             if _cnid == net_id:
                 continue
-            _exc = max((getattr(_cpad, 'local_clearance', 0.0) or 0.0) - clearance, 0.0)
+            _exc = _custom_pad_excess(
+                config, net_id, _cpad, s.layer, clearance,
+                max((getattr(_cpad, 'local_clearance', 0.0) or 0.0) - clearance, 0.0)
+                + float(_excess(np.array([_cnid]))[0]))
             _ex = _cpad.size_x / 2.0
             _ey = _cpad.size_y / 2.0
             if (abs((sx.min() + sx.max()) / 2 - _cpad.global_x) >
@@ -6991,7 +6995,10 @@ def _seg_worst_offender(pcb_data, net_id, s, clearance, net_clearances=None,
                 fexc = _fold_area_pad_excess(config, pcb_data, net_id, s.start_x, s.start_y,
                                              s.end_x, s.end_y, s.layer, near, plc, fexc,
                                              clearance)
-                _cx = _coupled_excess(config, net_id, nids[near], 'pad', clearance, s.layer)
+                _cx = _coupled_excess(config, net_id, nids[near], 'pad', clearance, s.layer,
+                                      pads=(_object_rows(_foreign_pad_rows(pcb_data,
+                                                                           s.layer))[near]
+                                            if config.coupled_pair_clearances else None))
                 fexc = _fold_scoped_excess(fexc, np.where(plc[near] > 0, np.nan, _cx))
             # Work in each pad's LOCAL frame (query offsets rotated by R(-rot),
             # identity for axis-aligned pads) so tilted pads use their true
@@ -7891,7 +7898,8 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
                 _need = same_net_pad_clearance  # #581 (only gathered when > 0)
             else:
                 _need = max(_area_need(pair_clr(own, p.net_id, v.net_id, 'pad',
-                                                getattr(p, 'pad_type', None) or 'smd',
+                                                _scoped.sc.pad_key(p) if _scoped is not None
+                                                else getattr(p, 'pad_type', None) or 'smd',
                                                 layers=_pad_layers1897(p)),
                                        x, y, 'pad', p),
                             getattr(p, 'local_clearance', 0.0) or 0.0)

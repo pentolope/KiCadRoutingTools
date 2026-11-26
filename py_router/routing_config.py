@@ -659,7 +659,7 @@ class GridRouteConfig:
         s1897 = self.scoped_clearance
         _kind = None
         if s1897 is not None and pad is not None:
-            _kind = getattr(pad, 'pad_type', None) or 'smd'
+            _kind = self.scoped_pad_key(pad)
         elif s1897 is not None and graphic:
             _kind = self._graphic_key(True)
         if (s1897 is not None and layer in s1897.layered_layers
@@ -778,7 +778,15 @@ class GridRouteConfig:
             default = max(floor, self.net_clearances.get(nid, self.clearance))
         if self.scoped_clearance is None:
             return default
-        return self.scoped_stamp(nid, getattr(pad, 'pad_type', None) or 'smd', default)
+        return self.scoped_stamp(nid, self.scoped_pad_key(pad), default)
+
+    def scoped_pad_key(self, pad):
+        """The scoped channel's obstacle key for a pad: its pad type, or
+        `kicad_dru.FootprintPad` when a rule names its part."""
+        s = self.scoped_clearance
+        if s is None:
+            return getattr(pad, 'pad_type', None) or 'smd'
+        return s.sc.pad_key(pad)
 
     def set_net_clearances(self, net_clearances, routed_net_ids) -> None:
         """Install the cross-class clearance map and compute the routing-side
@@ -833,6 +841,32 @@ class GridRouteConfig:
             return None
         return (cp.get('stack') if kind == 'stack'
                 else (cp.get(kind) or {}).get(layer))
+
+    def coupled_pad_value(self, pad, other_net: int,
+                          layer: Optional[str] = None) -> Optional[float]:
+        """`coupled_pair_value` of 'pad' kind for THIS partner pad against
+        `other_net`'s track: the pair map prices a pad with no part and no pad
+        type, so where the pad's own part, pad type or number makes another
+        rule KiCad's last match, None -- the caller prices the pad itself
+        (`pad_pair_clearance`, the scoped channel's per-pad key)."""
+        pad_net = int(getattr(pad, 'net_id', 0) or 0)
+        v = self.coupled_pair_value(pad_net, other_net, 'pad', layer)
+        dr = self.rules
+        if v is None or dr is None:
+            return v
+        ref = getattr(pad, 'component_ref', None)
+        fp_ref, fp_lib = dr.footprint_ids.get(ref, (ref, None))
+        trk = dr.item_for_net(other_net, 'track', layer)
+        bare = dr.item_for_net(pad_net, 'pad', layer)
+        own = dr.item_for_net(pad_net, 'pad', layer,
+                              pad_type=getattr(pad, 'pad_type', None),
+                              pad_number=getattr(pad, 'pad_number', None),
+                              footprint_ref=fp_ref, footprint_lib=fp_lib)
+        for (a, b), (c, d) in (((trk, bare), (trk, own)), ((bare, trk), (own, trk))):
+            if (dr.resolve('clearance', a, b, layer).min_rule
+                    != dr.resolve('clearance', c, d, layer).min_rule):
+                return None
+        return v
 
     def pair_clearance(self, net_a: int, net_b: int,
                        layer: Optional[str] = None, *, kind: str = 'layer',
@@ -974,8 +1008,8 @@ class GridRouteConfig:
         if self.scoped_clearance is not None and pad_net != other_net:
             # #1491: per item combination, the scoped rule and the layer rules
             # in file order (kicad_dru.resolve_pair), as pair_clearance
-            _pt = ('pad', getattr(pad, 'pad_type', None) or 'smd')
-            _ot = ((('pad', getattr(other_pad, 'pad_type', None) or 'smd'),)
+            _pt = ('pad', self.scoped_pad_key(pad))
+            _ot = ((('pad', self.scoped_pad_key(other_pad)),)
                    if other_pad is not None
                    else (other_type,) if other_type is not None
                    else ('track', 'via'))

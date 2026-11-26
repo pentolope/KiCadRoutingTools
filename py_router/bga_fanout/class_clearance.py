@@ -325,7 +325,7 @@ def class_violations(pcb_data, tracks, vias, base, net_clearances,
                 if need is not None:
                     hit = check_via_via_overlap(oa, ob, need, _MARGIN)[0]
             elif kind_b == 'pad':
-                _pt = (('pad', getattr(ob, 'pad_type', None) or 'smd'),)
+                _pt = (('pad', cfg.scoped_pad_key(ob)),)
                 if kind_a == 'seg':
                     need, is_low = verdict(na, nb, at, oa.layer, types=(('track',), _pt))
                     if need is not None:

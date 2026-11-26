@@ -115,7 +115,7 @@ class PadFreeMap:
             if c is not None and c > pc:
                 pc, pb = c, c
             if self._scoped:
-                s = cfg.scoped_stamp(p.net_id, getattr(p, 'pad_type', None) or 'smd', None)
+                s = cfg.scoped_stamp(p.net_id, cfg.scoped_pad_key(p), None)
                 if s is not None:
                     pc = pb = s
             need = max(pc, cfg.pad_override_clearance(pb, p))

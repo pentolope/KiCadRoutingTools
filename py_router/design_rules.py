@@ -568,7 +568,9 @@ def parse_dru(text: str) -> Tuple[List[Rule], List[str]]:
             if term:
                 rule.router_unhonoured = (f"clearance scoped by {term}: routing "
                                           f"prices a net and a pad type, never one "
-                                          f"pad or one part")
+                                          f"pad, and one part's pads only when an "
+                                          f"X.Type == 'Pad' term holds every "
+                                          f"memberOfFootprint() to the same item")
         if 'disallow' in rule.constraints and rule.unsupported is None:
             # #1527: evaluable, so nothing of it is "consumed" until a step
             # honours it -- it used to pass silently as consumed
@@ -3930,6 +3932,8 @@ def install_design_rules(config, input_file, pcb_data=None, *, fab_floor=None,
         # #1853: the hole_clearance rules the route steps read
         from hole_rule_routing import mark_honoured as _mark_holes
         _mark_holes(rules, pcb_data)
+        from kicad_dru import mark_footprint_pad_rules
+        mark_footprint_pad_rules(rules)
     try:
         from hole_rule_routing import install as _install_holes
         _install_holes(config, pcb_data)
