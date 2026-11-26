@@ -16,7 +16,8 @@ A. the comparison on hand-built records, and which records a step keeps:
    the newest accepted one always, however many rejected retries follow it.
 B. the record's file round trip (replaced, not merged).
 C. a chain of F.Cu-only laps on an in-repo board, each retry naming the nets
-   still open, where the third step breaks two nets the second connected.
+   still open, where the third step (Net-(C1-Pad1) routed first) breaks two
+   nets the second connected.
 """
 import json
 import os
@@ -150,12 +151,17 @@ try:
     route = PY + [os.path.join(ROOT, 'py_router', 'route.py')]
     run_check(route + [b[0], b[1], '--nets', '*', '--layers', 'F.Cu'],
               accept=True, timeout=1200)
+    # The retries of the lap-2 board route Net-(C1-Pad1) first, the order mps
+    # gave them before the end-of-run geometry pass reshaped the copper it
+    # reads: that net's rips are the ones that break /DTR and /EN.
+    first = ['--route-first', 'Net-(C1-Pad1)']
     logs, gates = {}, {}
     for i in (2, 3):
         nets = open_nets(b[i - 1])
         check(f"lap {i} has open nets to retry", bool(nets))
         r = run_check(route + [b[i - 1], b[i], '--nets'] + nets
-                      + ['--layers', 'F.Cu'], accept=True, timeout=1200)
+                      + ['--layers', 'F.Cu'] + (first if i == 3 else []),
+                      accept=True, timeout=1200)
         logs[i], gates[i] = r.stdout, gate(r.stdout)
         check(f"lap {i} printed its gate", gates[i] is not None)
     rec2 = lap_history(tool_records.effective_namespace(b[2]))
@@ -188,7 +194,7 @@ try:
                         [rec2[-1]] + others, verbose=False)
     b4 = os.path.join(tmp, 'lap4.kicad_pcb')
     r = run_check(route + [b[3], b4, '--nets'] + open_nets(b[3])
-                  + ['--layers', 'F.Cu'], accept=True, timeout=1200)
+                  + ['--layers', 'F.Cu'] + first, accept=True, timeout=1200)
     g4 = gate(r.stdout) or {}
     check("lap 4, the fourth rejected step on record, is rejected and named a "
           "cycle", g4.get('verdict') == 'reject'
