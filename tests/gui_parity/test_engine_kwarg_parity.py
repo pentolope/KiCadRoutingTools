@@ -95,6 +95,12 @@ CLI_ONLY_OK = {
     # Both run the CLIs (also from the GUI's Place + Route); the GUI's own
     # routing always routes to ship.
     "quick": "a placement review / seed judge via the CLI; the GUI routes to ship",
+    # route.py --tidy-copper-from BOARD names the board a CHAIN of CLI steps
+    # (autoroute) started from, so the end-of-run geometry pass may re-lay the
+    # copper the chain's earlier steps laid. The GUI routes the live board,
+    # whose input copper is the user's, and runs no chain (ROUTE_CLI_ONLY in
+    # test_manifest_plan_parity says the same for the flag).
+    "tidy_copper_from": "names a CLI chain's starting board; the GUI routes the live board and runs no chain",
     # (net_name_patterns was exempted here as "the GUI has no raw globs".
     # REVERSED: ai_plan resolving a plan's globs to exact names BEFORE the
     # call is not the reason the exemption is safe, it is the reason it was
