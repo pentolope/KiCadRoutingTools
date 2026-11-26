@@ -72,3 +72,7 @@ IPC_2221_MAX_AREA_MILS2 = 700.0
 # BGA/component detection (mm)
 BGA_EDGE_DETECTION_TOLERANCE = 0.01   # Tolerance for detecting pad alignment
 BGA_DEFAULT_EDGE_TOLERANCE = 1.6      # Default edge tolerance for BGA pitch detection
+
+# The shortest track piece a shipped board carries, except a piece entering a
+# pad or a via: shorter ones are grid-step jogs and slivers, not routing.
+MIN_TRACK_FRAGMENT = 0.1

@@ -828,6 +828,9 @@ ROUTE_CLI_ONLY = {
     '--json-out': "writes the JSON_SUMMARY to a file for a harness; the GUI "
                   "consumes results in memory",
     '--strict-sizes': "a harness EXIT-CODE flag (#857); changes no copper",
+    '--tidy-copper-from': "names the board a CHAIN of CLI steps started from "
+                          "(autoroute); the GUI routes the live board, whose "
+                          "copper is the user's, and runs no chain",
     '--keep-thermal': "deprecated no-op (#856)",
     # (--net-clearances left this list: its file REPLACES the class-derived
     # map, so "the GUI derives the same map from the net classes" was false

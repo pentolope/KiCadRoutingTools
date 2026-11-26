@@ -94,7 +94,7 @@ def strict_collapse_deferred() -> bool:
     return _STRICT_COLLAPSE_DEFERRED[0] > 0
 
 
-def _smooth_skip_net_ids(pcb_data):
+def _smooth_skip_net_ids(pcb_data, locked=True):
     """Nets the #536 octolinear smoothing pass must never touch: protected
     nets (length/time-matched groups, coupled diff pairs, KiCad-locked
     copper -- prior steps via the .kicad_pro plus THIS step's not-yet-
@@ -103,7 +103,11 @@ def _smooth_skip_net_ids(pcb_data):
     the coupling. Peeks at protected_nets._notes WITHOUT consuming -- the
     writeback site owns the consume."""
     import protected_nets as _pn
-    names = set(_pn.protection_map(pcb_data))
+    if locked:
+        names = set(_pn.protection_map(pcb_data))
+    else:
+        # a net's locked copper is held item by item, not the whole net
+        names = set(_pn.read_for_pcb_data(pcb_data)) | set(_pn.held_net_reasons(pcb_data))
     names |= set(_pn._notes.get(_pn.PRO_KEY, {}) or {})
     # A DECLARE-ONLY record (#1630) changes no copper decision, this one
     # included: the copper is the project's, routed as without --impedance.

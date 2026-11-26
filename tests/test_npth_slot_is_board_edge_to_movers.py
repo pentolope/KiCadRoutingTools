@@ -148,7 +148,9 @@ def t_the_movers_ask_about_slots_at_the_edge_floor():
                             'py_router', 'pcb_modification.py')).read()
     tree = ast.parse(src)
     lines = src.splitlines()
-    want = {'smooth_octolinear_chains', 'nudge_grazing_octolinear',
+    # the smoother's clearance test is copper_clearance_probe, which the
+    # end-of-run track geometry pass shares
+    want = {'copper_clearance_probe', 'nudge_grazing_octolinear',
             'nudge_grazing_microshift'}
     seen = {}
     for fn in ast.walk(tree):
@@ -157,6 +159,11 @@ def t_the_movers_ask_about_slots_at_the_edge_floor():
             seen[fn.name] = ('segment_to_npth_slots_distance' in body
                              and 'npth_slot_capsules' in body
                              and '_edge_clr' in body)
+        if isinstance(fn, ast.FunctionDef) and fn.name == 'smooth_octolinear_chains':
+            body = "\n".join(lines[fn.lineno - 1:getattr(fn, 'end_lineno', fn.lineno)])
+            check('t_smooth_octolinear_chains_uses_the_probe',
+                  'copper_clearance_probe(' in body,
+                  'the smoother takes its clearance test from copper_clearance_probe')
     for name in sorted(want):
         check(f't_{name}_grades_slots_as_edge',
               seen.get(name) is True,

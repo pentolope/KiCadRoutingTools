@@ -5662,69 +5662,19 @@ def _seg_cross_point(ax, ay, bx, by, cx, cy, dx, dy):
     return (ax + t * rx, ay + t * ry)
 
 
-def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
-                             clearance: float = 0.1,
-                             keep_input_copper: bool = False,
-                             net_clearances=None,
-                             board_edge_clearance: float = 0.0,
-                             config=None,
-                             skip_net_ids=None,
-                             dry_run: bool = False,
-                             min_gain: float = 0.01,
-                             max_net_segs: int = 400,
-                             max_chain_segs: int = 100):
-    """Collapse grid-A* staircase micro-jogs into octolinear shortcuts (#536).
-
-    Walks each net's simple track chains (split at junctions, same-net vias,
-    pad landings, width changes, layer changes) and greedily replaces the
-    farthest reachable sub-path with an octolinear connector -- the direct
-    segment when the span is already on a 45-degree bearing, else a single
-    diagonal+axis elbow (_octolinear_bends). Output stays STRICTLY octolinear;
-    no arbitrary-angle chords. A span is only replaced when the connector
-
-      * keeps clearance from all foreign copper (pads / segments / vias),
-        NPTH holes at their higher floor, and the board edge -- with a
-        .kicad_dru layer rule replacing the base clearance on ruled layers
-        (#498, which the older graze passes never honored) and a .kicad_dru
-        TRACK rule raising the seg-vs-seg term on top of it (#735);
-      * is shorter than the copper it replaces by at least min_gain, or
-        (#958, in a second greedy phase over the shortened chain, which
-        also takes the strictly shorter connectors the first phase's new
-        bends expose) equal in length to floating-point roundoff with
-        strictly fewer emitted legs -- a jog that is already a shortest
-        octolinear path loses its needless corner at the same length;
-        min_gain is never an allowance to get longer;
-      * strands no same-net copper: mid-span via taps, pad touches, and
-        T/X-touching sibling tracks hold their span un-collapsed unless the
-        touch sits at a kept endpoint.
-
-    Per net, the result is committed only if check_net_connectivity does not
-    grade it worse than the original. The guard runs WITHOUT pour credit:
-    endpoints are preserved by construction, so the track/via/pad graph
-    alone must not degrade -- raw zone-outline credit would mask a real
-    track loss behind fill the refill may not produce.
-
-    POURS the moving copper carves are deliberately not consulted -- the
-    same pour-blind convention routing follows; the plane finalize /
-    kicad-oracle recheck downstream owns that damage (see the comment at
-    the clears() block). dry_run=True measures without mutating anything --
-    the #536 "is it worth it on OUR output" instrument. Soft costs are
-    deliberately not consulted (the router's corridors are a routing-time
-    concept); callers gate this to the final chain step -- see
-    cleanup_pipeline.
-
-    Returns (changed_count, nets_changed, original_segments_to_remove,
-    added_segments, stats)."""
-    from collections import defaultdict
-    from check_connected import check_net_connectivity
-    from geometry_utils import segment_to_segment_closest_points, segments_intersect
+def copper_clearance_probe(pcb_data: PCBData, clearance: float,
+                          net_clearances=None,
+                          board_edge_clearance: float = 0.0, config=None):
+    """The octolinear smoother's clearance test for NEW copper, as a
+    callable clears(x1, y1, x2, y2, layer, net_id, width): foreign pads,
+    segments and vias, NPTH holes and slots, the board edge and the
+    keep-outs, each at the rule that binds it (see smooth_octolinear_chains)."""
     from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
                                       _seg_foreign_via_dist, _seg_foreign_hole_dist)
     from routing_defaults import NPTH_TO_TRACK_CLEARANCE
     from check_drc import (board_edge_geometry, _point_on_board,
                            _segment_to_rings_distance, point_to_pad_distance,
                            npth_slot_capsules, segment_to_npth_slots_distance)
-    from connectivity import COINCIDENCE_TOL
     from obstacle_map import resolve_hole_clearance
 
     # #1038: the board's DECLARED copper-to-hole floor, not the flat 0.20. The
@@ -5790,45 +5740,6 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
             return all(min(x - min_x, max_x - x, y - min_y, max_y - y) >= required
                        for x, y in ((x1, y1), (x2, y2)))
         return True
-
-    # FINE-PITCH PAD FIELDS, from the board's OWN helpers -- `detect_bga_pitch`
-    # and `get_footprint_bounds`, the two `auto_detect_bga_exclusion_zones` is
-    # itself built from. A dense field's inter-pad space is escape corridor: the
-    # only way out for a pad that still needs one.
-    #
-    # Keyed on PITCH, not on the package name. `find_components_by_type('BGA')`
-    # is the obvious reuse and it is the wrong set here: ft2232h_jtag's U4 --
-    # the part whose corridor this fix exists for -- is
-    # `Package_QFP:LQFP-64_10x10mm_P0.5mm`, so `detect_package_type` calls it
-    # QFP and the BGA filter returns nothing. (Its log line "BGA Grid Analysis
-    # for U4" is the FANOUT's grid analyser, which runs on any candidate and
-    # finds a pitch in a QFP's peripheral rows.) What makes the space a corridor
-    # is the pitch, not the ball/lead distinction, so a 0.5mm QFP and a 0.65mm
-    # BGA both qualify and ottercast's 0.2mm QFN does too.
-    #
-    # A static REGION deliberately, not "pads that currently lack copper": that
-    # set changes on every route pass, so a guard keyed on it fires differently
-    # each lap. Measured -- an earlier cut keyed on waiting pads and
-    # destabilised ottercast_audio's five-pass chain (2 -> 4 nets incomplete)
-    # while fixing ft2232h_jtag. A package does not move between passes.
-    _dense_boxes = []
-    try:
-        from kicad_parser import detect_bga_pitch, get_footprint_bounds
-        for _fp in pcb_data.footprints.values():
-            if not pad_field_is_corridor(
-                    _fp, getattr(config, 'track_width', None) or 0.15,
-                    clearance):
-                continue
-            _dense_boxes.append(get_footprint_bounds(_fp, margin=0.0))
-    except Exception:
-        _dense_boxes = []
-
-    def _in_dense_field(x1, y1, x2, y2):
-        for (bx0, by0, bx1, by1) in _dense_boxes:
-            if (min(x1, x2) <= bx1 and max(x1, x2) >= bx0
-                    and min(y1, y2) <= by1 and max(y1, y2) >= by0):
-                return True
-        return False
 
     # Foreign-net POURS are deliberately NOT consulted (same convention as
     # routing itself, which is pour-blind): a shortcut inside a foreign pour
@@ -5965,6 +5876,110 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                       f"w={w} cached_d={pd:.3f} fresh_d={pd_fresh:.3f}")
         return ok
 
+    return clears
+
+
+def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
+                             clearance: float = 0.1,
+                             keep_input_copper: bool = False,
+                             net_clearances=None,
+                             board_edge_clearance: float = 0.0,
+                             config=None,
+                             skip_net_ids=None,
+                             dry_run: bool = False,
+                             min_gain: float = 0.01,
+                             max_net_segs: int = 400,
+                             max_chain_segs: int = 100):
+    """Collapse grid-A* staircase micro-jogs into octolinear shortcuts (#536).
+
+    Walks each net's simple track chains (split at junctions, same-net vias,
+    pad landings, width changes, layer changes) and greedily replaces the
+    farthest reachable sub-path with an octolinear connector -- the direct
+    segment when the span is already on a 45-degree bearing, else a single
+    diagonal+axis elbow (_octolinear_bends). Output stays STRICTLY octolinear;
+    no arbitrary-angle chords. A span is only replaced when the connector
+
+      * keeps clearance from all foreign copper (pads / segments / vias),
+        NPTH holes at their higher floor, and the board edge -- with a
+        .kicad_dru layer rule replacing the base clearance on ruled layers
+        (#498, which the older graze passes never honored) and a .kicad_dru
+        TRACK rule raising the seg-vs-seg term on top of it (#735);
+      * is shorter than the copper it replaces by at least min_gain, or
+        (#958, in a second greedy phase over the shortened chain, which
+        also takes the strictly shorter connectors the first phase's new
+        bends expose) equal in length to floating-point roundoff with
+        strictly fewer emitted legs -- a jog that is already a shortest
+        octolinear path loses its needless corner at the same length;
+        min_gain is never an allowance to get longer;
+      * strands no same-net copper: mid-span via taps, pad touches, and
+        T/X-touching sibling tracks hold their span un-collapsed unless the
+        touch sits at a kept endpoint.
+
+    Per net, the result is committed only if check_net_connectivity does not
+    grade it worse than the original. The guard runs WITHOUT pour credit:
+    endpoints are preserved by construction, so the track/via/pad graph
+    alone must not degrade -- raw zone-outline credit would mask a real
+    track loss behind fill the refill may not produce.
+
+    POURS the moving copper carves are deliberately not consulted -- the
+    same pour-blind convention routing follows; the plane finalize /
+    kicad-oracle recheck downstream owns that damage (see the comment at
+    the clears() block). dry_run=True measures without mutating anything --
+    the #536 "is it worth it on OUR output" instrument. Soft costs are
+    deliberately not consulted (the router's corridors are a routing-time
+    concept); callers gate this to the final chain step -- see
+    cleanup_pipeline.
+
+    Returns (changed_count, nets_changed, original_segments_to_remove,
+    added_segments, stats)."""
+    from collections import defaultdict
+    from check_connected import check_net_connectivity
+    from geometry_utils import segment_to_segment_closest_points, segments_intersect
+    from check_drc import point_to_pad_distance
+    from connectivity import COINCIDENCE_TOL
+
+    clears = copper_clearance_probe(pcb_data, clearance, net_clearances,
+                                    board_edge_clearance, config)
+
+    # FINE-PITCH PAD FIELDS, from the board's OWN helpers -- `detect_bga_pitch`
+    # and `get_footprint_bounds`, the two `auto_detect_bga_exclusion_zones` is
+    # itself built from. A dense field's inter-pad space is escape corridor: the
+    # only way out for a pad that still needs one.
+    #
+    # Keyed on PITCH, not on the package name. `find_components_by_type('BGA')`
+    # is the obvious reuse and it is the wrong set here: ft2232h_jtag's U4 --
+    # the part whose corridor this fix exists for -- is
+    # `Package_QFP:LQFP-64_10x10mm_P0.5mm`, so `detect_package_type` calls it
+    # QFP and the BGA filter returns nothing. (Its log line "BGA Grid Analysis
+    # for U4" is the FANOUT's grid analyser, which runs on any candidate and
+    # finds a pitch in a QFP's peripheral rows.) What makes the space a corridor
+    # is the pitch, not the ball/lead distinction, so a 0.5mm QFP and a 0.65mm
+    # BGA both qualify and ottercast's 0.2mm QFN does too.
+    #
+    # A static REGION deliberately, not "pads that currently lack copper": that
+    # set changes on every route pass, so a guard keyed on it fires differently
+    # each lap. Measured -- an earlier cut keyed on waiting pads and
+    # destabilised ottercast_audio's five-pass chain (2 -> 4 nets incomplete)
+    # while fixing ft2232h_jtag. A package does not move between passes.
+    _dense_boxes = []
+    try:
+        from kicad_parser import detect_bga_pitch, get_footprint_bounds
+        for _fp in pcb_data.footprints.values():
+            if not pad_field_is_corridor(
+                    _fp, getattr(config, 'track_width', None) or 0.15,
+                    clearance):
+                continue
+            _dense_boxes.append(get_footprint_bounds(_fp, margin=0.0))
+    except Exception:
+        _dense_boxes = []
+
+    def _in_dense_field(x1, y1, x2, y2):
+        for (bx0, by0, bx1, by1) in _dense_boxes:
+            if (min(x1, x2) <= bx1 and max(x1, x2) >= bx0
+                    and min(y1, y2) <= by1 and max(y1, y2) >= by0):
+                return True
+        return False
+
     def vk(x, y):
         return (round(x, 3), round(y, 3))
 
@@ -6019,7 +6034,7 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
             net_vias = vias_by_net.get(net_id, [])
 
             candidates = [s for s in net_segs
-                          if not getattr(s, 'graphic', False)
+                          if not getattr(s, 'graphic', False) and not _locked(s)
                           and (not keep_input_copper or id(s) in routed_seg_result)
                           and math.hypot(s.end_x - s.start_x, s.end_y - s.start_y) > 1e-6]
             if len(candidates) < 2:

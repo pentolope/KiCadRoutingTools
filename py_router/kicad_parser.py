@@ -639,12 +639,48 @@ class Segment:
     # and it does not make the net never-rippable (only the net's pre-existing
     # copper is spared from whole-net strips, protected_nets.protection_map).
     held_by: str = ""
+    # A piece of a linearised track ARC (both parse paths).
+    arc: bool = False
+    # ...read from a FILE, whose writer strips (segment ...) blocks and has no
+    # way to rewrite or strip this piece's (arc ...) block alone: immutable.
+    # The pcbnew path maps a piece back to its live PCB_ARC and removes the
+    # whole arc, so a GUI pass may still rip or sweep arcs whole.
+    arc_in_file: bool = False
+
+
+def tuning_pattern_members(content: str) -> set:
+    """The uuids of the copper KiCad's length-tuning patterns own:
+    `(generated ... (type tuning_pattern) ... (members "uuid" ...))`."""
+    out = set()
+    for m in re.finditer(r'\(generated\b', content):
+        depth, i = 0, m.start()
+        while i < len(content):
+            c = content[i]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif c == '"':
+                i = content.index('"', i + 1)
+            i += 1
+        block = content[m.start():i + 1]
+        if not re.search(r'\(type\s+"?tuning_pattern"?\s*\)', block):
+            continue
+        mm = re.search(r'\(members\s+([^()]*)\)', block)
+        if mm:
+            out.update(t.strip('"') for t in mm.group(1).split())
+    return out
 
 
 def is_immutable_copper(item) -> bool:
     """True for a track or via no pass may move, rewrite or remove: KiCad-
-    locked copper (#1261) or copper a `sense:` group holds (#1279)."""
-    return bool(getattr(item, 'locked', False) or getattr(item, 'held_by', ''))
+    locked copper (#1261), copper a `sense:` group holds (#1279), and a piece
+    of a track arc read from a file (the file holds the arc, not the piece:
+    Segment.arc_in_file)."""
+    return bool(getattr(item, 'locked', False) or getattr(item, 'held_by', '')
+                or getattr(item, 'arc_in_file', False))
 
 
 @dataclass
@@ -6679,6 +6715,7 @@ def extract_segments(content: str, name_to_id: Dict[str, int] = None) -> List[Se
         for (p0, p1) in _arc_to_segments((sx, sy), (mx, my), (ex, ey)):
             out.append(_seg(p0[0], p0[1], p1[0], p1[1], width, layer, net_id,
                             uuid, locked))
+            out[-1].arc = out[-1].arc_in_file = True
 
     blocks, unbalanced = _track_blocks(content)
     for off in unbalanced:
@@ -8682,6 +8719,7 @@ def pcbnew_track_copper(board, to_mm=None, get_layer_name=None, owners=None):
                     net_id=track.GetNetCode(),
                     uuid=_item_uuid(track),
                     locked=bool(track.IsLocked()),
+                    arc=True,
                 ))
                 if owners is not None:
                     owners[id(segments[-1])] = track

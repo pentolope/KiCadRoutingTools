@@ -1828,6 +1828,10 @@ def route_passes(ch, a, L, costs, effort_factor=2.0, finish=False, rip=(), rerou
             shared += ['--rip-existing-nets', *rip]
         if quick:
             shared += ['--quick', str(quick)]
+        # the chain's earlier steps laid the copper its starting board lacks: the
+        # route steps' end-of-run geometry pass may re-lay that, never the board's own
+        if getattr(ch, 'baseline', None):
+            shared += ['--tidy-copper-from', ch.baseline]
         return shared
     order = a.get('route_first') or []
     routed_groups = [g for g in a.get('match_groups') or () if g['step'] == 'route']
