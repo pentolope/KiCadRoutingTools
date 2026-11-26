@@ -129,6 +129,8 @@ REGISTRY = {
     'single_ended_routing.py:_route_multipoint_taps_impl._register_inprogress_via': ('exempt', 'same-net ring'),
     'obstacle_map.py:add_connector_region_via_blocking': ('exempt', "a pair's own breakout corridor"),
     'diff_pair_routing.py:_route_hybrid_leg': ('exempt', "the pair's own partner (the pair gap)"),
+    'diff_pair_routing.py:_pose_search_clear_of_via_sites': (
+        'exempt', "bars a refused via landing cell for the re-search, then lifts it"),
     'net_keepouts.py:_EdgeBandSink._cells': ('exempt', 'edge band'),
     'net_keepouts.py:_EdgeBandSink._vias': ('exempt', 'edge band'),
     'net_keepouts.py:block': ('exempt', 'net-filtered keep-out area'),
