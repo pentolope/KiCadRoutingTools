@@ -9,7 +9,13 @@ judged by independent geometry (shapely distances, segment lengths):
      whole is refused;
   5. a chain is not re-laid across a width change at the wider width;
   6. the window search per defect is bounded: a 600-leg staircase weighs at
-     most a fixed number of paths per search.
+     most a fixed number of paths per search;
+  7. the pour-split model on a corridor of GND fill between two squares,
+     under KiCad's min_thickness 0.25 (each verdict checked against a
+     kicad-cli refill when this was written): a strip thinner than that
+     carries no fill; the moving net's own clearance widens the cut when
+     larger than the pour's; and a second edit of a net is judged against
+     the net's copper after the first.
 
     python3 tests/test_final_geometry_safeguards.py
 """
@@ -125,13 +131,15 @@ def main():
 
     print('4. a foreign pour the re-lay would split')
     # the clearance case's jog with no foreign tracks, over a FOE pour of two
-    # pads of fill joined by a neck between y=-0.29 and -0.26: the 0.05 mm
+    # pads of fill joined by a neck between y=-0.52 and -0.25: the 0.05 mm
     # lower run (its carve ends at -0.25 under a 0.2 mm clearance) leaves the
-    # neck, the run carried on at y=0 would cut it
+    # neck its 0.27 mm, the run carried on at y=0 would leave 0.22 mm, under
+    # the pour's 0.25 mm min_thickness
     from shapely.ops import unary_union
-    gnd_poly = [(3.2, -1.0), (3.8, -1.0), (3.8, -0.29), (4.2, -0.29), (4.2, -1.0), (4.8, -1.0),
-                (4.8, -0.26), (3.2, -0.26)]
-    gnd = Zone(net_id=FOE, net_name='FOE', layer='F.Cu', polygon=gnd_poly, clearance=0.2)
+    gnd_poly = [(3.2, -1.5), (3.8, -1.5), (3.8, -0.52), (4.2, -0.52), (4.2, -1.5), (4.8, -1.5),
+                (4.8, -0.25), (3.2, -0.25)]
+    gnd = Zone(net_id=FOE, net_name='FOE', layer='F.Cu', polygon=gnd_poly, clearance=0.2,
+               min_thickness=0.25)
     jog = [make_seg(0, 0, 3, 0), make_seg(3, 0, 3, 0.05), make_seg(3, 0.05, 5, 0.05),
            make_seg(5, 0.05, 6, 1.05)]
     pcb = board(jog, vias=[make_via(0, 0, net_id=NET), make_via(6, 1.05, net_id=NET)], zones=[gnd])
@@ -139,7 +147,7 @@ def main():
     def fill_pieces(p):
         carve = unary_union([LineString([(s.start_x, s.start_y), (s.end_x, s.end_y)])
                              .buffer(s.width / 2 + 0.2) for s in p.segments if s.net_id == NET])
-        fill = Polygon(gnd_poly).difference(carve)
+        fill = Polygon(gnd_poly).difference(carve).buffer(-0.124).buffer(0.124)
         return sum(1 for g in getattr(fill, 'geoms', [fill]) if g.area > 1e-6)
     n0 = fill_pieces(pcb)
     run(pcb)
@@ -188,11 +196,55 @@ def main():
     check('no search weighs more than 5000 paths', max(counts or [0]) <= 5000,
           f'max {max(counts or [0])} over {len(counts)} searches')
 
+    pour_model()
     if failures:
         print(f'FAIL: {len(failures)}: ' + '; '.join(failures))
         return 1
     print('ALL PASS')
     return 0
+
+
+def corridor(h):
+    lo, hi = 5 - h / 2, 5 + h / 2
+    return [(0, 0), (4, 0), (4, lo), (6, lo), (6, 0), (10, 0), (10, 10), (6, 10), (6, hi),
+            (4, hi), (4, 10), (0, 10)]
+
+
+def pour_model():
+    print('7. the pour-split model')
+    from types import SimpleNamespace
+
+    def editor(h, segs, net_clearance=None):
+        pcb = board(segs, zones=[Zone(net_id=FOE, net_name='FOE', layer='F.Cu', polygon=corridor(h),
+                                      clearance=0.2, min_thickness=0.25)])
+        cfg = SimpleNamespace(clearance=0.2,
+                              net_clearances={NET: net_clearance} if net_clearance else {})
+        ed = fg._Editor(pcb, cfg, lambda *a: True, set(), {})
+        return ed, ed.view(NET, 'F.Cu')
+
+    def splits(h, y, net_clearance=None):
+        old = make_seg(4.5, 9, 5.5, 9)
+        ed, nl = editor(h, [old], net_clearance)
+        return fg._splits_pours(ed, nl, [old], [(4.5, y), (5.5, y)], 0.2)
+    # a 0.2 mm track's carve at 0.2 mm clearance is 0.6 mm tall
+    for h, y, want, why in ((1.0, 5.0, True, '0.2 mm strips either side'),
+                            (1.0, 5.04, True, 'a 0.24 mm strip and a 0.16 mm one'),
+                            (1.0, 5.06, False, 'a 0.26 mm strip'),
+                            (1.4, 5.0, False, '0.4 mm strips')):
+        check(f'{h} mm corridor, track at y={y} ({why}): {"splits" if want else "keeps"}',
+              splits(h, y) == want)
+    check('1.2 mm corridor: keeps it at the pour clearance (0.3 mm strips)', not splits(1.2, 5.0))
+    check('...splits it at the net\'s 0.3 mm clearance (0.2 mm strips)', splits(1.2, 5.0, 0.3))
+    # first edit: a SIG track at y=5.35 in a 1.4 mm corridor (fill left below
+    # it, 4.3..5.05); then one at y=4.6, which leaves 4.9..5.05 = 0.15 mm
+    first, second = make_seg(4.5, 9, 5.5, 9), make_seg(4.5, 8, 5.5, 8)
+    ed, nl = editor(1.4, [first, second])
+    fg._splits_pours(ed, nl, [first], [(4.5, 9.5), (5.5, 9.5)], 0.2)
+    check('(the first edit alone keeps the corridor)',
+          not fg._splits_pours(ed, nl, [first], [(4.5, 5.35), (5.5, 5.35)], 0.2))
+    ed.replace(nl, [first], [(4.5, 5.35), (5.5, 5.35)], 0.2)
+    check('a second edit is judged with the first in place',
+          fg._splits_pours(ed, nl, [second], [(4.5, 4.6), (5.5, 4.6)], 0.2))
 
 
 def test_final_geometry_safeguards():

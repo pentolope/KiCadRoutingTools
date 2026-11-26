@@ -425,11 +425,6 @@ class _Editor:
                                    if id(s) not in self.gone] + self.fresh
             for s in self.fresh:
                 self.by_nl[(s.net_id, s.layer)].append(s)
-            if self._copper is not None:
-                for s in self.gone.values():
-                    self._copper[s.layer].remove(s)
-                for s in self.fresh:
-                    self._copper[s.layer].add(s, _seg_box(s))
             self.by_nl = defaultdict(list, {k: [s for s in v if id(s) not in self.gone]
                                             for k, v in self.by_nl.items()})
             self.gone, self.fresh = {}, []
@@ -449,8 +444,25 @@ class _Editor:
         self.fresh.extend(new)
         for s in new:
             self.added[id(s)] = s
+        if self._copper is not None:
+            # the pour check reads this net's copper as it stands now
+            for s in old:
+                self._copper[s.layer].remove(s)
+            for s in new:
+                self._copper[s.layer].add(s, _seg_box(s))
         nl.apply(old, new)
         return new
+
+    def undo_net(self, added0, removed0):
+        """Drop every edit since the net began (all still pending)."""
+        if self._copper is not None:
+            for s in self.fresh:
+                self._copper[s.layer].remove(s)
+            for s in self.gone.values():
+                if id(s) not in self.added:
+                    self._copper[s.layer].add(s, _seg_box(s))
+        self.gone, self.fresh = {}, []
+        self.added, self.removed = added0, removed0
 
     def copper_near(self, layer, bounds, grow):
         """(net, id, shape) of the copper on `layer` near `bounds`, each grown by
@@ -502,9 +514,18 @@ class _Editor:
                     poly = poly.buffer(0)
                 clr = z.clearance if z.clearance is not None else \
                     getattr(self.config, 'clearance', 0.0) or 0.0
-                rows.append((z.net_id, poly, clr))
+                thick = z.min_thickness if z.min_thickness is not None else _MIN_THICKNESS
+                rows.append((z.net_id, poly, clr, thick))
             self._pours[layer] = rows
-        return [(nid, p, c) for nid, p, c in self._pours[layer] if nid != net_id]
+        return [row for row in self._pours[layer] if row[0] != net_id]
+
+    def net_clearance(self, net_id):
+        """The moving net's own clearance, which a pour keeps from it when it
+        is larger than the pour's."""
+        cfg = self.config
+        base = getattr(cfg, 'clearance', 0.0) or 0.0
+        nc = getattr(cfg, 'net_clearances', None) or {}
+        return max(base, nc.get(net_id, base))
 
 
 def _pinned(nl, segs):
@@ -714,8 +735,10 @@ def _splits_pours(ed, nl, old, path, width):
     """Would the new copper split a foreign pour where the copper it replaces
     did not? The pass runs after the plane finalize, so nothing after it
     would rejoin a pour it cut. Judged on the pour's fill model around the
-    edit (the outline less every other net's copper at the pour's
-    clearance): the fill pieces there may not grow in number."""
+    edit as KiCad decides connectivity: the outline less every other net's
+    copper at its clearance, opened by the zone's min_thickness (eroded by
+    half of it and grown back, so a strip thinner than that carries no
+    fill). The fill pieces there may not grow in number."""
     pours = ed.pours(nl.layer, nl.net_id)
     if not pours:
         return False
@@ -723,7 +746,9 @@ def _splits_pours(ed, nl, old, path, width):
     from shapely.ops import unary_union
     xs = [p[0] for p in path]
     ys = [p[1] for p in path]
-    for zone_net, poly, clr in pours:
+    own = ed.net_clearance(nl.net_id)
+    for zone_net, poly, zclr, thick in pours:
+        clr = max(zclr, own)
         bx0, by0, bx1, by1 = poly.bounds
         r = width / 2.0 + clr
         if max(xs) + r < bx0 or min(xs) - r > bx1 or max(ys) + r < by0 or min(ys) - r > by1:
@@ -737,13 +762,17 @@ def _splits_pours(ed, nl, old, path, width):
         x0, y0, x1, y1 = grown.bounds
         win = _box(x0 - _POUR_WINDOW, y0 - _POUR_WINDOW, x1 + _POUR_WINDOW, y1 + _POUR_WINDOW)
         mine = {id(s) for s in old}
-        blocks = [g for nid, oid, g in ed.copper_near(nl.layer, win.bounds, clr)
+        blocks = [g for nid, oid, g in ed.copper_near(nl.layer, win.bounds, zclr)
                   if nid != zone_net and oid not in mine]
         region = poly.intersection(win)
         rest = unary_union(blocks) if blocks else None
 
         def pieces(carve):
             fill = region.difference(carve if rest is None else rest.union(carve))
+            if thick > 0:
+                # KiCad keeps a strip exactly min_thickness wide
+                k = thick / 2.0 - _THICK_SLACK
+                fill = fill.buffer(-k).buffer(k)
             return sum(1 for g in getattr(fill, 'geoms', [fill])
                        if not g.is_empty and g.area > _POUR_AREA)
         if pieces(new) > pieces(was):
@@ -751,7 +780,9 @@ def _splits_pours(ed, nl, old, path, width):
     return False
 
 
-_POUR_WINDOW = 0.3
+_POUR_WINDOW = 2.0
+_MIN_THICKNESS = 0.25          # KiCad's default zone min_thickness
+_THICK_SLACK = 0.001
 _POUR_SLACK = 0.001
 _POUR_AREA = 1e-6
 
@@ -1132,8 +1163,7 @@ def legalize_track_geometry(board, scope_net_ids, config, clears,
             if worse(before, grade(nid)):
                 # the net's edits are all still pending (ed.sync folds them
                 # in per net): dropping them restores the net
-                ed.gone, ed.fresh = {}, []
-                ed.added, ed.removed = added0, removed0
+                ed.undo_net(added0, removed0)
                 stats['nets_reverted'] += 1
             elif set(ed.added) != set(added0) or set(ed.removed) != set(removed0):
                 stats['nets'] += 1
