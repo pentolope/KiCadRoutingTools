@@ -285,6 +285,19 @@ def _route_power_nets_count_mismatch(ns, cwd):
                 f"must have the same length")
 
 
+def _route_via_cost_past_int32(ns, cwd):
+    # route.py: the per-via cost (routing_config.via_cost_units) must be a
+    # 32-bit signed integer, the router's cost type, at the run's grid.
+    from routing_config import REFERENCE_GRID_STEP
+    vc, grid = getattr(ns, 'via_cost', None), getattr(ns, 'grid_step', None)
+    if vc is None or not grid or grid <= 0:
+        return None
+    if vc * 1000 * (REFERENCE_GRID_STEP / grid) > 2 ** 31 - 1:
+        return (f"--via-cost {vc} at --grid-step {grid:g} is past the router's "
+                f"32-bit cost: at most "
+                f"{int((2 ** 31 - 1) * grid / (1000 * REFERENCE_GRID_STEP))}")
+
+
 def _repair_count_mismatch(ns, cwd):
     if ns.nets and ns.plane_layers and len(ns.nets) != len(ns.plane_layers):
         return "when both --nets and --plane-layers are given, counts must match"
@@ -320,7 +333,8 @@ def _cap_intent_unreadable(ns, cwd):
 POST_PARSE = {
     'route.py': (_fab_overrides_missing, _output_twice, _route_group_empty,
                  _keep_away, _route_force_reroute_unscoped, _route_group_sources,
-                 _route_power_nets_count_mismatch, _net_clearances_unreadable),
+                 _route_power_nets_count_mismatch, _route_via_cost_past_int32,
+                 _net_clearances_unreadable),
     'route_diff.py': (_keep_away, _fab_overrides_missing, _output_twice,
                       _diff_force_reroute_unscoped, _net_clearances_unreadable),
     'route_planes.py': (_fab_overrides_missing, _output_twice,
@@ -363,6 +377,7 @@ REFUSAL_SITES = {
         '--force-reroute requires an explicit net':
             ('argv', '_route_force_reroute_unscoped'),
         '--power-nets (': ('argv', '_route_power_nets_count_mismatch'),
+        '--via-cost ': ('argv', '_route_via_cost_past_int32'),
         '--component matched no footprint on this':
             ('board', "the board's footprint references"),
         # parse_sources is the argument half; block_refs, in the same try,

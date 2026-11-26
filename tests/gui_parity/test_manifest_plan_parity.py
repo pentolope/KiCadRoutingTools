@@ -1972,6 +1972,12 @@ _POST_PARSE_WITNESSES = (
      'must have the same length'),
     ('_route_power_nets_count_mismatch', 'route.py a.kicad_pcb b.kicad_pcb '
      '--nets X --power-nets GND +3V3', None),
+    ('_route_via_cost_past_int32', 'route.py a.kicad_pcb b.kicad_pcb '
+     '--nets X --via-cost 2147484', "past the router's 32-bit cost"),
+    ('_route_via_cost_past_int32', 'route.py a.kicad_pcb b.kicad_pcb '
+     '--nets X --via-cost 2147483', None),
+    ('_route_via_cost_past_int32', 'route.py a.kicad_pcb b.kicad_pcb '
+     '--nets X --via-cost 214749 --grid-step 0.01', "at most 214748"),
     ('_cap_clearance_not_finite', 'place_fanout_clearance.py a.kicad_pcb '
      '--clearance nan', 'finite number'),
     ('_cap_clearance_not_finite', 'place_fanout_clearance.py a.kicad_pcb '
