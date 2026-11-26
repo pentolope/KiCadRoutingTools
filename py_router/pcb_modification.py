@@ -6034,7 +6034,7 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
             net_vias = vias_by_net.get(net_id, [])
 
             candidates = [s for s in net_segs
-                          if not getattr(s, 'graphic', False)
+                          if not getattr(s, 'graphic', False) and not _locked(s)
                           and (not keep_input_copper or id(s) in routed_seg_result)
                           and math.hypot(s.end_x - s.start_x, s.end_y - s.start_y) > 1e-6]
             if len(candidates) < 2:

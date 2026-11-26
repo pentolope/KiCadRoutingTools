@@ -4,7 +4,8 @@ rules and leaves alone the copper that is not its to change, on both the
 
   (a) a .kicad_dru net keep-out ('disallow track' in a rule area);
   (b) a .kicad_dru net-pair clearance rule above the board's clearance;
-  (c) a track arc: the file's (arc ...) block stays, nothing bypasses it;
+  (c) a track arc: the file's (arc ...) block stays, nothing bypasses it
+      (on a run that routes, the in-run smoother used to);
   (d) copper a KiCad tuning pattern owns;
   (e) a deliberate open stub: a one-pad trace antenna;
   (f) a protected net (.kicad_pro protected_nets) and a net a .kicad_dru
@@ -14,7 +15,11 @@ rules and leaves alone the copper that is not its to change, on both the
       found in it;
   (i) a loop of a track arc and a straight track between the same points:
       the strict collapse removes the straight track, never the arc's
-      pieces, which no (segment ...) block in the file holds.
+      pieces, which no (segment ...) block in the file holds;
+  (j) the atomic write keeps the file's mode, writes through a symlink to
+      its target, and syncs the bytes before the swap;
+  (k) a shipped board whose net ids differ from the run's (an id on one
+      and not the other) is not edited, and the log says why.
 
 Each oracle reads the written file with its own regexes and shapely.
 
@@ -98,8 +103,13 @@ def run(td, body, net_args, dru=None, pro_edit=None):
     json.dump(pro, open(os.path.join(td, 'in.kicad_pro'), 'w', encoding='utf-8'))
     if dru:
         open(os.path.join(td, 'in.kicad_dru'), 'w', encoding='utf-8').write(dru)
+    # the tracks as an earlier chain step's, so the pass may re-lay them
+    start = os.path.join(td, 'start.kicad_pcb')
+    open(start, 'w', encoding='utf-8').write(HEAD + ''.join(
+        b for b in body if not b.lstrip().startswith(('(segment', '(arc'))) + TAIL)
     out = os.path.join(td, 'out.kicad_pcb')
-    r = subprocess.run(PY + [os.path.join('py_router', 'route.py'), src, out, '--nets'] + net_args,
+    r = subprocess.run(PY + [os.path.join('py_router', 'route.py'), src, out, '--nets'] + net_args
+                       + ['--tidy-copper-from', start],
                        capture_output=True, text=True, cwd=REPO)
     run_utils.evidence(out)
     return open(out, encoding='utf-8').read(), r.stdout
@@ -171,7 +181,7 @@ def in_process():
         rd = {'results': [{'new_segments': list(segs), 'new_vias': []}]}
         _late_final_geometry(pcb, None, True, rd,
                              lambda r: ({NET: [x for res in r['results'] for x in res['new_segments']]}, {}),
-                             {}, {'SIG'}, False, cfg)
+                             {}, {'SIG'}, False, cfg, authority={'chain': {}, 'nets': set()})
         after = [(x.start_x, x.start_y, x.end_x, x.end_y) for x in pcb.segments]
         if guided:
             check('a guided step ships as it was drawn', after == before)
@@ -200,6 +210,57 @@ def in_process():
         got = open(path, encoding='utf-8').read()
         shutil.rmtree(td, ignore_errors=True)
     check('the file is left byte for byte', got == text)
+
+    print('(j) the atomic write')
+    from route import _write_atomically
+    td = tempfile.mkdtemp(prefix='krt_fgr_')
+    try:
+        target = os.path.join(td, 'real.kicad_pcb')
+        link = os.path.join(td, 'link.kicad_pcb')
+        open(target, 'w', encoding='utf-8').write('old')
+        os.chmod(target, 0o644)
+        os.symlink(target, link)
+        order = []
+        fsync, replace = os.fsync, os.replace
+        os.fsync = lambda fd: (order.append('fsync'), fsync(fd))[1]
+        os.replace = lambda a, b: (order.append('replace'), replace(a, b))[1]
+        try:
+            _write_atomically(link, 'new')
+        finally:
+            os.fsync, os.replace = fsync, replace
+        check('the link is still a link to the target', os.path.islink(link)
+              and os.path.realpath(link) == os.path.realpath(target))
+        check('the target holds the new text', open(target, encoding='utf-8').read() == 'new')
+        check('the file keeps mode 0644', (os.stat(target).st_mode & 0o777) == 0o644,
+              oct(os.stat(target).st_mode & 0o777))
+        check('the bytes are synced before the swap', order == ['fsync', 'replace'], f'{order}')
+        plain = os.path.join(td, 'plain.kicad_pcb')
+        open(plain, 'w', encoding='utf-8').write('old')
+        os.chmod(plain, 0o644)
+        _write_atomically(plain, 'new')
+        check('a plain file keeps mode 0644', (os.stat(plain).st_mode & 0o777) == 0o644,
+              oct(os.stat(plain).st_mode & 0o777))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    print('(k) a shipped board whose net ids are not the run\'s')
+    import contextlib
+    import io
+    td = tempfile.mkdtemp(prefix='krt_fgr_')
+    try:
+        path = os.path.join(td, 'b.kicad_pcb')
+        text2 = text.replace('(net 0 "") (net 1 "SIG")', '(net 0 "") (net 1 "SIG") (net 2 "FOO")')
+        open(path, 'w', encoding='utf-8').write(text2)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _late_final_geometry(make_pcb(nets={0: make_net(0, ''), NET: make_net(NET, 'SIG')}),
+                                 path, False, None, None, {}, {'SIG'}, False, GridRouteConfig(),
+                                 authority={'chain': {}, 'nets': set()})
+        said = buf.getvalue()
+        check('the file is left as it was', open(path, encoding='utf-8').read() == text2)
+        check('the log names the mismatch', "net 2 is 'FOO' on the shipped board" in said, said)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def main():
@@ -236,10 +297,8 @@ def main():
         check(f'{label}: its tracks ship as they were',
               same(tracks(text, 1), [((3, 5), (5, 5), 0.2), ((6, 5), (10, 5), 0.2)]),
               f'{tracks(text, 1)}')
-    # (a routing run's in-run cleanup re-lays an arc net's tracks on its own,
-    # before this pass; so only the return that runs no in-run cleanup)
     both_paths('arc', [nets('SIG', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'RR')] + sig, ['SIG'],
-               judge=arcs, routes=False)
+               judge=arcs)
 
     print('(d) copper a tuning pattern owns')
     tuned = [pad('J1', 3, 5, 1, 'STAIR'), pad('J2', 10, 5.5, 1, 'STAIR'),

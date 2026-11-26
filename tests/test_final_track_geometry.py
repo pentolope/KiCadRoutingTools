@@ -2,9 +2,11 @@
 becomes the 45-degree run it approximates, a track end that stops just
 outside a via lands on the via centre, a sub-0.1 mm sliver between two
 (almost) collinear pieces merges into one track, and a sub-0.1 mm width
-step joins a neighbour. Run on an already-routed
-board, so route.py takes its "nothing to route" return and only the end of
-a run's cleanups touch the copper.
+step joins a neighbour. Run on an already-routed board, so route.py takes
+its "nothing to route" return and only the end of a run's cleanups touch
+the copper -- copper an earlier step of a chain laid (--tidy-copper-from
+names the board the chain started from). The same board's copper as the
+human's (no --tidy-copper-from) ships as it was drawn.
 
     python3 tests/test_final_track_geometry.py
 """
@@ -130,7 +132,7 @@ def gui_front():
     from kicad_parser import BoardInfo
     from route import _late_final_geometry
 
-    def case(keep_input):
+    def case(keep_input, chain=True):
         pads = [make_pad(7, 3, 12, ref='J3', size_x=1.0, size_y=1.0)]
         track = make_seg(3, 12, 8.0, 12, net_id=7, width=0.2)
         via = make_via(8.255, 12, net_id=7, size=0.5)
@@ -148,7 +150,8 @@ def gui_front():
             return {7: segs}, {7: [via]}
 
         _late_final_geometry(pcb, None, True, rd, write_model, sig, {'LAND'},
-                             keep_input, GridRouteConfig())
+                             keep_input, GridRouteConfig(),
+                             authority={'chain': {} if chain else None, 'nets': set()})
         return rd, track, write_model
 
     rd, track, wm = case(False)
@@ -158,6 +161,9 @@ def gui_front():
           [sorted(p) for p in shipped] == [[(3, 12), (8.255, 12)]], f'{shipped}')
     rd, track, wm = case(True)
     check('--keep-input-copper: the input track stays as it was',
+          not rd.get('segments_to_remove') and wm(rd)[0][7] == [track])
+    rd, track, wm = case(False, chain=False)
+    check('no chain authority: the input track stays as it was',
           not rd.get('segments_to_remove') and wm(rd)[0][7] == [track])
 
 
@@ -171,9 +177,22 @@ def main():
         pro = json.load(open(os.path.join(td, 'in.kicad_pro'), encoding='utf-8'))
         pro['board']['design_settings']['rules']['min_track_width'] = 0.2
         json.dump(pro, open(os.path.join(td, 'in.kicad_pro'), 'w', encoding='utf-8'))
+        start = os.path.join(td, 'start.kicad_pcb')
+        open(start, 'w', encoding='utf-8').write(''.join(
+            ln for ln in board_text().splitlines(True)
+            if not ln.lstrip().startswith(('(segment', '(via'))))
+        human = os.path.join(td, 'human.kicad_pcb')
+        r = subprocess.run(PY + [os.path.join('py_router', 'route.py'), src, human,
+                                 '--nets', 'STAIR', 'LAND', 'SLIVER', 'STEP'],
+                           capture_output=True, text=True, cwd=REPO)
+        run_utils.evidence(human)
+        print('(f) the same copper on the board as the human drew it')
+        check('ships as it was drawn', tracks(human) == tracks(src),
+              f'{sorted(tracks(human).items())}')
         out = os.path.join(td, 'out.kicad_pcb')
         r = subprocess.run(PY + [os.path.join('py_router', 'route.py'), src, out,
-                                 '--nets', 'STAIR', 'LAND', 'SLIVER', 'STEP'],
+                                 '--nets', 'STAIR', 'LAND', 'SLIVER', 'STEP',
+                                 '--tidy-copper-from', start],
                            capture_output=True, text=True, cwd=REPO)
         run_utils.evidence(out)
         check('route.py takes the "nothing to route" return', 'nothing to route' in r.stdout,

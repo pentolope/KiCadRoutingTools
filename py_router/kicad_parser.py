@@ -672,8 +672,10 @@ def tuning_pattern_members(content: str) -> set:
 
 def is_immutable_copper(item) -> bool:
     """True for a track or via no pass may move, rewrite or remove: KiCad-
-    locked copper (#1261) or copper a `sense:` group holds (#1279)."""
-    return bool(getattr(item, 'locked', False) or getattr(item, 'held_by', ''))
+    locked copper (#1261), copper a `sense:` group holds (#1279), and a piece
+    of a linearised track arc (the file holds the arc, not the piece)."""
+    return bool(getattr(item, 'locked', False) or getattr(item, 'held_by', '')
+                or getattr(item, 'arc', False))
 
 
 @dataclass

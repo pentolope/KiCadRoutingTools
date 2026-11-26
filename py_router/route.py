@@ -2125,6 +2125,10 @@ def _install_copper_rules(config, pcb_data, input_file, layer_clearances,
     config.set_net_clearances(net_clearances, list(routed_net_ids))
 
 
+class _NetIdMismatch(ValueError):
+    """The shipped board's net ids name other nets than the run's."""
+
+
 def _copper_probe(board, pcb_data, config):
     """copper_clearance_probe for new copper on `board` (the shipped board:
     the written file re-parsed on the CLI, the write model on the GUI) under
@@ -2133,10 +2137,13 @@ def _copper_probe(board, pcb_data, config):
     board whose ids name other nets than pcb_data's is refused."""
     from pcb_modification import copper_clearance_probe
     if board is not pcb_data:
-        for nid, net in board.nets.items():
-            if nid in pcb_data.nets and pcb_data.nets[nid].name != net.name:
-                raise ValueError(f"net {nid} is {net.name!r} on the shipped board "
-                                 f"and {pcb_data.nets[nid].name!r} in the run")
+        for nid in set(board.nets) | set(pcb_data.nets):
+            ours = pcb_data.nets[nid].name if nid in pcb_data.nets else None
+            theirs = board.nets[nid].name if nid in board.nets else None
+            if ours != theirs:
+                raise _NetIdMismatch(f"net {nid} is {theirs!r} on the shipped board and "
+                                 f"{ours!r} in the run, and the run's rules are "
+                                 f"keyed by net id")
         board._net_keepouts = list(getattr(pcb_data, '_net_keepouts', None) or [])
     return copper_clearance_probe(
         board, config.clearance,
@@ -2144,9 +2151,32 @@ def _copper_probe(board, pcb_data, config):
         getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
 
 
+def _input_copper_authority(pcb_data, tidy_copper_from, rip_existing_nets):
+    """Which of this run's INPUT copper the end-of-run track geometry pass
+    may re-lay: {'chain': the starting board's copper signature or None,
+    'nets': the net names opted in}. Copper on the starting board -- the
+    human's -- stays as drawn unless its net is named in --rip-existing-nets;
+    copper the chain's earlier steps laid may be re-laid when the chain says
+    where it started (--tidy-copper-from)."""
+    from net_queries import matches_net_filter
+    names = set()
+    if rip_existing_nets:
+        names = {n.name for n in pcb_data.nets.values()
+                 if n.name and matches_net_filter(n.name, rip_existing_nets)}
+    chain = None
+    if tidy_copper_from:
+        from kicad_parser import parse_kicad_pcb as _pk_tidy
+        from improvement_gate import copper_signature
+        base = _pk_tidy(tidy_copper_from)
+        chain = copper_signature(base.segments, base.vias,
+                                 lambda nid: (base.nets[nid].name
+                                              if nid in base.nets else None))
+    return {'chain': chain, 'nets': names}
+
+
 def _late_final_geometry(pcb_data, output_file, return_results, results_data,
                          write_model, input_signature, scope_names,
-                         keep_input_copper, config):
+                         keep_input_copper, config, authority=None):
     """final_geometry.legalize_track_geometry on the board this run SHIPS,
     after the passes that lay, collapse or sweep copper: every end exactly
     on what it joins, no unjustified fragment under MIN_TRACK_FRAGMENT,
@@ -2157,7 +2187,9 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
     owns, and --keep-input-copper makes input copper read-only. A guide-
     corridor step keeps its drawn geometry, as the smoother does. On the CLI
     the file is rewritten once, and not at all unless every track the pass
-    replaces is found in it. Returns (nets changed, copper keys laid)."""
+    replaces is found in it. INPUT copper -- what the board carried before
+    this run -- is read-only unless `authority` (_input_copper_authority)
+    opens it. Returns (nets changed, copper keys laid)."""
     import copy as _copy
     from collections import Counter
     from improvement_gate import copper_item_key
@@ -2204,13 +2236,27 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
         owned = set()
         readonly = {id(s) for s in board.segments if s.uuid and s.uuid in tuned}
         left = {n: Counter(c) for n, c in (input_signature or {}).items()}
+        authority = authority or {}
+        chain_left = ({n: Counter(c) for n, c in authority['chain'].items()}
+                      if authority.get('chain') is not None else None)
+        opted = set(authority.get('nets') or ())
         for s in board.segments:
-            c = left.get(name_of.get(s.net_id))
+            nm = name_of.get(s.net_id)
+            c = left.get(nm)
             k = copper_item_key(s)
             if c and c[k] > 0:
-                c[k] -= 1
+                c[k] -= 1                   # input copper
                 if keep_input_copper:
                     readonly.add(id(s))
+                elif nm in opted:
+                    continue
+                elif chain_left is None:
+                    readonly.add(id(s))
+                else:
+                    b = chain_left.get(nm)
+                    if b and b[k] > 0:      # on the board the chain started from
+                        b[k] -= 1
+                        readonly.add(id(s))
             else:
                 owned.add(id(s))
         clears = _copper_probe(board, pcb_data, config)
@@ -2264,6 +2310,9 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
                  if stats.get('nets_reverted') else ""))
         return ({name_of.get(x.net_id) for x in list(removed) + list(added)},
                 {copper_item_key(x) for x in added})
+    except _NetIdMismatch as _e:
+        print(f"  Track geometry (end of run): not run -- {_e}")
+        return set(), set()
     except Exception as _e:                                     # noqa: BLE001
         print(f"  (end-of-run track geometry skipped: {type(_e).__name__}: {_e})")
         return set(), set()
@@ -2271,14 +2320,27 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
 
 def _write_atomically(path, content):
     """Replace `path` with `content` in one step: a reader never sees a
-    half-written board, and a failed write leaves the old one."""
+    half-written board, and a failed write leaves the old one. A symlinked
+    path is written through to its target; the file keeps its mode (a new
+    one takes the umask's), and its bytes reach the disk before the swap."""
+    import stat
     import tempfile
-    d = os.path.dirname(os.path.abspath(path))
+    target = os.path.realpath(path)
+    d = os.path.dirname(target)
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     fd, tmp = tempfile.mkstemp(prefix='.krt_', suffix='.kicad_pcb', dir=d)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as _f:
             _f.write(content)
-        os.replace(tmp, path)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -2287,14 +2349,15 @@ def _write_atomically(path, content):
 
 def _late_final_geometry_and_collapse(pcb_data, output_file, return_results,
                                       results_data, write_model, input_signature,
-                                      scope_names, keep_input_copper, config):
+                                      scope_names, keep_input_copper, config,
+                                      authority=None):
     """_late_final_geometry, then the #1063 strict collapse once more on the
     nets it changed, its own copper held: a landing or re-lay can leave a
     track it replaced in spirit (a loop through the via it landed on) that
     the collapse before it never saw."""
     changed, laid = _late_final_geometry(
         pcb_data, output_file, return_results, results_data, write_model,
-        input_signature, scope_names, keep_input_copper, config)
+        input_signature, scope_names, keep_input_copper, config, authority)
     if changed:
         _late_strict_collapse1063(
             pcb_data, output_file, return_results, results_data, write_model,
@@ -2787,6 +2850,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 keep_input_copper: bool = False,
                 smoothing: bool = True,
                 rip_existing_nets: Optional[List[str]] = None,
+                # The board a chain started from: input copper this run carries
+                # beyond it was laid by the chain's earlier steps, and the
+                # end-of-run track geometry pass may re-lay it. Internal to
+                # chains (autoroute), CLI only.
+                tidy_copper_from: Optional[str] = None,
                 # Net name patterns whose matches are protected for THIS run
                 # (reason 'user') and persisted to the output .kicad_pro like
                 # a routed diff pair's record: no rip glob, --rip-blocker-nets
@@ -3321,12 +3389,15 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     # which nets this run changed (objects move in place; see copper_signature).
     # Outermost run only -- nested sub-runs do not re-grade.
     _input_sig1069 = None
+    _tidy_authority = None
     if final_reconcile:
         from improvement_gate import copper_signature as _csig1069
         _input_sig1069 = _csig1069(
             pcb_data.segments, pcb_data.vias,
             lambda _nid: (pcb_data.nets[_nid].name
                           if _nid in pcb_data.nets else None))
+        _tidy_authority = _input_copper_authority(
+            pcb_data, tidy_copper_from, rip_existing_nets)
     # #962: the input's vias as VALUES (net, x, y, size), not object references
     # (a nudge moves the objects). The ship-time Type VII stamp uses it to tell
     # a via this run ADDED from one the board already had. With the board
@@ -4122,7 +4193,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 if _pass is _late_strict_collapse1063:
                     _late_final_geometry_and_collapse(
                         pcb_data, output_file, as_gui, rd, None, _input_sig1069,
-                        _scope1166, keep_input_copper, config)
+                        _scope1166, keep_input_copper, config, _tidy_authority)
                     # #1843: the geometry pass merges pieces an area edge split
                     _late_area_edge_split1843(
                         pcb_data, output_file, as_gui, rd, None, _input_sig1069,
@@ -9691,7 +9762,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             _gui_write_model, _input_sig1069,
             {pcb_data.nets[_n].name for _n in sweep_scope_ids
              if _n in pcb_data.nets},
-            keep_input_copper, config)
+            keep_input_copper, config, _tidy_authority)
         # #1166: after the collapse, which can itself free a via.
         _late_dangling_via_sweep1166(
             pcb_data, output_file, return_results, locals().get('results_data'),
@@ -10982,6 +11053,13 @@ For differential pair routing, use route_diff.py:
                              "otherwise)")
     parser.add_argument("--no-bga-zones", "--no-bga-zone", nargs="*", default=None,
                         help="Disable BGA exclusion zones. No args = disable all. With component refs (e.g., U1 U3) = disable only those.")
+    parser.add_argument("--tidy-copper-from", default=None, metavar="BOARD",
+                        help="The .kicad_pcb a chain of steps started from. The "
+                             "end-of-run track geometry pass re-lays only the copper "
+                             "this run laid; with this flag also the input copper "
+                             "the earlier steps laid (copper the starting board "
+                             "already had stays as drawn). Nets named in "
+                             "--rip-existing-nets may be re-laid either way.")
     parser.add_argument("--rip-existing-nets", nargs="+", default=None,
                         metavar="PATTERN",
                         help="Net name patterns of PRE-EXISTING routed nets that may be "
@@ -11880,6 +11958,7 @@ For differential pair routing, use route_diff.py:
                 route_first=args.route_first,
                 disable_bga_zones=args.no_bga_zones,
                 rip_existing_nets=args.rip_existing_nets,
+                tidy_copper_from=args.tidy_copper_from,
                 force_reroute=args.force_reroute,
                 # RAW patterns (pre-expansion): the #521 protection override
                 # must see what the operator TYPED, not the expanded names.
