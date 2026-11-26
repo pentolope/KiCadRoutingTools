@@ -6999,7 +6999,8 @@ def _seg_worst_offender(pcb_data, net_id, s, clearance, net_clearances=None,
                 _cx = _coupled_excess(config, net_id, nids[near], 'pad', clearance, s.layer,
                                       pads=(_object_rows(_foreign_pad_rows(pcb_data,
                                                                            s.layer))[near]
-                                            if config.coupled_pair_clearances else None))
+                                            if getattr(config, 'coupled_pair_clearances', None)
+                                            else None))
                 fexc = _fold_scoped_excess(fexc, np.where(plc[near] > 0, np.nan, _cx))
             # Work in each pad's LOCAL frame (query offsets rotated by R(-rot),
             # identity for axis-aligned pads) so tilted pads use their true
