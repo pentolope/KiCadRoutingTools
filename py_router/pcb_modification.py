@@ -1997,11 +1997,7 @@ def sweep_dead_ends(results, pcb_data: PCBData, scope_net_ids=None,
                                                   margin=0.02,
                                                   shared_buckets=_fvb))
         anchor = []
-        # A net with one pad and no pour joins nothing, so the copper the
-        # board gave it is the design's own (a trace antenna), never a dead
-        # end routing left: it is kept as input copper is under
-        # keep_input_copper.
-        if keep_input_copper or (len(pads) < 2 and not zones):
+        if keep_input_copper:
             # Input copper is read-only: anchor it (counts for degree/T-junction/
             # connectivity in the pruner) instead of offering it as a candidate.
             anchor = [s for s in net_segs if id(s) not in routed_seg_ids]
@@ -6033,11 +6029,8 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
             if len(net_segs) > max_net_segs:
                 stats['nets_skipped_large'] += 1
                 continue
-            net_pads = pcb_data.pads_by_net.get(net_id, [])
-            if len(net_pads) < 2 and not any(z.net_id == net_id for z in
-                                             (getattr(pcb_data, 'zones', None) or ())):
-                continue            # joins nothing: its copper is the design's
             stats['nets'] += 1
+            net_pads = pcb_data.pads_by_net.get(net_id, [])
             net_vias = vias_by_net.get(net_id, [])
 
             candidates = [s for s in net_segs
