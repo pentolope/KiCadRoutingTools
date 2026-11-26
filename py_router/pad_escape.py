@@ -211,6 +211,29 @@ def stub_width(config, net_id, layer) -> Optional[float]:
     return w
 
 
+def note_used(pcb_data, net_id, used) -> None:
+    """Record the launch cells a route ended on, `used` = {cell: stub}: a
+    path end there connects through its stub, never by a connector of its
+    own (`joins_launch`)."""
+    reg = pcb_data.__dict__.setdefault('_pad_escape_ends', {})
+    for cell, segs in used.items():
+        reg[(net_id,) + tuple(cell[:3])] = list(segs)
+
+
+def joins_launch(pcb_data, net_id, cell, config) -> bool:
+    """Is grid `cell` (gx, gy, layer_idx) a launch whose stub joins it to
+    the net's pad -- committed to the board, or held by a plan probe, which
+    commits nothing?"""
+    reg = getattr(pcb_data, '_pad_escape_ends', None)
+    segs = reg.get((net_id,) + tuple(cell[:3])) if reg else None
+    if not segs:
+        return False
+    if getattr(config, 'plan_probe', False):
+        return True
+    have = {id(sg) for sg in pcb_data.segments}
+    return all(id(sg) in have for sg in segs)
+
+
 def escape_launches(obstacles, config, pcb_data, net_id, pad, layer_idx,
                     side_cells, coord, w) -> List[Tuple[Tuple[int, int, int], list]]:
     """[((gx, gy, layer_idx), [Segment, ...]), ...]: free cells outside the

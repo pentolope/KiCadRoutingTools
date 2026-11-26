@@ -79,7 +79,8 @@ DRU = ('(version 1)\n'
        '(A.NetName == \'SRC\' || B.NetName == \'SRC\')"))\n')
 #: kicad-cli violation types that are copper the route made wrong
 COPPER = {'clearance', 'shorting_items', 'tracks_crossing', 'copper_edge_clearance',
-          'hole_clearance', 'unconnected_items', 'track_width'}
+          'hole_clearance', 'unconnected_items', 'track_width', 'track_dangling',
+          'solder_mask_bridge'}
 
 fails = []
 

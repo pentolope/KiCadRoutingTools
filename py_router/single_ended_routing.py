@@ -3337,6 +3337,11 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
     # (`_terminal_row`, #1556).
     start_original = _terminal_row(sources, path_start, layer_names, coord)
     end_original = _terminal_row(targets, path_end, layer_names, coord)
+    from pad_escape import joins_launch
+    if start_original and joins_launch(pcb_data, net_id, path_start, config):
+        start_original = None
+    if end_original and joins_launch(pcb_data, net_id, path_end, config):
+        end_original = None
 
     # Get through-hole pad positions for this net (layer transitions without via)
     through_hole_positions = get_same_net_through_hole_positions(pcb_data, net_id, config)
@@ -4415,12 +4420,15 @@ def _route_with_pad_escape(router, obstacles, config, sources, targets,
     path = res[0]
     if path is None:
         return None, res[1]
-    used = []
+    ends = {}
     for end in (tuple(path[0][:3]), tuple(path[-1][:3])):
         if end in stubs:
-            used.extend(stubs.pop(end))
+            ends[end] = stubs.pop(end)
+    used = [sg for segs in ends.values() for sg in segs]
     if not used:
         return res + ([], []), res[1]   # routed between the original terminals
+    from pad_escape import note_used
+    note_used(pcb_data, net_id, ends)
     if not getattr(config, 'plan_probe', False):
         # Committed now, as the #189 unblock copper is (#803).
         _have = {id(sg) for sg in pcb_data.segments}
@@ -7804,6 +7812,15 @@ def _path_to_segments_vias(
 
     if not path:
         return segments, vias
+
+    if pcb_data is not None:
+        # A path end on a pad-escape launch connects through the escape's
+        # exact-clear stub: no connector (nor a terminal merge) to the pad.
+        from pad_escape import joins_launch
+        if start_original and joins_launch(pcb_data, net_id, path[0], config):
+            start_original = None
+        if end_original and joins_launch(pcb_data, net_id, path[-1], config):
+            end_original = None
 
     # Simplify path by removing collinear intermediate points
     path = simplify_path(path)
