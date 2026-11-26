@@ -19,9 +19,10 @@ the floor the step wrote back).
   A2. the grades of a step's own copper (`STEP_RULE_KEYS`: hole_rules and
      the rest) survive a ledger re-stamp, and the outermost run's grade of
      the copper it ships replaces them in --json-out and the log merge.
-  B. end to end on the kit board: the pour, then route.py `--nets GND`. The
-     run must descend (else this fixture tests nothing -- BROKEN), and every
-     channel must then report the floor the .kicad_pro says.
+  B. end to end on the kit board at clearance 0.25: the pour, then route.py
+     `--nets GND`. The run must descend (else this fixture tests nothing --
+     BROKEN), and every channel must then report the floor the .kicad_pro
+     says.
 
     python3 -X utf8 tests/test_summary_shipped_floor.py
 """
@@ -168,7 +169,10 @@ def row_a2_step_rule_grades():
     rs.reset_run_state()
 
 
-BASE = ['--track-width', '0.2', '--clearance', '0.2', '--via-size', '0.5',
+# At 0.2 the boxed-pad escape (pad_escape.py) routes every GND pad with no
+# descent; at 0.25 the finalize still descends.
+CLEARANCE = 0.25
+BASE = ['--track-width', '0.2', '--clearance', str(CLEARANCE), '--via-size', '0.5',
         '--via-drill', '0.4', '--hole-to-hole-clearance', '0.3',
         '--layers', 'F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu']
 
@@ -194,10 +198,10 @@ def row_b_kit_board():
                   + '.kicad_pro', encoding='utf-8') as fh:
             pro = json.load(fh)
         floor = pro['board']['design_settings']['rules']['min_clearance']
-        if not floor < 0.2 - 1e-9:
+        if not floor < CLEARANCE - 1e-9:
             raise AssertionError(
                 f'BROKEN TEST: the run wrote back min_clearance {floor}, not a '
-                f'descent below 0.2 -- this fixture no longer exercises a '
+                f'descent below {CLEARANCE} -- this fixture no longer exercises a '
                 f'finalize descent, so it tests nothing')
         print(f'  (the writeback stored rules.min_clearance {floor})')
 
