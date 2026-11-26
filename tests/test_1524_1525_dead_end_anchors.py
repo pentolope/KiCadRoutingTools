@@ -105,9 +105,11 @@ def zone_text(layer):
 
 
 def plane_board(td, zone_layers):
-    """GND pad on F.Cu at (10,20), F.Cu track to a through via at (15,20), and
-    a B.Cu stub (15,20)-(20,20) off that via whose far end connects nothing.
-    The net is poured on `zone_layers`."""
+    """GND pads on F.Cu at (5,20) and (10,20) joined by an F.Cu track, an F.Cu
+    track on to a through via at (15,20), and a B.Cu stub (15,20)-(20,20)
+    off that via whose far end connects nothing. The net is poured on
+    `zone_layers`. (Two pads: a one-pad net's copper is the design's own,
+    which the sweep keeps.)"""
     zones = ''.join(zone_text(L) for L in zone_layers)
     text = f'''(kicad_pcb (version 20240108) (generator "test") (generator_version "8.0")
   (general (thickness 1.6) (legacy_teardrops no))
@@ -121,7 +123,13 @@ def plane_board(td, zone_layers):
     (property "Value" "P" (at 0 1.5 0) (layer "F.Fab") (hide yes) (effects (font (size 1 1) (thickness 0.15))))
     (attr smd)
     (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+  (footprint "P:Pad" (layer "F.Cu") (at 5 20)
+    (property "Reference" "U2" (at 0 -1.5 0) (layer "F.SilkS") (hide yes) (effects (font (size 1 1) (thickness 0.15))))
+    (property "Value" "P" (at 0 1.5 0) (layer "F.Fab") (hide yes) (effects (font (size 1 1) (thickness 0.15))))
+    (attr smd)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
   (gr_rect (start 0 0) (end 40 40) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))
+  (segment (start 5 20) (end 10 20) (width 0.2) (layer "F.Cu") (net 1))
   (segment (start 10 20) (end 15 20) (width 0.2) (layer "F.Cu") (net 1))
   (via (at 15 20) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))
   (segment (start 15 20) (end 20 20) (width 0.2) (layer "B.Cu") (net 1)){zones}

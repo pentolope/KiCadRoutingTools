@@ -1017,10 +1017,12 @@ def _ship_via_protection962(pcb_data, output_file, return_results, results_data,
 
 def _strip_written_copper(output_file, segments, vias, name_of,
                           match_width=False, unmatched_out=None,
-                          require_all=False):
+                          require_all=False, append=()):
     """Delete `segments` and `vias` from the written file, in place. Returns
     the (segments, vias) counts actually deleted, which the caller reports;
     `unmatched_out`, if given, receives the SEGMENTS no block matched.
+    `append` blocks are added in the same write; with `require_all`, nothing
+    is written unless every item chosen is found.
 
     The name map rides whenever the file references nets by name
     (`board_uses_name_nets`, the writer's own test). remove_*_from_content
@@ -1048,7 +1050,11 @@ def _strip_written_copper(output_file, segments, vias, name_of,
     if require_all and (n_s, n_v) != (len(segments or ()), len(vias or ())):
         # a removal chosen as a whole is written as a whole or not at all
         return 0, 0
-    if n_s or n_v:
+    if append:
+        # blocks laid in the same edit go in with the same write
+        lp = content.rfind(')')
+        content = content[:lp] + '\n'.join(append) + '\n' + content[lp:]
+    if n_s or n_v or append:
         _write_atomically(output_file, content)
     return n_s, n_v
 
@@ -1524,7 +1530,7 @@ def _late_strict_collapse1063(pcb_data, output_file, return_results, results_dat
             scope, keep_input_copper=keep_input_copper, stats=_stats,
             protect_segment_ids={id(x) for x in board.segments
                                  if copper_item_key(x) in protect_keys
-                                 or getattr(x, 'arc', False)})
+                                 or getattr(x, 'arc_in_file', False)})
         kept_s = {id(s) for s in board.segments}
         kept_v = {id(v) for v in board.vias}
         removed = [s for s in before_s if id(s) not in kept_s]
@@ -1788,7 +1794,7 @@ def _late_dangling_via_sweep1166(pcb_data, output_file, return_results,
                 owned.add(id(item))
         scope = {nid for nid, nm in name_of.items() if nm in set(scope_names)}
         _stats = {}
-        protected |= {id(x) for x in board.segments if getattr(x, 'arc', False)}
+        protected |= {id(x) for x in board.segments if getattr(x, 'arc_in_file', False)}
         removed, dropped = sweep_dangling_via_branches(
             board, scope, protected_ids=protected, stats=_stats)
         if not (removed or dropped):
@@ -2151,6 +2157,38 @@ def _copper_probe(board, pcb_data, config):
         getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
 
 
+def _copper_cover(signature, tol=2e-4):
+    """covers(net_name, segment): does `segment` lie along a track of
+    `signature` (improvement_gate.copper_signature) -- same net, layer and
+    width, both ends on that track's centreline?"""
+    import math
+    from collections import defaultdict
+    cells = defaultdict(list)
+    for name, keys in signature.items():
+        for k in keys:
+            if k[0] != 's':
+                continue
+            _s, layer, a, b, w = k
+            for cx in range(int((min(a[0], b[0]) - tol) // 1), int((max(a[0], b[0]) + tol) // 1) + 1):
+                for cy in range(int((min(a[1], b[1]) - tol) // 1),
+                                int((max(a[1], b[1]) + tol) // 1) + 1):
+                    cells[(name, layer, cx, cy)].append((a, b, w))
+
+    def on(p, a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = dx * dx + dy * dy
+        t = 0.0 if L <= 0 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L))
+        return math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy) <= tol
+
+    def covers(name, seg):
+        p, q = (seg.start_x, seg.start_y), (seg.end_x, seg.end_y)
+        for a, b, w in cells.get((name, seg.layer, int(p[0] // 1), int(p[1] // 1)), ()):
+            if abs(w - seg.width) <= tol and on(p, a, b) and on(q, a, b):
+                return True
+        return False
+    return covers
+
+
 def _input_copper_authority(pcb_data, tidy_copper_from, rip_existing_nets):
     """Which of this run's INPUT copper the end-of-run track geometry pass
     may re-lay: {'chain': the starting board's copper signature or None,
@@ -2235,30 +2273,23 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
             return set(), set()
         owned = set()
         readonly = {id(s) for s in board.segments if s.uuid and s.uuid in tuned}
-        left = {n: Counter(c) for n, c in (input_signature or {}).items()}
+        # Ownership by GEOMETRY: a track lying along copper the input had is
+        # that copper, whole or a piece another pass split off it (#1217).
         authority = authority or {}
-        chain_left = ({n: Counter(c) for n, c in authority['chain'].items()}
-                      if authority.get('chain') is not None else None)
+        in_input = _copper_cover(input_signature or {})
+        in_start = (_copper_cover(authority['chain'])
+                    if authority.get('chain') is not None else None)
         opted = set(authority.get('nets') or ())
         for s in board.segments:
             nm = name_of.get(s.net_id)
-            c = left.get(nm)
-            k = copper_item_key(s)
-            if c and c[k] > 0:
-                c[k] -= 1                   # input copper
-                if keep_input_copper:
-                    readonly.add(id(s))
-                elif nm in opted:
-                    continue
-                elif chain_left is None:
-                    readonly.add(id(s))
-                else:
-                    b = chain_left.get(nm)
-                    if b and b[k] > 0:      # on the board the chain started from
-                        b[k] -= 1
-                        readonly.add(id(s))
-            else:
-                owned.add(id(s))
+            if not in_input(nm, s):
+                owned.add(id(s))            # this run laid it
+            elif keep_input_copper:
+                readonly.add(id(s))
+            elif nm in opted:
+                continue
+            elif in_start is None or in_start(nm, s):
+                readonly.add(id(s))         # on the board the chain started from
         clears = _copper_probe(board, pcb_data, config)
         removed, added, stats = legalize_track_geometry(
             board, scope, config, clears, readonly_ids=readonly)
@@ -2283,24 +2314,20 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
             bump_copper_epoch(pcb_data)
         else:
             from kicad_parser import board_uses_name_nets
-            from kicad_writer import generate_segment_sexpr, remove_segments_from_content
+            from kicad_writer import generate_segment_sexpr
             v10 = board_uses_name_nets(content)
-            unmatched = []
-            content, n_s = remove_segments_from_content(
-                content, removed, net_id_to_name=name_of if v10 else None,
-                unmatched_out=unmatched, match_width=True)
-            if unmatched or n_s != len(removed):
-                print(f"  WARNING: track geometry: chose {len(removed)} "
-                      f"segment(s) to replace and found {n_s} in the written "
-                      f"file; the file is left as it was")
-                return set(), set()
             sexprs = [generate_segment_sexpr(
                 (p.start_x, p.start_y), (p.end_x, p.end_y), p.width, p.layer,
                 p.net_id, name_of.get(p.net_id) if v10 else None)
                 for p in added]
-            lp = content.rfind(')')
-            content = content[:lp] + '\n'.join(sexprs) + '\n' + content[lp:]
-            _write_atomically(output_file, content)
+            n_s, _nv = _strip_written_copper(output_file, removed, [], name_of,
+                                             match_width=True, require_all=True,
+                                             append=sexprs)
+            if n_s != len(removed):
+                print(f"  WARNING: track geometry: chose {len(removed)} "
+                      f"segment(s) to replace, not all of them are in the "
+                      f"written file; the file is left as it was")
+                return set(), set()
         print(f"  Track geometry (end of run): re-laid {stats.get('legs_relaid', 0)} "
               f"short piece(s) and {stats.get('corners_relaid', 0)} corner(s), "
               f"landed {stats.get('ends_landed', 0)} end(s), merged "

@@ -639,9 +639,13 @@ class Segment:
     # and it does not make the net never-rippable (only the net's pre-existing
     # copper is spared from whole-net strips, protected_nets.protection_map).
     held_by: str = ""
-    # A piece of a linearised track ARC: the file holds one (arc ...) block,
-    # not this straight piece, so no pass can rewrite or strip it alone.
+    # A piece of a linearised track ARC (both parse paths).
     arc: bool = False
+    # ...read from a FILE, whose writer strips (segment ...) blocks and has no
+    # way to rewrite or strip this piece's (arc ...) block alone: immutable.
+    # The pcbnew path maps a piece back to its live PCB_ARC and removes the
+    # whole arc, so a GUI pass may still rip or sweep arcs whole.
+    arc_in_file: bool = False
 
 
 def tuning_pattern_members(content: str) -> set:
@@ -673,9 +677,10 @@ def tuning_pattern_members(content: str) -> set:
 def is_immutable_copper(item) -> bool:
     """True for a track or via no pass may move, rewrite or remove: KiCad-
     locked copper (#1261), copper a `sense:` group holds (#1279), and a piece
-    of a linearised track arc (the file holds the arc, not the piece)."""
+    of a track arc read from a file (the file holds the arc, not the piece:
+    Segment.arc_in_file)."""
     return bool(getattr(item, 'locked', False) or getattr(item, 'held_by', '')
-                or getattr(item, 'arc', False))
+                or getattr(item, 'arc_in_file', False))
 
 
 @dataclass
@@ -6710,7 +6715,7 @@ def extract_segments(content: str, name_to_id: Dict[str, int] = None) -> List[Se
         for (p0, p1) in _arc_to_segments((sx, sy), (mx, my), (ex, ey)):
             out.append(_seg(p0[0], p0[1], p1[0], p1[1], width, layer, net_id,
                             uuid, locked))
-            out[-1].arc = True
+            out[-1].arc = out[-1].arc_in_file = True
 
     blocks, unbalanced = _track_blocks(content)
     for off in unbalanced:

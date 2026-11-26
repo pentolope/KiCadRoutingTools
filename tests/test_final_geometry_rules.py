@@ -7,7 +7,8 @@ rules and leaves alone the copper that is not its to change, on both the
   (c) a track arc: the file's (arc ...) block stays, nothing bypasses it
       (on a run that routes, the in-run smoother used to);
   (d) copper a KiCad tuning pattern owns;
-  (e) a deliberate open stub: a one-pad trace antenna;
+  (e) a deliberate open stub: a one-pad trace antenna (on a run that
+      routes, the in-run dead-end sweep took it and the smoother re-laid it);
   (f) a protected net (.kicad_pro protected_nets) and a net a .kicad_dru
       length rule binds;
   (g) a guide-corridor step keeps its drawn geometry (GUI front);
@@ -19,7 +20,10 @@ rules and leaves alone the copper that is not its to change, on both the
   (j) the atomic write keeps the file's mode, writes through a symlink to
       its target, and syncs the bytes before the swap;
   (k) a shipped board whose net ids differ from the run's (an id on one
-      and not the other) is not edited, and the log says why.
+      and not the other) is not edited, and the log says why;
+  (l) a user track a pass split at a tee (#1217) stays the user's: both
+      pieces are read-only to the pass, with or without a chain's start
+      board, while the branch the run laid stays editable.
 
 Each oracle reads the written file with its own regexes and shapely.
 
@@ -262,6 +266,40 @@ def in_process():
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
+    print('(l) a user track split at a tee')
+    from improvement_gate import copper_signature
+    td = tempfile.mkdtemp(prefix='krt_fgr_')
+    try:
+        path = os.path.join(td, 'b.kicad_pcb')
+        segs3 = ''.join(f'  (segment (start {a[0]} {a[1]}) (end {b[0]} {b[1]}) (width 0.2) '
+                        f'(layer "F.Cu") (net 1) (uuid "11111111-0000-0000-0000-00000000000{i}"))\n'
+                        for i, (a, b) in enumerate((((3, 5), (5, 5)), ((5, 5), (10, 5)),
+                                                    ((5, 5), (5, 8)))))
+        open(path, 'w', encoding='utf-8').write(
+            '(kicad_pcb (version 20241229) (generator "pcbnew")\n  (layers (0 "F.Cu" signal) '
+            '(2 "B.Cu" signal) (25 "Edge.Cuts" user))\n  (net 0 "") (net 1 "SIG")\n' + segs3 + ')\n')
+        user = copper_signature([make_seg(3, 5, 10, 5, net_id=NET)], [], {NET: 'SIG'}.get)
+        seen = {}
+
+        def capture(board, scope, config, clears, readonly_ids=frozenset()):
+            seen['ro'] = sorted((x.start_x, x.start_y, x.end_x, x.end_y)
+                                for x in board.segments if id(x) in readonly_ids)
+            return [], [], {}
+        fg.legalize_track_geometry = capture
+        try:
+            for label, authority in (('no chain authority', None),
+                                     ('the chain started with it', {'chain': user, 'nets': set()})):
+                seen.clear()
+                _late_final_geometry(make_pcb(nets={0: make_net(0, ''), NET: make_net(NET, 'SIG')}),
+                                     path, False, None, None, user, {'SIG'}, False,
+                                     GridRouteConfig(), authority=authority)
+                check(f'{label}: both pieces read-only, the branch editable',
+                      seen.get('ro') == [(3, 5, 5, 5), (5, 5, 10, 5)], f'{seen}')
+        finally:
+            fg.legalize_track_geometry = real
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 
 def main():
     print('(a) a .kicad_dru keep-out for STAIR over rule area KO')
@@ -322,10 +360,8 @@ def main():
 
     def keep(label, text, log):
         check(f'{label}: the antenna ships whole', same(tracks(text, 1), ant), f'{tracks(text, 1)}')
-    # (a routing run's in-run dead-end sweep takes a one-pad net's copper on
-    # its own, before this pass; so only the return that runs none)
     both_paths('antenna', [nets('ANT', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'RR')] + stubs,
-               ['ANT'], judge=keep, routes=False)
+               ['ANT'], judge=keep)
 
     print('(i) a loop of an arc and a straight track')
     loop = [pad('J1', 3, 5, 1, 'SIG'), pad('J2', 10, 5, 1, 'SIG'),
