@@ -1016,7 +1016,8 @@ def _ship_via_protection962(pcb_data, output_file, return_results, results_data,
 
 
 def _strip_written_copper(output_file, segments, vias, name_of,
-                          match_width=False, unmatched_out=None):
+                          match_width=False, unmatched_out=None,
+                          require_all=False):
     """Delete `segments` and `vias` from the written file, in place. Returns
     the (segments, vias) counts actually deleted, which the caller reports;
     `unmatched_out`, if given, receives the SEGMENTS no block matched.
@@ -1044,9 +1045,11 @@ def _strip_written_copper(output_file, segments, vias, name_of,
     if vias:
         content, n_v = remove_vias_from_content(content, vias,
                                                 net_id_to_name=nmap)
+    if require_all and (n_s, n_v) != (len(segments or ()), len(vias or ())):
+        # a removal chosen as a whole is written as a whole or not at all
+        return 0, 0
     if n_s or n_v:
-        with open(output_file, 'w', encoding='utf-8') as _f:
-            _f.write(content)
+        _write_atomically(output_file, content)
     return n_s, n_v
 
 
@@ -1520,7 +1523,8 @@ def _late_strict_collapse1063(pcb_data, output_file, return_results, results_dat
             [{'new_segments': owned_segs, 'new_vias': owned_vias}], board,
             scope, keep_input_copper=keep_input_copper, stats=_stats,
             protect_segment_ids={id(x) for x in board.segments
-                                 if copper_item_key(x) in protect_keys})
+                                 if copper_item_key(x) in protect_keys
+                                 or getattr(x, 'arc', False)})
         kept_s = {id(s) for s in board.segments}
         kept_v = {id(v) for v in board.vias}
         removed = [s for s in before_s if id(s) not in kept_s]
@@ -1550,11 +1554,12 @@ def _late_strict_collapse1063(pcb_data, output_file, return_results, results_dat
             n_s, n_v = len(removed), len(dropped)
         else:
             n_s, n_v = _strip_written_copper(output_file, removed, dropped,
-                                             name_of)
+                                             name_of, require_all=True)
             if (n_s, n_v) != (len(removed), len(dropped)):
                 print(f"  WARNING: strict collapse (#1063): chose "
                       f"{len(removed)} segment(s) and {len(dropped)} via(s), "
-                      f"found {n_s} and {n_v} in the written file")
+                      f"not all of them are in the written file; it is left "
+                      f"as it was")
         print(f"  Strict collapse (#1063, end of run): removed {n_s} "
               f"redundant segment(s)"
               + (f" and {n_v} via(s) they freed" if n_v else "")
@@ -1783,6 +1788,7 @@ def _late_dangling_via_sweep1166(pcb_data, output_file, return_results,
                 owned.add(id(item))
         scope = {nid for nid, nm in name_of.items() if nm in set(scope_names)}
         _stats = {}
+        protected |= {id(x) for x in board.segments if getattr(x, 'arc', False)}
         removed, dropped = sweep_dangling_via_branches(
             board, scope, protected_ids=protected, stats=_stats)
         if not (removed or dropped):
@@ -1814,11 +1820,13 @@ def _late_dangling_via_sweep1166(pcb_data, output_file, return_results,
             n_s, n_v = len(removed), len(dropped)
         else:
             n_s, n_v = _strip_written_copper(output_file, removed, dropped,
-                                             name_of)
+                                             name_of, require_all=True)
             if (n_s, n_v) != (len(removed), len(dropped)):
                 print(f"  WARNING: dangling-via sweep (#1166): chose "
                       f"{len(removed)} segment(s) and {len(dropped)} via(s), "
-                      f"found {n_s} and {n_v} in the written file")
+                      f"not all of them are in the written file; it is left "
+                      f"as it was")
+                welded = []
             if welded:
                 from kicad_parser import board_uses_name_nets
                 from kicad_writer import generate_segment_sexpr
@@ -2097,25 +2105,70 @@ def _late_kicad_dangling_split1217(pcb_data, output_file, return_results,
         return 0
 
 
+def _install_copper_rules(config, pcb_data, input_file, layer_clearances,
+                          track_clearances, scoped_clearance_rules, net_keepouts,
+                          net_clearances, routed_net_ids):
+    """The rules every pass that lays copper is held to, on `config` and
+    `pcb_data`: the .kicad_dru layer, track and scoped rules (#498, #735),
+    its net-filtered keep-outs, and the cross-class map. The main routing
+    path installs them on its way in; a run that returns before routing
+    calls this so its end-of-run passes see the same rules."""
+    from kicad_dru import install_layer_clearances, install_track_clearances
+    from net_keepouts import attach as _nk_attach
+    install_layer_clearances(config, layer_clearances, input_file, pcb_data,
+                             net_keepouts=True)
+    install_track_clearances(config, track_clearances, input_file, pcb_data,
+                             routed_net_ids=list(routed_net_ids),
+                             scoped_rules=scoped_clearance_rules)
+    _nk_attach(pcb_data, net_keepouts if net_keepouts is not None
+               else getattr(getattr(config, 'rules', None), 'net_keepouts', None))
+    config.set_net_clearances(net_clearances, list(routed_net_ids))
+
+
+def _copper_probe(board, pcb_data, config):
+    """copper_clearance_probe for new copper on `board` (the shipped board:
+    the written file re-parsed on the CLI, the write model on the GUI) under
+    the rules installed on `config` and `pcb_data`. The keep-outs ride on
+    pcb_data, so they are carried over; the rules are keyed by net id, so a
+    board whose ids name other nets than pcb_data's is refused."""
+    from pcb_modification import copper_clearance_probe
+    if board is not pcb_data:
+        for nid, net in board.nets.items():
+            if nid in pcb_data.nets and pcb_data.nets[nid].name != net.name:
+                raise ValueError(f"net {nid} is {net.name!r} on the shipped board "
+                                 f"and {pcb_data.nets[nid].name!r} in the run")
+        board._net_keepouts = list(getattr(pcb_data, '_net_keepouts', None) or [])
+    return copper_clearance_probe(
+        board, config.clearance,
+        getattr(config, 'net_clearances', None) or None,
+        getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
+
+
 def _late_final_geometry(pcb_data, output_file, return_results, results_data,
                          write_model, input_signature, scope_names,
                          keep_input_copper, config):
     """final_geometry.legalize_track_geometry on the board this run SHIPS,
     after the passes that lay, collapse or sweep copper: every end exactly
     on what it joins, no unjustified fragment under MIN_TRACK_FRAGMENT,
-    octolinear corners, no dangling dead end. Same plumbing and scope as
-    _late_kicad_dangling_split1217; protected, impedance, skew- and
-    length-graded nets are left as they are (their geometry is the spec),
-    and --keep-input-copper makes input copper read-only. Returns
-    (segments removed, segments laid)."""
+    octolinear corners. Same plumbing and scope as
+    _late_kicad_dangling_split1217, under the rules _copper_probe reads;
+    protected, impedance, skew- and length-graded nets are left as they are
+    (their geometry is the spec), so is the copper a KiCad tuning pattern
+    owns, and --keep-input-copper makes input copper read-only. A guide-
+    corridor step keeps its drawn geometry, as the smoother does. On the CLI
+    the file is rewritten once, and not at all unless every track the pass
+    replaces is found in it. Returns (nets changed, copper keys laid)."""
     import copy as _copy
     from collections import Counter
     from improvement_gate import copper_item_key
     from final_geometry import legalize_track_geometry
-    from pcb_modification import copper_clearance_probe
     from cleanup_pipeline import _smooth_skip_net_ids, _centre_stub_net_ids
+    from kicad_parser import tuning_pattern_members
+    if getattr(config, 'guide_corridor_enabled', False):
+        return set(), set()
     try:
         rd = None
+        content = None
         if return_results:
             rd = results_data if results_data is not None else {}
             board = _copy.copy(pcb_data)
@@ -2126,11 +2179,19 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
             else:
                 board.segments = list(pcb_data.segments)
                 board.vias = list(pcb_data.vias)
+            src = getattr(pcb_data, 'source_path', '') or ''
+            tuned = set()
+            if src and os.path.isfile(src):
+                with open(src, 'r', encoding='utf-8') as _f:
+                    tuned = tuning_pattern_members(_f.read())
         elif output_file and os.path.isfile(output_file):
             from kicad_parser import parse_kicad_pcb as _pkfg
+            with open(output_file, 'r', encoding='utf-8') as _f:
+                content = _f.read()
             board = _pkfg(output_file)
+            tuned = tuning_pattern_members(content)
         else:
-            return 0, 0
+            return set(), set()
         name_of = {nid: n.name for nid, n in board.nets.items()}
         held = {pcb_data.nets[n].name for n in
                 (_smooth_skip_net_ids(pcb_data, locked=False)
@@ -2139,9 +2200,9 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
         scope = {nid for nid, nm in name_of.items()
                  if nm in set(scope_names) and nm not in held}
         if not scope:
-            return 0, 0
+            return set(), set()
         owned = set()
-        readonly = set()
+        readonly = {id(s) for s in board.segments if s.uuid and s.uuid in tuned}
         left = {n: Counter(c) for n, c in (input_signature or {}).items()}
         for s in board.segments:
             c = left.get(name_of.get(s.net_id))
@@ -2152,15 +2213,11 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
                     readonly.add(id(s))
             else:
                 owned.add(id(s))
-        clears = copper_clearance_probe(
-            board, config.clearance,
-            getattr(config, 'net_clearances', None) or None,
-            getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
+        clears = _copper_probe(board, pcb_data, config)
         removed, added, stats = legalize_track_geometry(
             board, scope, config, clears, readonly_ids=readonly)
         if not (removed or added):
             return set(), set()
-        changed = {name_of.get(x.net_id) for x in list(removed) + list(added)}
         if return_results:
             gone = {id(x) for x in removed}
             for r in rd.get('results') or []:
@@ -2178,42 +2235,54 @@ def _late_final_geometry(pcb_data, output_file, return_results, results_data,
             pcb_data.segments = [x for x in pcb_data.segments
                                  if id(x) not in gone] + list(added)
             bump_copper_epoch(pcb_data)
-            n_s, n_a = len(removed), len(added)
         else:
             from kicad_parser import board_uses_name_nets
-            from kicad_writer import generate_segment_sexpr
-            unmatched = []
-            n_s, _nv = _strip_written_copper(output_file, removed, [], name_of,
-                                             match_width=True,
-                                             unmatched_out=unmatched)
-            if unmatched:
-                print(f"  WARNING: track geometry: chose {len(removed)} "
-                      f"segment(s) to replace, found {n_s} in the written file")
-            with open(output_file, 'r', encoding='utf-8') as _f:
-                content = _f.read()
+            from kicad_writer import generate_segment_sexpr, remove_segments_from_content
             v10 = board_uses_name_nets(content)
+            unmatched = []
+            content, n_s = remove_segments_from_content(
+                content, removed, net_id_to_name=name_of if v10 else None,
+                unmatched_out=unmatched, match_width=True)
+            if unmatched or n_s != len(removed):
+                print(f"  WARNING: track geometry: chose {len(removed)} "
+                      f"segment(s) to replace and found {n_s} in the written "
+                      f"file; the file is left as it was")
+                return set(), set()
             sexprs = [generate_segment_sexpr(
                 (p.start_x, p.start_y), (p.end_x, p.end_y), p.width, p.layer,
                 p.net_id, name_of.get(p.net_id) if v10 else None)
                 for p in added]
-            if sexprs:
-                lp = content.rfind(')')
-                content = content[:lp] + '\n'.join(sexprs) + '\n' + content[lp:]
-                with open(output_file, 'w', encoding='utf-8') as _f:
-                    _f.write(content)
-            n_a = len(added)
+            lp = content.rfind(')')
+            content = content[:lp] + '\n'.join(sexprs) + '\n' + content[lp:]
+            _write_atomically(output_file, content)
         print(f"  Track geometry (end of run): re-laid {stats.get('legs_relaid', 0)} "
               f"short piece(s) and {stats.get('corners_relaid', 0)} corner(s), "
               f"landed {stats.get('ends_landed', 0)} end(s), merged "
-              f"{stats.get('collinear_merged', 0)} collinear joint(s), removed "
-              f"{stats.get('spurs_removed', 0)} dead end(s) on {stats.get('nets', 0)} "
-              f"net(s): -{n_s}/+{n_a} segment(s)"
+              f"{stats.get('collinear_merged', 0)} collinear joint(s) on "
+              f"{stats.get('nets', 0)} net(s): -{len(removed)}/+{len(added)} segment(s)"
               + (f"; {stats['nets_reverted']} net(s) kept as they were"
                  if stats.get('nets_reverted') else ""))
-        return changed, {copper_item_key(x) for x in added}
+        return ({name_of.get(x.net_id) for x in list(removed) + list(added)},
+                {copper_item_key(x) for x in added})
     except Exception as _e:                                     # noqa: BLE001
         print(f"  (end-of-run track geometry skipped: {type(_e).__name__}: {_e})")
         return set(), set()
+
+
+def _write_atomically(path, content):
+    """Replace `path` with `content` in one step: a reader never sees a
+    half-written board, and a failed write leaves the old one."""
+    import tempfile
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix='.krt_', suffix='.kicad_pcb', dir=d)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as _f:
+            _f.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _late_final_geometry_and_collapse(pcb_data, output_file, return_results,
@@ -4054,6 +4123,10 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                     _late_final_geometry_and_collapse(
                         pcb_data, output_file, as_gui, rd, None, _input_sig1069,
                         _scope1166, keep_input_copper, config)
+                    # #1843: the geometry pass merges pieces an area edge split
+                    _late_area_edge_split1843(
+                        pcb_data, output_file, as_gui, rd, None, _input_sig1069,
+                        _scope1166, config)
             _late_orphan_sweep659(pcb_data, output_file, as_gui, rd,
                                   None, keep_input_copper, skip_routing)
             _moved = []
@@ -4075,6 +4148,10 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                     if rd is not None:
                         rd['length_moved_by_cleanup'] = _lmoved
             return _moved
+        if final_reconcile and not skip_routing:
+            _install_copper_rules(config, pcb_data, input_file, layer_clearances,
+                                  track_clearances, scoped_clearance_rules,
+                                  net_keepouts, net_clearances, sweep_scope_ids)
         if return_results:
             _rd659 = _empty_results_data()
             _rd659['keep_away'] = keep_away_entries(_ka_done)
