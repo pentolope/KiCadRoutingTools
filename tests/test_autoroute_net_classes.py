@@ -333,7 +333,7 @@ def test_refusals(tmp):
          'not both', '--layer-costs with --plane-layer-cost'),
         (['--layer-costs', '-1', '-1'], 'forbids tracks on every layer',
          'every layer forbidden'),
-        (['--via-cost', str((2 ** 31 - 1) // 2000 + 1)], 'the most whose cost the router holds',
+        (['--via-cost', str((2 ** 31 - 1) // 2000 + 1)], "converts to the router's 32-bit cost",
          'a via cost one past what the router holds at the 0.1 mm grid'),
     ]
     for extra, why, what in cases:

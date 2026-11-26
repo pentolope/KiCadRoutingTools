@@ -2822,10 +2822,11 @@ Options:
                      value, every layer negative and --plane-layer-cost with
                      it are refused before any step (exit 2).
   --via-cost N       route.py's and route_diff.py's --via-cost (a whole
-                     number >= 0, at most what the router's 32-bit cost holds
-                     at the chain's grid, doubled for a pair: 1073741 at
-                     0.1 mm) for every route and diff-pair step; without
-                     it, their own default.
+                     number >= 0 whose per-via cost, doubled for a pair,
+                     converts to the router's 32-bit cost at the chain's
+                     grid: at most 1073741 at 0.1 mm; a path's summed cost
+                     is not bounded by it) for every route and diff-pair
+                     step; without it, their own default.
   --cap-net-classes  Cap every net class at the chain clearance on every step
                      (the pre-existing behaviour). Without it a class declared
                      above that clearance routes at its own (step 1).
@@ -2915,7 +2916,7 @@ follow it (the plugin's Autorouter sub-tab reads nothing else):
 | `AUTOROUTE_PLAN` | after the analysis | the design rules and `rules_why`, planes, parts, pairs, power nets, and `steps`: one `{tag, tool, what, why, optional}` row per step it means to run; an optional row runs only if what comes before calls for it |
 | `AUTOROUTE_STEP` | each step start and end | `state` `running`, then `done` or `failed` (one of each per step run), or `skipped` with its `reason` for a planned step that never ran. An ending carries `seconds`, `rc`, a one-line `result`, the step's own `summary` (escapes, caps moved, pairs routed, routed/failed/vias), the `cmd` and `log`, a route pass's `grade` (open nets, real DRC) and whether it was `kept`, and on failure `error_tail`, the last lines of its log. A step the plan did not list (a fanout's next rung, a re-fan, the pair re-route) names its planned row as `parent` |
 | `AUTOROUTE_DECISION` | when the chain chooses | `{tag, kept, why}`: the fanout rung kept, a re-fan or a route pass kept or not, the pair nets ripped or re-routed |
-| `AUTOROUTE_SUMMARY` | last | the shipped step (`final_step`, `final_tag`), `output`, `open`, `open_nets`, `drc`, `drc_items`, `seconds`, `routing_costs` (`via_cost`, the caller's or route.py's default, the first pass's `layer_costs` and the later passes' `crossing_layer_costs` by layer, and `from_caller`) and `net_classes` (`clearance`, the nets declared above it, `mode` `honoured`, `capped` or null when none is, and the route call of each class clearance); with `error` when nothing shipped. `--json-out` carries `routing_costs` and `net_classes` too |
+| `AUTOROUTE_SUMMARY` | last | the shipped step (`final_step`, `final_tag`), `output`, `open`, `open_nets`, `drc`, `drc_items`, `seconds`, `routing_costs` (`via_cost`, the caller's or route.py's default, the first pass's `layer_costs` and the later passes' `crossing_layer_costs` by layer, and `from_caller`) and `net_classes` (`clearance`, the nets declared above it, `mode` `honoured`, `capped` or null when none is, the route call of each class clearance, the class nets the passes route, `in_passes`, and the clearance route.py holds those passes at, `passes_held_at`); with `error` when nothing shipped. `--json-out` carries `routing_costs` and `net_classes` too |
 
 `KRT_AUTOROUTE_FAIL_STEPS` (step tags, comma separated) makes those steps run
 a stand-in that exits 3, so a test can drive the failure path on a real board.

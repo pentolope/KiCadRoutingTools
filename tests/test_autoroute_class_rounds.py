@@ -22,6 +22,13 @@
    route steps cap every class when they do.
 8. A length group of a class net and a Default net is refused, naming
    --cap-net-classes.
+9. With every net in a class call and the last class call of a round
+   failing, the board an earlier class call laid is graded and ships.
+10. A pass that reports no router iterations leaves nothing to budget a
+   later call from: no class call follows the last pass, and the class
+   calls' own iterations still count.
+11. The record gives the clearance route.py holds the passes at for the
+   class nets they route.
 """
 import os
 import sys
@@ -62,7 +69,7 @@ class Recorder(AP.ChainEvents):
     a board's grade GRADES[the tag of the step that laid it] (open nets),
     every other board fully routed."""
 
-    def __init__(self, work, grades=(), iters=None, input_open=None):
+    def __init__(self, work, grades=(), iters=None, input_open=None, fail=()):
         self.work = work
         self.cur = 'IN'
         self.runs = []
@@ -71,13 +78,18 @@ class Recorder(AP.ChainEvents):
         self.grades = dict(grades)
         self.iters = iters or {'class': 100, 'pass': 10}
         self.input_open = input_open
+        self.fail = set(fail)
         self.last_iterations = None
 
     def run(self, kind, args, tag, **kw):
         self.runs.append((kind, tag, list(args)))
+        self.steps.append({'tag': tag, 'tool': kind, 'ok': tag not in self.fail,
+                           'log': tag + '.log'})
+        if tag in self.fail:
+            self.last_iterations = None
+            return None, {}, {}
         out = f'OUT{len(self.runs)}'
         self.boards[out] = tag
-        self.steps.append({'tag': tag, 'tool': kind, 'ok': True, 'log': tag + '.log'})
         self.last_iterations = self.iters['class' if tag.startswith('route_class_')
                                           else 'pass']
         return out, {}, {}
@@ -282,9 +294,63 @@ def test_match_group(tmp):
     assert len(FAILS) == n, FAILS[n:]
 
 
+def test_failed_last_call(tmp):
+    print("every net in a class call, the round's last class call fails")
+    n = len(FAILS)
+    a = dict(A, plane_nets=[], planes=[], power_nets=[], pair_nets=[],
+             class_clearances={'CLK': 0.25, 'ETH_N': 0.2, 'ETH_P': 0.2},
+             route_first=[], tiers_cover_scope=True)
+    ch = Recorder(tmp, {'route_class_0.25': ['ETH_N', 'ETH_P']}, fail={'route_class_0.2'})
+    _, final, g = AP.route_passes(ch, a, a['layers'], ['1.0', '-1.0', '1.0', '1.0'],
+                                  effort_factor=10)
+    step = next(s for s in ch.steps if s['tag'] == 'route_class_0.25')
+    expect((step.get('grade') or {}).get('open_nets') == ['ETH_N', 'ETH_P'],
+           f"the 0.25 call's board, the round's, is graded ({step.get('grade')})")
+    expect(tags(ch) == ['route_class_0.25', 'route_class_0.2', 'route_class_0.2_p2']
+           and final == 'OUT3' and g is not None and g['open'] == 0,
+           f"the next round calls the open class again and its board ships "
+           f"({tags(ch)}, {final}, {g})")
+    ch = Recorder(tmp, {}, fail={'route_class_0.2'})
+    _, final, g = AP.route_passes(ch, a, a['layers'], ['1.0', '-1.0', '1.0', '1.0'],
+                                  effort_factor=10)
+    expect(final == 'OUT1' and g is not None and g['open'] == 0,
+           f"with no net left open, the 0.25 call's board ships, graded ({final}, {g})")
+    assert len(FAILS) == n, FAILS[n:]
+
+
+def test_pass_without_iterations(tmp):
+    print("a pass that reports no iterations")
+    n = len(FAILS)
+    ch = Recorder(tmp, {'route': ['CLK', 'SIG']}, iters={'class': 100, 'pass': None})
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        AP.route_passes(ch, A, A['layers'], ['1.0', '-1.0', '1.0', '1.0'], effort_factor=10)
+    expect(tags(ch) == ['route_class_0.25', 'route_class_0.2', 'route'],
+           f"no later pass and no class call after it ({tags(ch)})")
+    expect('no router iterations to budget it from' in buf.getvalue(),
+           "and it says why the class call did not run")
+    assert len(FAILS) == n, FAILS[n:]
+
+
+def test_held_record(tmp):
+    print("the clearance the passes are held at")
+    n = len(FAILS)
+    rec = AP.net_class_record(A)
+    expect(rec.get('passes_held_at') == 0.2,
+           f"GND, a plane in the passes, holds them at its 0.2 ({rec.get('passes_held_at')})")
+    a = dict(A, class_clearances={'CLK': 0.25})
+    rec = AP.net_class_record(a)
+    expect('passes_held_at' in rec and rec['passes_held_at'] is None,
+           f"no class net in the passes, no clearance ({rec.get('passes_held_at', 'absent')})")
+    assert len(FAILS) == n, FAILS[n:]
+
+
 def main():
     for t in (test_which_nets, test_rounds, test_budget, test_empty_pass, test_finish,
-              test_rip, test_plan_text, test_match_group):
+              test_rip, test_plan_text, test_match_group, test_failed_last_call,
+              test_pass_without_iterations, test_held_record):
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 t(tmp)
