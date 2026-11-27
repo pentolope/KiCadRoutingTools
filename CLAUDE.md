@@ -279,8 +279,10 @@ Validate routed boards against the *real* spec, with the right checker — most
   to the DRC-floor writeback, carried down chains by the project copy) and later
   steps will NOT rip them: `--rip-existing-nets` globs skip them (printed
   exclusion) and plane-repair `--rip-blocker-nets` never picks them as blockers.
-  The override is naming the net EXACTLY (no glob) in `--nets` or
-  `--rip-existing-nets` — there is deliberately no CLI flag or GUI control.
+  The override is naming the net EXACTLY in `--rip-existing-nets`, or in
+  `--nets` with `--force-reroute`: its name, or a pattern with no `*`, `?` or
+  negated class that selects that one net alone — there is deliberately no
+  CLI flag or GUI control.
   **The whole `kicad_routing_tools` namespace (these records and the ones
   below) also lives on the board**, as a top-level `(property
   "kicad_routing_tools" ...)`: KiCad's own project save rewrites the

@@ -20,10 +20,9 @@ reader here takes the newer copy.
 
 **Policy** (no CLI flag, no GUI control -- deliberate, like the #498 .kicad_dru
 auto-read): protection guards against COLLATERAL damage. A net named EXACTLY
-(no glob metacharacters, or a literal glob that spells it: ``exact_names``) in
-``--nets`` or ``--rip-existing-nets`` is being deliberately targeted and stays
-rippable; glob matches over protected nets are filtered with a printed
-exclusion. Consumers:
+(``exact_names``) in ``--rip-existing-nets``, or in ``--nets`` with
+``--force-reroute``, is being deliberately targeted and stays rippable; glob
+matches over protected nets are filtered with a printed exclusion. Consumers:
 
   * route.py's ``--rip-existing-nets`` expansion (collateral rip of non-target
     nets) skips protected nets unless exactly named.
@@ -597,8 +596,7 @@ def effective_protection_map(pcb_data, input_file: Optional[str] = None
 
 def _literal_glob(pattern: str) -> bool:
     """True when PATTERN spells names char by char: no '*' or '?', no
-    negated class, no leading '!' (an exclusion). autoroute names each net so
-    (`autoroute._glob`: 'GND' -> 'GN[D/]')."""
+    negated class, no leading '!' (an exclusion)."""
     if pattern.startswith('!') or '*' in pattern or '?' in pattern:
         return False
     i = pattern.find('[')
@@ -617,22 +615,22 @@ def _literal_glob(pattern: str) -> bool:
 
 def exact_names(patterns: Optional[Iterable[str]], net_names=None) -> Set[str]:
     """The nets a pattern list names exactly: its non-glob entries, and with
-    the board's NET_NAMES each net a literal glob (`_literal_glob`) selects
-    as the whole name, read as --nets reads it (net_queries: a pattern that
-    spells a net names that net only). Naming a net exactly is the
-    deliberate-override signal that lifts its protection for this step."""
+    the board's NET_NAMES the one net a literal glob (`_literal_glob`) selects
+    when it selects exactly one, whole, read as --nets reads it (autoroute
+    names each net so: `autoroute._glob`, 'GND' -> 'GN[D/]'). Naming a net
+    exactly is the deliberate-override signal that lifts its protection for
+    this step."""
     if not patterns:
         return set()
     out = {p for p in patterns if p and not (_GLOB_CHARS & set(p))}
     lit = [p for p in patterns if p and p not in out and _literal_glob(p)]
     if lit and net_names:
-        from net_queries import _pattern_names_a_net
+        from net_queries import net_pattern_matches
         known = frozenset(n for n in net_names if n)
         for p in lit:
-            if p in known:
-                out.add(p)
-            elif not _pattern_names_a_net(p, known):
-                out |= {n for n in known if fnmatch.fnmatchcase(n, p)}
+            hit = [n for n in known if net_pattern_matches(n, p, known)]
+            if len(hit) == 1 and (hit[0] == p or fnmatch.fnmatchcase(hit[0], p)):
+                out.add(hit[0])
     return out
 
 

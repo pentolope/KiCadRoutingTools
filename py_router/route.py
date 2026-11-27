@@ -4599,23 +4599,17 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 existing_rippable.append(nid)
         # #521: protected nets (length-matched groups, routed diff pairs --
         # recorded in the sibling .kicad_pro by the step that made them) are
-        # excluded from COLLATERAL rips. Naming a net exactly (no glob) in
-        # --rip-existing-nets or --nets is the deliberate override. Nets with
-        # KiCad-LOCKED copper are excluded unconditionally (no override).
+        # excluded from COLLATERAL rips. Naming a net exactly in
+        # --rip-existing-nets is the deliberate override (--nets asks to route
+        # a net, not to rip one). Nets with KiCad-LOCKED copper are excluded
+        # unconditionally (no override).
         if existing_rippable:
             from protected_nets import (protection_map, filter_rippable_names,
                                         stash_rip_overrides, rip_override_names,
                                         board_net_names)
             _prot = protection_map(pcb_data, input_file)
-            # Override source: the RAW --nets patterns when main() passed
-            # them -- expansion turns a glob into exact names, which made
-            # any glob-selected protected net "exactly named" here (#521's
-            # override is deliberately no-glob; found by the force-reroute
-            # test). rip_existing_nets is never expanded, so it stays as-is.
+            # Override source: rip_existing_nets as given (never expanded)
             _rip_overrides = (list(rip_existing_nets)
-                              + list(net_name_patterns
-                                     if net_name_patterns is not None
-                                     else (net_names or []))
                               # #1395: overrides an enclosing step stashed on
                               # this pcb_data (a nested sub-run is passed none
                               # of the patterns itself)
@@ -4787,7 +4781,6 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 _pe_keep = set(filter_rippable_names(
                     [pcb_data.nets[n].name for n in _pe_auto], _pe_prot,
                     override_patterns=(list(rip_existing_nets or [])
-                                       + _pe_caller_pats
                                        + sorted(rip_override_names(pcb_data))),
                     context="pre-existing rip candidacy",
                     net_names=board_net_names(pcb_data)))
