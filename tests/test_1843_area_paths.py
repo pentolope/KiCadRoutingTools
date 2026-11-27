@@ -136,11 +136,12 @@ REGISTRY = {
     'net_keepouts.py:_block_regions': ('exempt', 'net-filtered keep-out area'),
     'net_keepouts.py:_block_regions.remove': ('exempt', 'net-filtered keep-out area'),
     'net_keepouts.py:_block_scoped_pads': (
-        'exempt', 'scoped pad raise: never armed with a rule area (_scoped_raise_armed)'),
+        'exempt', 'scoped pad raise: its switch is never on with a rule area '
+                  '(arm_scoped_pad_floor; test_scoped_pad_rule_per_net)'),
     'net_keepouts.py:_block_scoped_pads.at_rung': (
-        'exempt', 'scoped pad raise: never armed with a rule area (_scoped_raise_armed)'),
+        'exempt', 'scoped pad raise: as _block_scoped_pads'),
     'net_keepouts.py:_block_scoped_pads.remove': (
-        'exempt', 'scoped pad raise: never armed with a rule area (_scoped_raise_armed)'),
+        'exempt', 'scoped pad raise: as _block_scoped_pads'),
     'route_planes.py:_block_route_as_obstacle': ('exempt', "a split plane's spine: KiCad's fill keeps the clearance"),
     'route_planes.py:build_plane_base_obstacles': ('exempt', "a split plane's spine: KiCad's fill keeps the clearance"),
     'routing_diagnostics.py:same_net_pad_seal_hint': ('exempt', 'a diagnostic on a scratch map'),

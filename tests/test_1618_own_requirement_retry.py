@@ -11,6 +11,9 @@ freely, far from that gap. HV2's only path is a second 0.9 mm gap that its
 pads at 0.5 mm for SIG too, so SIG shipped only after the rescue narrowed it
 to 0.127 mm. In the rule arm the pads stand at the board's floor and only HV
 and HV2 get the rule's raise while they route, so SIG routes in the main loop.
+With the walls drawn as locked tracks instead (the track-wall arm) the rule
+still binds them against HV's tracks, and a track obstacle is stamped at the
+widest requirement over the routed nets, so SIG is fenced there.
 
 Now a net the pipeline leaves open gets one whole-net retry with foreign
 copper priced at its OWN requirement (net_rescue.own_requirement_retry),
@@ -21,6 +24,8 @@ Checks:
   2. Rule arm, CLI: `--nets SIG HV HV2` -- the main loop routes SIG at full
      width (no retry), HV2 stays unrouted, and check_drc passes the board
      with the rule.
+  2b. Track-wall rule arm, CLI: the retry recovers SIG at full width under
+     the rule, HV2 stays unrouted, and check_drc passes the board.
   3. Class arm, CLI: the same with HV in a 0.5 mm class and no rule -- the
      retry recovers SIG at full width, not narrowed.
   4. Class arm, GUI leg (batch_route in memory): the retry recovers SIG and
@@ -60,13 +65,19 @@ def check(label, ok, detail=''):
         failures.append(label)
 
 
-def build(path, hv_clearance=0.2, rule=True):
+def build(path, hv_clearance=0.2, rule=True, track_wall=False):
     b = RoutingBoard(w=20, h=20)
     b.pad('S1', 3, 5, 'SIG', sx=1, sy=1)
     b.pad('S2', 17, 5, 'SIG', sx=1, sy=1)
-    b.pad('W1', 10, 2.425, 'GND', sx=1, sy=4.25)        # the wall: GND,
-    b.pad('W2', 10, 11.5, '+3V3', sx=1, sy=12.1)        # +3V3 and +5V with
-    b.pad('W3', 10, 19.075, '+5V', sx=1, sy=1.25)       # two 0.9 mm gaps
+    if track_wall:
+        # the same copper as the pads below: 1 mm tracks, round ends
+        b.seg(10, 0.8, 10, 4.05, 'GND', w=1, locked=True)
+        b.seg(10, 5.95, 10, 17.05, '+3V3', w=1, locked=True)
+        b.seg(10, 18.95, 10, 19.2, '+5V', w=1, locked=True)
+    else:
+        b.pad('W1', 10, 2.425, 'GND', sx=1, sy=4.25)    # the wall: GND,
+        b.pad('W2', 10, 11.5, '+3V3', sx=1, sy=12.1)    # +3V3 and +5V with
+        b.pad('W3', 10, 19.075, '+5V', sx=1, sy=1.25)   # two 0.9 mm gaps
     b.pad('H1', 3, 12, 'HV', sx=1, sy=1)
     b.pad('H2', 7, 12, 'HV', sx=1, sy=1)
     b.pad('K1', 3, 18, 'HV2', sx=1, sy=1)
@@ -123,11 +134,13 @@ def main():
     tmp = tempfile.mkdtemp(prefix='t1618_')
     try:
         rule = os.path.join(tmp, 'rule', 'in.kicad_pcb')
+        wall = os.path.join(tmp, 'wall', 'in.kicad_pcb')
         cls = os.path.join(tmp, 'cls', 'in.kicad_pcb')
         flat = os.path.join(tmp, 'flat', 'in.kicad_pcb')
-        for p in (rule, cls, flat):
+        for p in (rule, wall, cls, flat):
             os.makedirs(os.path.dirname(p))
         build(rule)
+        build(wall, track_wall=True)
         build(cls, hv_clearance=0.5, rule=False)
         build(flat, rule=False)
 
@@ -145,6 +158,16 @@ def main():
         log = route(rule, out, ['SIG', 'HV', 'HV2'])
         check("the main loop routes SIG, no retry of it",
               'Routing SIG' in log and 'own-requirement retry: SIG' not in log)
+        check("SIG ships at full width", net_widths(out, 'SIG') == [WIDTH],
+              str(net_widths(out, 'SIG')))
+        check("HV2, whose gap the rule forbids, stays unrouted",
+              net_widths(out, 'HV2') == [])
+        check("check_drc passes it with the rule", drc_clean(out))
+
+        print("2b. track-wall rule arm, CLI: SIG HV HV2 in one call")
+        out = os.path.join(tmp, 'wall', 'all.kicad_pcb')
+        log = route(wall, out, ['SIG', 'HV', 'HV2'])
+        check("the own-requirement retry recovers SIG", RETRY in log)
         check("SIG ships at full width", net_widths(out, 'SIG') == [WIDTH],
               str(net_widths(out, 'SIG')))
         check("HV2, whose gap the rule forbids, stays unrouted",

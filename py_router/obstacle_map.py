@@ -580,9 +580,8 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
                 if _rec.cell_batches:
                     _tie_recorded.append(('pad', id(pad), _rec.merged_cells()))
                 continue
-            _clr = _obstacle_clearance(net_id, pad)
-            if _area is None and _area_pass is None:
-                _clr = config.pad_floor_clearance(pad, _clr, extra_clearance, pcb_data)
+            _clr = config.pad_floor_clearance(pad, _obstacle_clearance(net_id, pad),
+                                              extra_clearance, pcb_data)
             _add_pad_obstacle(obstacles, pad, coord, layer_map, config, extra_clearance,
                               clearance_override=_clr,
                               cell_sink=_pad_cell_sink, via_sink=_pad_via_sink)

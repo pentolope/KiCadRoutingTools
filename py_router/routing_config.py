@@ -521,7 +521,8 @@ class GridRouteConfig:
     # The pads a scoped rule binds stand at the board's lowest requirement
     # (`pad_floor_clearance`) on the maps this config builds, and a routed net
     # that needs more gets the rest while it routes (`net_keepouts.block`).
-    # Set by the single-ended engine, whose route entries stamp it.
+    # The one switch both read; armed by the single-ended engine
+    # (`arm_scoped_pad_floor`), never on a board with a rule-area rule.
     scoped_pad_floor: bool = False
     # #530: the board's design rules resolved in KiCad's order
     # (design_rules.DesignRules), installed engine-side by
@@ -809,21 +810,28 @@ class GridRouteConfig:
     def pad_floor_clearance(self, pad, default: Optional[float] = None,
                             extra_clearance=0.0, pcb_data=None) -> float:
         """A foreign pad's stamp on a routing map: under `scoped_pad_floor`
-        (on a map with no extra clearance and no rule area, for a pad of
-        `pcb_data` outside a net tie) the scoped channel's floor for it
+        (on a map with no extra clearance, for a pad of `pcb_data` outside a
+        net tie) the scoped channel's floor for it
         (`ScopedClearanceInstall.pad_floor`), else `pad_obstacle_clearance`."""
         s = self.scoped_clearance
         if (s is not None and self.scoped_pad_floor and pcb_data is not None
                 and (getattr(pad, 'component_ref', None),
                      getattr(pad, 'pad_number', None)) not in net_tie_pad_keys(pcb_data)
                 and not float(extra_clearance or 0.0)
-                and not any((getattr(extra_clearance, 'by_layer', None) or {}).values())
-                and getattr(self, 'area_clearance', None) is None):
+                and not any((getattr(extra_clearance, 'by_layer', None) or {}).values())):
             v = s.pad_floor(int(getattr(pad, 'net_id', 0) or 0),
                             self.scoped_pad_key(pad), self)
             if v is not None:
                 return v
         return self.pad_obstacle_clearance(pad, default)
+
+    def arm_scoped_pad_floor(self) -> None:
+        """Arm `scoped_pad_floor` when a scoped rule is installed and no
+        rule-area rule is: the area composition stamps pads through configs
+        of its own (`AreaClearance.outside_config` / `region_config`) that the
+        raise does not compose over."""
+        self.scoped_pad_floor = (self.scoped_clearance is not None
+                                 and self.area_clearance is None)
 
     def scoped_pad_key(self, pad):
         """The scoped channel's obstacle key for a pad: its pad type, or

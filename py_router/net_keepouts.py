@@ -608,7 +608,6 @@ def _scoped_raise_armed(config) -> bool:
     its own raise?"""
     return (config is not None and getattr(config, 'scoped_pad_floor', False)
             and getattr(config, 'scoped_clearance', None) is not None
-            and getattr(config, 'area_clearance', None) is None
             and not float(getattr(config, 'edge_extra_clearance', 0.0) or 0.0))
 
 
@@ -642,7 +641,7 @@ def _scoped_raise_rows(pcb_data, net_ids, config, via_geom=None):
     """(track cells (N, 3), via cells (M, 2)) of `_scoped_raise_pads`, each
     pad stamped whole at its value as the base map stamps a pad, at the
     config's via or at ``via_geom`` = (size, drill). Cached on pcb_data per
-    install, nets, geometry and clip."""
+    nets, geometry and clip, for the latest install only."""
     from obstacle_map import _add_pad_obstacle
     from routing_config import GridCoord
     from routing_utils import build_layer_map
@@ -668,6 +667,8 @@ def _scoped_raise_rows(pcb_data, net_ids, config, via_geom=None):
              else np.empty((0, 3), dtype=np.int32))
     vias = (np.unique(np.concatenate(rec.vias), axis=0) if rec.vias
             else np.empty((0, 2), dtype=np.int32))
+    for k in [k for k, v in cache.items() if v[0] is not s]:
+        del cache[k]
     cache[key] = (s, config.net_clearances, (cells, vias))
     return cells, vias
 

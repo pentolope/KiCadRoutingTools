@@ -4844,7 +4844,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     # a scoped pad rule binds each routed net only where its condition does:
     # the maps hold its pads at the board's floor and each net's route entry
     # adds what that net needs above it (net_keepouts.block)
-    config.scoped_pad_floor = True
+    config.arm_scoped_pad_floor()
     # #1260: a pour island of a zone net outside this run that no routed net
     # has a terminal inside can only be CUT by this run (nothing here repairs
     # it), so it is an obstacle on every map built from this config. Scope is

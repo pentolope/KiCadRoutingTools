@@ -1714,3 +1714,7 @@ def install(config, pcb_data) -> None:
         if not area.regions:
             area = None
     config.area_clearance = area
+    if area is not None:
+        # the scoped pad floor's raise does not compose over the areas
+        # (GridRouteConfig.arm_scoped_pad_floor)
+        config.scoped_pad_floor = False
