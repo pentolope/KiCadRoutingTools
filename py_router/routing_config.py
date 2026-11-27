@@ -755,11 +755,18 @@ class GridRouteConfig:
         tab, a board-level `gr_*`), which KiCad types `Graphic` and a
         class/type-scoped rule reads so, never as a track (#1931). Inert
         without a scoped rule."""
-        floor = self.net_clearance_floor if self.net_clearance_floor is not None else self.clearance
-        base = max(floor, self.net_clearances.get(net_id, self.clearance))
+        base = self.class_obstacle_clearance(net_id)
         if self.scoped_clearance is None:
             return base
         return self.scoped_stamp(net_id, self._graphic_key(graphic), base)
+
+    def class_obstacle_clearance(self, net_id: int) -> float:
+        """`obstacle_clearance` before the scoped channel: max(the routing-
+        side floor, `net_id`'s class). The base of a check that folds the
+        scoped rules pair-exact for the moving net (the terminal neck), where
+        the scoped stamp would price `net_id` at what OTHER routed nets need."""
+        floor = self.net_clearance_floor if self.net_clearance_floor is not None else self.clearance
+        return max(floor, self.net_clearances.get(net_id, self.clearance))
 
     @staticmethod
     def _graphic_key(graphic: bool):

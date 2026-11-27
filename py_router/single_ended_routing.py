@@ -1706,8 +1706,8 @@ def _terminal_room(s, term_pts, pcb_data, net_id, config):
     # max(classOwn, classForeign), not the flat global clearance. Inert on an
     # all-Default board.
     nc = getattr(config, 'net_clearances', None) or None
-    own = (config.obstacle_clearance(net_id)
-           if hasattr(config, 'obstacle_clearance') else config.clearance)
+    own = (config.class_obstacle_clearance(net_id)
+           if hasattr(config, 'class_obstacle_clearance') else config.clearance)
     # The edge clearance the board-edge band is stamped at
     # (obstacle_map.add_board_edge_obstacles).
     edge_clr = (config.board_edge_clearance
@@ -5227,8 +5227,8 @@ def _launch_weld_test(pcb_data, net_id, config, coord, layer_names, forbid):
     floor = config.track_floor(net_id, None, _fab_track_floor(pcb_data)) \
         if hasattr(config, 'track_floor') else _fab_track_floor(pcb_data)
     nc = getattr(config, 'net_clearances', None) or None
-    own = (config.obstacle_clearance(net_id)
-           if hasattr(config, 'obstacle_clearance') else config.clearance)
+    own = (config.class_obstacle_clearance(net_id)
+           if hasattr(config, 'class_obstacle_clearance') else config.clearance)
     gate = _keepout_gate(pcb_data)
     memo = {}
 

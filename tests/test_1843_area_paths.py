@@ -133,8 +133,14 @@ REGISTRY = {
         'exempt', "bars a refused via landing cell for the re-search, then lifts it"),
     'net_keepouts.py:_EdgeBandSink._cells': ('exempt', 'edge band'),
     'net_keepouts.py:_EdgeBandSink._vias': ('exempt', 'edge band'),
-    'net_keepouts.py:block': ('exempt', 'net-filtered keep-out area'),
-    'net_keepouts.py:block.remove': ('exempt', 'net-filtered keep-out area'),
+    'net_keepouts.py:_block_regions': ('exempt', 'net-filtered keep-out area'),
+    'net_keepouts.py:_block_regions.remove': ('exempt', 'net-filtered keep-out area'),
+    'net_keepouts.py:_block_scoped_pads': (
+        'exempt', 'scoped pad raise: never armed with a rule area (_scoped_raise_armed)'),
+    'net_keepouts.py:_block_scoped_pads.at_rung': (
+        'exempt', 'scoped pad raise: never armed with a rule area (_scoped_raise_armed)'),
+    'net_keepouts.py:_block_scoped_pads.remove': (
+        'exempt', 'scoped pad raise: never armed with a rule area (_scoped_raise_armed)'),
     'route_planes.py:_block_route_as_obstacle': ('exempt', "a split plane's spine: KiCad's fill keeps the clearance"),
     'route_planes.py:build_plane_base_obstacles': ('exempt', "a split plane's spine: KiCad's fill keeps the clearance"),
     'routing_diagnostics.py:same_net_pad_seal_hint': ('exempt', 'a diagnostic on a scratch map'),

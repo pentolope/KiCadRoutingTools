@@ -5,8 +5,8 @@ matched with it (#1828), and otherwise it is graded and named (#1801).
 
 route.py matches its groups once, before the own-requirement retry (#1618),
 the rescue and the terminal escalation. On the board below the main loop
-fails SIG (a .kicad_dru rule holds the HV class at 0.5 mm, which fences SIG
-out of its only gap) and the own-requirement retry then routes it.
+fails SIG (the HV class's 0.5 mm clearance is the call's class floor, which
+fences SIG out of its only gap) and the own-requirement retry then routes it.
 
 Arms:
   late     -- group `SIG HV`. It formed with HV alone, so the first pass
@@ -20,7 +20,8 @@ Arms:
               stays disclosed with the #1801 reason.
   multi    -- group `SIG HV` with HV a 3-pad net, whose Phase-3 tap sits on
               its first-pass copper: disclosed.
-  control  -- no rule: both route in the main loop, matched and protected.
+  control  -- HV at the Default 0.2 mm: both route in the main loop, matched
+              and protected.
 
     python3 tests/test_1801_late_member_group.py
 """
@@ -51,9 +52,9 @@ def check(name, cond, detail=''):
     print(('  PASS ' if cond else '  FAIL ') + name + (f'  {detail}' if detail else ''))
 
 
-def build(path, rule, sig=(3, 17), hv2=False, h5=False):
-    """SIG's only path is a 0.9 mm gap between two foreign pads; with `rule`
-    a .kicad_dru clearance holds the HV class at 0.5 mm. `sig` places SIG's
+def build(path, wide, sig=(3, 17), hv2=False, h5=False):
+    """SIG's only path is a 0.9 mm gap between two foreign pads; with `wide`
+    the HV class's clearance is 0.5 mm. `sig` places SIG's
     two pads on y=5, `hv2` adds a second HV-class net on a wider board's
     right side (a meander bump keeps a long pad's bounding circle), `h5`
     gives HV a third pad (a multipoint member with a Phase-3 tap)."""
@@ -74,7 +75,8 @@ def build(path, rule, sig=(3, 17), hv2=False, h5=False):
         fh.write(b.text())
 
     def cl(n):
-        return {'name': n, 'clearance': 0.2, 'track_width': 0.25,
+        return {'name': n, 'clearance': 0.5 if wide and n == 'HV' else 0.2,
+                'track_width': 0.25,
                 'via_diameter': 0.6, 'via_drill': 0.3,
                 'priority': 2147483647 if n == 'Default' else 0}
     base = path[:-len('.kicad_pcb')]
@@ -89,10 +91,6 @@ def build(path, rule, sig=(3, 17), hv2=False, h5=False):
                              'netclass_patterns': [{'netclass': 'HV',
                                                     'pattern': 'HV*'}]}},
             fh, indent=1)
-    if rule:
-        with open(base + '.kicad_dru', 'w', encoding='utf-8') as fh:
-            fh.write('(version 1)\n(rule "HV"\n  (constraint clearance (min 0.5mm))\n'
-                     '  (condition "A.NetClass == \'HV\'"))\n')
 
 
 def route(inp, out, nets, group):
@@ -144,11 +142,11 @@ def main():
     tmp = tempfile.mkdtemp(prefix='t1801_')
     try:
         arms = {}
-        for arm, kw in (('late', dict(rule=True)),
-                        ('shorter', dict(rule=True, sig=(5, 16), hv2=True)),
-                        ('longer', dict(rule=True, hv2=True)),
-                        ('multi', dict(rule=True, h5=True)),
-                        ('control', dict(rule=False))):
+        for arm, kw in (('late', dict(wide=True)),
+                        ('shorter', dict(wide=True, sig=(5, 16), hv2=True)),
+                        ('longer', dict(wide=True, hv2=True)),
+                        ('multi', dict(wide=True, h5=True)),
+                        ('control', dict(wide=False))):
             os.makedirs(os.path.join(tmp, arm))
             arms[arm] = os.path.join(tmp, arm, 'in.kicad_pcb')
             build(arms[arm], **kw)
@@ -277,7 +275,7 @@ def main():
               g.get('not_rematched') == 'HV is not a 2-pad net',
               str(g.get('not_rematched')))
 
-        print("9. control: no rule")
+        print("9. control: HV at the Default class")
         out, log, doc, prot = run('control')
         g = group(doc.get('length_match_groups'), 'SIG HV')
         ms = g.get('member_status') or {}

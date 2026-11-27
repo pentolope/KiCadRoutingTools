@@ -7,9 +7,10 @@ stamps. The board: net SIG (Default, 0.2 mm) has one path, a 0.9 mm gap
 between a GND pad and a +3V3 pad. HV and HV2 are held at 0.5 mm -- by a rule
 (`A.NetClass == 'HV'`) or, in the class arm, by their net class. HV routes
 freely, far from that gap. HV2's only path is a second 0.9 mm gap that its
-0.5 mm forbids. Routed together, the GND/+3V3 pads are stamped at 0.5 mm
-for SIG too. So SIG failed: with the rule it shipped unrouted, and with the
-class it shipped only after the rescue narrowed it to 0.127 mm.
+0.5 mm forbids. In the class arm the call's class floor stamps the GND/+3V3
+pads at 0.5 mm for SIG too, so SIG shipped only after the rescue narrowed it
+to 0.127 mm. In the rule arm the pads stand at the board's floor and only HV
+and HV2 get the rule's raise while they route, so SIG routes in the main loop.
 
 Now a net the pipeline leaves open gets one whole-net retry with foreign
 copper priced at its OWN requirement (net_rescue.own_requirement_retry),
@@ -17,12 +18,13 @@ before the rescue narrows anything.
 
 Checks:
   1. Control: SIG alone routes at its width (the gap is legal for it).
-  2. Rule arm, CLI: `--nets SIG HV HV2` -- the retry recovers SIG at full
-     width, HV2 stays unrouted, and check_drc passes the board with the rule.
-  3. Class arm, CLI: the same with HV in a 0.5 mm class and no rule -- SIG
-     routes at full width, not narrowed.
-  4. Rule arm, GUI leg (batch_route in memory): the change-set carries SIG's
-     copper and none of HV2's.
+  2. Rule arm, CLI: `--nets SIG HV HV2` -- the main loop routes SIG at full
+     width (no retry), HV2 stays unrouted, and check_drc passes the board
+     with the rule.
+  3. Class arm, CLI: the same with HV in a 0.5 mm class and no rule -- the
+     retry recovers SIG at full width, not narrowed.
+  4. Class arm, GUI leg (batch_route in memory): the retry recovers SIG and
+     the change-set carries SIG's copper and none of HV2's.
   5. Inert: with HV at the Default clearance and no rule there is no
      candidate config and no retry line; own_requirement_config answers
      None for every net.
@@ -141,7 +143,8 @@ def main():
         print("2. rule arm, CLI: SIG HV HV2 in one call")
         out = os.path.join(tmp, 'rule', 'all.kicad_pcb')
         log = route(rule, out, ['SIG', 'HV', 'HV2'])
-        check("the own-requirement retry recovers SIG", RETRY in log)
+        check("the main loop routes SIG, no retry of it",
+              'Routing SIG' in log and 'own-requirement retry: SIG' not in log)
         check("SIG ships at full width", net_widths(out, 'SIG') == [WIDTH],
               str(net_widths(out, 'SIG')))
         check("HV2, whose gap the rule forbids, stays unrouted",
@@ -156,13 +159,13 @@ def main():
               str(net_widths(out, 'SIG')))
         check("check_drc passes it at the classes", drc_clean(out))
 
-        print("4. rule arm, GUI leg: batch_route in memory")
+        print("4. class arm, GUI leg: batch_route in memory")
         from kicad_parser import parse_kicad_pcb
         from route import batch_route
-        pcb = parse_kicad_pcb(rule)
+        pcb = parse_kicad_pcb(cls)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            _ok, _fail, _t, rd = batch_route(rule, '', ['SIG', 'HV', 'HV2'],
+            _ok, _fail, _t, rd = batch_route(cls, '', ['SIG', 'HV', 'HV2'],
                                              layers=['F.Cu'], pcb_data=pcb,
                                              return_results=True)
         check("the own-requirement retry recovers SIG", RETRY in buf.getvalue())
