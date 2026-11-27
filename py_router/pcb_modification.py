@@ -7741,26 +7741,22 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
             return need
         if kind == 'track':
             lays = [obj.layer]
+
+            def row(L):
+                return _area.item_index(obj.start_x, obj.start_y, obj.end_x, obj.end_y,
+                                        obj.width / 2.0, L)
         elif kind == 'via':
             lays = list(copper_layers)
+
+            def row(L):
+                return _area.item_index(obj.x, obj.y, obj.x, obj.y, obj.size / 2.0, L)
         else:
             from net_queries import expand_pad_layers
             lays = [l for l in expand_pad_layers(obj.layers, list(copper_layers))]
-        got = None
-        for L in lays:
-            own_i = _area.own_index(x, y, x, y, L)
-            if kind == 'track':
-                row = _area.item_index(obj.start_x, obj.start_y, obj.end_x, obj.end_y,
-                                       obj.width / 2.0, L)
-            elif kind == 'via':
-                row = _area.item_index(obj.x, obj.y, obj.x, obj.y, obj.size / 2.0, L)
-            else:
-                row = _area.pad_index(obj, L)
-            if max(own_i, row) < 0:
-                continue
-            v_ = _area.pair_value(own_i, row, need, L)
-            got = v_ if got is None else max(got, v_)
-        return need if got is None else got
+
+            def row(L):
+                return _area.pad_index(obj, L)
+        return _area.via_value(x, y, need, lays, row)
 
     def hole_flagged(v):
         vd = (getattr(v, 'drill', 0) or 0) / 2.0

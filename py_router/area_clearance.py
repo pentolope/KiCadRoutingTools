@@ -564,6 +564,25 @@ class AreaClearance:
             return default
         return r.value
 
+    def via_value(self, x, y, need: float, layers, row) -> float:
+        """The clearance a via at (x, y) is held to against one item it meets
+        on ``layers``: ``need`` where no region binds the pair on any of
+        them, else the largest `pair_value` over those layers. ``row(layer)``
+        is the item's region index there (`item_index`, `pad_index`)."""
+        got = None
+        for L in layers:
+            own_i = self.own_index(x, y, x, y, L)
+            r = row(L)
+            if max(own_i, r) < 0:
+                continue
+            v = self.pair_value(own_i, r, need, L)
+            got = v if got is None else max(got, v)
+        return need if got is None else got
+
+    def max_value(self) -> float:
+        """The largest clearance any region sets (0 when none sets one)."""
+        return max((r.value for r in self.regions if r.value is not None), default=0.0)
+
     def pad_index(self, pad, layer) -> int:
         """`rows_index` for one pad (a custom pad the kernels measure apart)."""
         from shapely.geometry import Point, box

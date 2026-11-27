@@ -6947,9 +6947,13 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
     probe = Via(x=x, y=y, size=config.via_size, drill=config.via_drill,
                 layers=_via_layer_pair(config), net_id=net_id, via_type=_via_kind(config))
     r = config.via_size / 2
-    reach = r + config.max_pair_clearance()
+    area = getattr(config, 'area_clearance', None)
+    reach = r + max(config.max_pair_clearance(), area.max_value() if area is not None else 0.0)
     copper = list(getattr(getattr(pcb_data, 'board_info', None), 'copper_layers', None)
                   or config.layers)
+
+    def held(need, layers, row):
+        return need if area is None else area.via_value(x, y, need, layers, row)
     for seg in getattr(pcb_data, 'segments', None) or ():
         if seg.net_id == net_id or not via_on_layer(probe, seg.layer):
             continue
@@ -6962,6 +6966,8 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
         need = (config.pair_clearance(net_id, seg.net_id, seg.layer)
                 if getattr(seg, 'graphic', False) else
                 config.pair_clearance(net_id, seg.net_id, seg.layer, types=(('via',), ('track',))))
+        need = held(need, [seg.layer], lambda L, s=seg, w=w: area.item_index(
+            s.start_x, s.start_y, s.end_x, s.end_y, w / 2, L))
         if gap < need - _VIA_SITE_EPS:
             return (f"its copper would sit {gap:.4f}mm from a {_net_label(pcb_data, seg.net_id)} "
                     f"track on {seg.layer} (clearance {need:g}mm)")
@@ -6971,10 +6977,12 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
         d = math.hypot(v.x - x, v.y - y)
         if d >= reach + v.size / 2:
             continue
-        if not any(via_on_layer(probe, l) and via_on_layer(v, l) for l in copper):
+        shared = [l for l in copper if via_on_layer(probe, l) and via_on_layer(v, l)]
+        if not shared:
             continue
         gap = d - r - v.size / 2
-        need = config.pair_clearance(net_id, v.net_id, kind='stack')
+        need = held(config.pair_clearance(net_id, v.net_id, kind='stack'), shared,
+                    lambda L, v=v: area.item_index(v.x, v.y, v.x, v.y, v.size / 2, L))
         if gap < need - _VIA_SITE_EPS:
             return (f"its copper would sit {gap:.4f}mm from the {_net_label(pcb_data, v.net_id)} "
                     f"via at ({v.x:.4f},{v.y:.4f}) (clearance {need:g}mm)")
@@ -6999,10 +7007,12 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
                 continue
             if pnid == net_id:
                 continue
-            if not any(via_on_layer(probe, l) for l in pad_copper_layers(pad, copper)):
+            shared = [l for l in pad_copper_layers(pad, copper) if via_on_layer(probe, l)]
+            if not shared:
                 continue
             gap = point_to_pad_distance(x, y, pad) - r
-            need = config.pad_pair_clearance(pad, net_id, other_type='via')
+            need = held(config.pad_pair_clearance(pad, net_id, other_type='via'), shared,
+                        lambda L, pad=pad: area.pad_index(pad, L))
             if gap < need - _VIA_SITE_EPS:
                 return (f"its copper would sit {gap:.4f}mm from {_net_label(pcb_data, pnid)} pad "
                         f"{pad.component_ref}.{pad.pad_number} (clearance {need:g}mm)")
