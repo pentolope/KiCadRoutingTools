@@ -9,10 +9,11 @@ other: a wildcard, a negated class, a '!' exclusion or a class that selects
 several nets ('D_[PN]', 'SIG[0-7]') still lifts nothing. A net is stripped
 when none of its input tracks (by uuid) is left on the output board.
 
---nets asks to route a net, not to rip one: a class-tier call of autoroute
-(its nets by literal glob, an uncoupled pair in --rip-existing-nets, the
-in-run rip of pre-existing copper on) leaves a protected pair in its --nets
-as it is, though the pair walls a net of the call in.
+In plain --nets only an exact name lifts protection (#521): a class-tier
+call of autoroute (its nets by literal glob, an uncoupled pair in
+--rip-existing-nets, the in-run rip of pre-existing copper on) leaves a
+protected pair in its --nets as it is, though the pair walls a net of the
+call in, while the same call naming the nets exactly rips the pair to free it.
 
     python3 tests/test_reroute_protected_globs.py
 """
@@ -118,6 +119,19 @@ def reroute(td, board, tag, nets):
     return run_utils.evidence(out, f'the {tag} board'), log
 
 
+def tier_call(board, out, name):
+    r = subprocess.run(PY + [os.path.join(REPO, 'py_router', 'route.py'), board, out, '--nets',
+                             *[name(n) for n in ('D_P', 'D_N', 'U_P', 'U_N', 'X')],
+                             '--rip-existing-nets', name('U_P'), name('U_N'),
+                             '--layers', 'F.Cu', '--clearance', '0.15', '--track-width', '0.2'],
+                       capture_output=True, text=True, cwd=REPO,
+                       env=dict(os.environ, KICAD_RIP_PREEXISTING='1'))
+    if r.returncode != 0:
+        raise AssertionError(f'BROKEN TEST: route.py {out} exited {r.returncode}\n'
+                             f'{(r.stdout + r.stderr)[-2000:]}')
+    return run_utils.evidence(out, 'the tier board')
+
+
 def main():
     from autoroute import _glob
     from kicad_parser import parse_kicad_pcb
@@ -177,23 +191,18 @@ def main():
         print('5. a class-tier call: --nets by literal glob, --rip-existing-nets the '
               'uncoupled pair, KICAD_RIP_PREEXISTING=1')
         tb = tier_board(os.path.join(td, 'tier'))
-        tout = os.path.join(td, 'tier', 'out.kicad_pcb')
-        r = subprocess.run(PY + [os.path.join(REPO, 'py_router', 'route.py'), tb, tout, '--nets',
-                                 *[_glob(n) for n in ('D_P', 'D_N', 'U_P', 'U_N', 'X')],
-                                 '--rip-existing-nets', _glob('U_P'), _glob('U_N'),
-                                 '--layers', 'F.Cu', '--clearance', '0.15',
-                                 '--track-width', '0.2'],
-                           capture_output=True, text=True, cwd=REPO,
-                           env=dict(os.environ, KICAD_RIP_PREEXISTING='1'))
-        if r.returncode != 0:
-            raise AssertionError(f'BROKEN TEST: route.py tier exited {r.returncode}\n'
-                                 f'{(r.stdout + r.stderr)[-2000:]}')
-        run_utils.evidence(tout, 'the tier board')
+        tout = tier_call(tb, os.path.join(td, 'tier', 'globs.kicad_pcb'), _glob)
         check('the protected pair keeps every track as it was',
               all(copper(tout, n) == copper(tb, n) for n in ('D_P', 'D_N')),
               str({n: copper(tout, n) for n in ('D_P', 'D_N')}))
         check('and X, which only a rip of the pair could free, stays open',
               not copper(tout, 'X'), str(copper(tout, 'X')))
+
+        print('6. the same call naming every net exactly in --nets (the #521 override)')
+        tout = tier_call(tb, os.path.join(td, 'tier', 'exact.kicad_pcb'), lambda n: n)
+        check('the protected pair is ripped', copper(tout, 'D_P') != copper(tb, 'D_P'),
+              str(copper(tout, 'D_P')))
+        check('and X routes', bool(copper(tout, 'X')), str(copper(tout, 'X')))
     finally:
         shutil.rmtree(td, ignore_errors=True)
     if failures:

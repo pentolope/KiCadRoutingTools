@@ -20,9 +20,11 @@ reader here takes the newer copy.
 
 **Policy** (no CLI flag, no GUI control -- deliberate, like the #498 .kicad_dru
 auto-read): protection guards against COLLATERAL damage. A net named EXACTLY
-(``exact_names``) in ``--rip-existing-nets``, or in ``--nets`` with
-``--force-reroute``, is being deliberately targeted and stays rippable; glob
-matches over protected nets are filtered with a printed exclusion. Consumers:
+(no glob metacharacters) in ``--nets`` or ``--rip-existing-nets`` is being
+deliberately targeted and stays rippable; glob matches over protected nets are
+filtered with a printed exclusion. In ``--rip-existing-nets``, and in
+``--nets`` with ``--force-reroute``, a glob that names one net alone counts as
+its exact name (``exact_names`` with the board's net names). Consumers:
 
   * route.py's ``--rip-existing-nets`` expansion (collateral rip of non-target
     nets) skips protected nets unless exactly named.
