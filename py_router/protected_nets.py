@@ -20,9 +20,10 @@ reader here takes the newer copy.
 
 **Policy** (no CLI flag, no GUI control -- deliberate, like the #498 .kicad_dru
 auto-read): protection guards against COLLATERAL damage. A net named EXACTLY
-(no glob metacharacters) in ``--nets`` or ``--rip-existing-nets`` is being
-deliberately targeted and stays rippable; glob matches over protected nets are
-filtered with a printed exclusion. Consumers:
+(no glob metacharacters, or a literal glob that spells it: ``exact_names``) in
+``--nets`` or ``--rip-existing-nets`` is being deliberately targeted and stays
+rippable; glob matches over protected nets are filtered with a printed
+exclusion. Consumers:
 
   * route.py's ``--rip-existing-nets`` expansion (collateral rip of non-target
     nets) skips protected nets unless exactly named.
@@ -36,6 +37,7 @@ call ``note_protection_candidates``; the per-step persistence happens next to
 the DRC-floor writeback (CLI mains, ai_plan executor) via
 ``consume_protection_candidates`` + ``persist_protected_nets``.
 """
+import fnmatch
 import json
 import os
 from typing import Dict, Iterable, List, Optional, Set
@@ -593,12 +595,51 @@ def effective_protection_map(pcb_data, input_file: Optional[str] = None
     return {n: r for n, r in m.items() if never_lifts(r) or n not in lifted}
 
 
-def exact_names(patterns: Optional[Iterable[str]]) -> Set[str]:
-    """The non-glob entries of a pattern list: naming a net exactly is the
+def _literal_glob(pattern: str) -> bool:
+    """True when PATTERN spells names char by char: no '*' or '?', no
+    negated class, no leading '!' (an exclusion). autoroute names each net so
+    (`autoroute._glob`: 'GND' -> 'GN[D/]')."""
+    if pattern.startswith('!') or '*' in pattern or '?' in pattern:
+        return False
+    i = pattern.find('[')
+    while i >= 0:
+        j = i + 1
+        if pattern[j:j + 1] == '!':
+            return False
+        if pattern[j:j + 1] == ']':
+            j += 1
+        k = pattern.find(']', j)
+        if k < 0:
+            return True
+        i = pattern.find('[', k + 1)
+    return True
+
+
+def exact_names(patterns: Optional[Iterable[str]], net_names=None) -> Set[str]:
+    """The nets a pattern list names exactly: its non-glob entries, and with
+    the board's NET_NAMES each net a literal glob (`_literal_glob`) selects
+    as the whole name, read as --nets reads it (net_queries: a pattern that
+    spells a net names that net only). Naming a net exactly is the
     deliberate-override signal that lifts its protection for this step."""
     if not patterns:
         return set()
-    return {p for p in patterns if p and not (_GLOB_CHARS & set(p))}
+    out = {p for p in patterns if p and not (_GLOB_CHARS & set(p))}
+    lit = [p for p in patterns if p and p not in out and _literal_glob(p)]
+    if lit and net_names:
+        from net_queries import _pattern_names_a_net
+        known = frozenset(n for n in net_names if n)
+        for p in lit:
+            if p in known:
+                out.add(p)
+            elif not _pattern_names_a_net(p, known):
+                out |= {n for n in known if fnmatch.fnmatchcase(n, p)}
+    return out
+
+
+def board_net_names(pcb_data) -> Set[str]:
+    """The names of the nets of PCB_DATA."""
+    return {n.name for n in (getattr(pcb_data, 'nets', None) or {}).values()
+            if getattr(n, 'name', None)}
 
 
 def stash_rip_overrides(pcb_data, patterns: Optional[Iterable[str]]) -> Set[str]:
@@ -610,7 +651,7 @@ def stash_rip_overrides(pcb_data, patterns: Optional[Iterable[str]]) -> Set[str]
     explicitly named ('protected_skipped {"phase3 tap cascade":
     {USB_DM_R: user}}' while --rip-existing-nets named it). 'locked' is
     never overridable, here or anywhere."""
-    names = exact_names(patterns)
+    names = exact_names(patterns, board_net_names(pcb_data))
     if names:
         pcb_data._rip_override_names = set(
             getattr(pcb_data, '_rip_override_names', None) or set()) | names
@@ -744,14 +785,14 @@ def clear_skipped() -> None:
 
 def filter_rippable_names(names: List[str], protected: Dict[str, str],
                           override_patterns: Optional[Iterable[str]] = None,
-                          context: str = "rip-up") -> List[str]:
+                          context: str = "rip-up", net_names=None) -> List[str]:
     """Drop protected names (minus exact-name overrides), printing what was
     excluded and why. Returns the surviving names in input order. A net whose
     reason is 'locked' (KiCad-locked copper) or a `sense:` group (#1279) has
     NO override -- ever (`never_lifts`)."""
     if not protected:
         return list(names)
-    overrides = exact_names(override_patterns)
+    overrides = exact_names(override_patterns, net_names)
     kept, blocked = [], []
     for n in names:
         if n in protected and (never_lifts(protected[n]) or n not in overrides):

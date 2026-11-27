@@ -742,7 +742,7 @@ def select_force_reroute_nets(pcb_data: PCBData, net_ids, overrides,
     if not cand:
         return ripped
     from protected_nets import (protection_map, filter_rippable_names,
-                                stash_rip_overrides)
+                                stash_rip_overrides, board_net_names)
     prot = protection_map(pcb_data, input_file)
     overrides = list(overrides)
     stash_rip_overrides(pcb_data, overrides)
@@ -750,7 +750,7 @@ def select_force_reroute_nets(pcb_data: PCBData, net_ids, overrides,
     if prot:
         keep = set(filter_rippable_names(
             [n for n, _ in cand], prot, override_patterns=overrides,
-            context="--force-reroute"))
+            context="--force-reroute", net_names=board_net_names(pcb_data)))
     # Copper held immutable stays where it is (kicad_parser.is_immutable_copper):
     # a net carrying it can still be ripped -- a via-span step's hold on an
     # earlier step's escape (#1842) keeps the net's routes rippable -- but the
