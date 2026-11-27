@@ -125,6 +125,20 @@ class LayerExtraClearance(float):
         return f"{float(self):.3f}mm ({per})"
 
 
+def net_tie_pad_keys(pcb_data) -> FrozenSet[tuple]:
+    """(reference, pad number) of every pad in a footprint's net-tie group:
+    the pads whose stamps the net-tie corridor lift owns."""
+    fps = getattr(pcb_data, 'footprints', None) or {}
+    memo = pcb_data.__dict__.get('_net_tie_pad_keys')
+    if memo is not None and memo[0] is fps and memo[1] == len(fps):
+        return memo[2]
+    keys = frozenset((ref, num) for ref, fp in fps.items()
+                     for group in (getattr(fp, 'net_tie_groups', None) or ())
+                     for num in group)
+    pcb_data.__dict__['_net_tie_pad_keys'] = (fps, len(fps), keys)
+    return keys
+
+
 def extra_on_layer(extra, layer: str):
     """The extra clearance a stamp on copper layer `layer` takes: that layer's
     own value for a `LayerExtraClearance`, the value itself otherwise."""
@@ -504,6 +518,11 @@ class GridRouteConfig:
     # obstacle_clearance / pad_obstacle_clearance / pair_clearance read it;
     # None (no such rule) leaves every value as it was.
     scoped_clearance: Optional[object] = None
+    # The pads a scoped rule binds stand at the board's lowest requirement
+    # (`pad_floor_clearance`) on the maps this config builds, and a routed net
+    # that needs more gets the rest while it routes (`net_keepouts.block`).
+    # Set by the single-ended engine, whose route entries stamp it.
+    scoped_pad_floor: bool = False
     # #530: the board's design rules resolved in KiCad's order
     # (design_rules.DesignRules), installed engine-side by
     # kicad_dru.install_layer_clearances for both fronts. None until then.
@@ -779,6 +798,25 @@ class GridRouteConfig:
         if self.scoped_clearance is None:
             return default
         return self.scoped_stamp(nid, self.scoped_pad_key(pad), default)
+
+    def pad_floor_clearance(self, pad, default: Optional[float] = None,
+                            extra_clearance=0.0, pcb_data=None) -> float:
+        """A foreign pad's stamp on a routing map: under `scoped_pad_floor`
+        (on a map with no extra clearance and no rule area, for a pad of
+        `pcb_data` outside a net tie) the scoped channel's floor for it
+        (`ScopedClearanceInstall.pad_floor`), else `pad_obstacle_clearance`."""
+        s = self.scoped_clearance
+        if (s is not None and self.scoped_pad_floor and pcb_data is not None
+                and (getattr(pad, 'component_ref', None),
+                     getattr(pad, 'pad_number', None)) not in net_tie_pad_keys(pcb_data)
+                and not float(extra_clearance or 0.0)
+                and not any((getattr(extra_clearance, 'by_layer', None) or {}).values())
+                and getattr(self, 'area_clearance', None) is None):
+            v = s.pad_floor(int(getattr(pad, 'net_id', 0) or 0),
+                            self.scoped_pad_key(pad), self)
+            if v is not None:
+                return v
+        return self.pad_obstacle_clearance(pad, default)
 
     def scoped_pad_key(self, pad):
         """The scoped channel's obstacle key for a pad: its pad type, or

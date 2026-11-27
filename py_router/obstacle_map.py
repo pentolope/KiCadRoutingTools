@@ -580,8 +580,11 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
                 if _rec.cell_batches:
                     _tie_recorded.append(('pad', id(pad), _rec.merged_cells()))
                 continue
+            _clr = _obstacle_clearance(net_id, pad)
+            if _area is None and _area_pass is None:
+                _clr = config.pad_floor_clearance(pad, _clr, extra_clearance, pcb_data)
             _add_pad_obstacle(obstacles, pad, coord, layer_map, config, extra_clearance,
-                              clearance_override=_obstacle_clearance(net_id, pad),
+                              clearance_override=_clr,
                               cell_sink=_pad_cell_sink, via_sink=_pad_via_sink)
     # One Rust call per layer for every pad's track keep-out, one for the via
     # keep-outs -- the segment loop above has done this since 2026-08-14; the
@@ -3218,7 +3221,8 @@ def add_net_pads_as_obstacles(obstacles: GridObstacleMap, pcb_data: PCBData,
     for pad in pads:
         # #1491: by the pad's own type (a scoped rule may bind pads alone)
         _add_pad_obstacle(obstacles, pad, coord, layer_map, config, extra_clearance,
-                          clearance_override=config.pad_obstacle_clearance(pad))
+                          clearance_override=config.pad_floor_clearance(
+                              pad, extra_clearance=extra_clearance, pcb_data=pcb_data))
     # #1853: and off their holes at a hole_clearance rule, as the base map
     # holds the pads of the nets a step does not route
     stamp_hole_rule_pad_holes(obstacles, pads, config, extra_clearance)

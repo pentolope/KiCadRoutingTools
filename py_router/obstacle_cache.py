@@ -1066,7 +1066,9 @@ def _precompute_net_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteC
         _collect_pad_obstacles(pad, coord, layer_map, config, extra_clearance,
                                 blocked_cells_set, blocked_vias_set,
                                 obs_clearance=(obs_clearance if config.scoped_clearance is None
-                                               else config.pad_obstacle_clearance(pad)))
+                                               else config.pad_floor_clearance(
+                                                   pad, extra_clearance=extra_clearance,
+                                                   pcb_data=pcb_data)))
     if getattr(config, 'hole_rules', None) is not None:
         # #1853: the pads' HOLES at a hole_clearance rule, as the base map
         # holds the pads of the nets a step does not route

@@ -602,7 +602,135 @@ def _cells_for(pcb_data, idx: Tuple[int, ...], config) -> Tuple[np.ndarray, np.n
     return cache[key]
 
 
+def _scoped_raise_armed(config) -> bool:
+    """Do maps built from `config` stand their scoped-rule pads at the floor
+    (`GridRouteConfig.pad_floor_clearance`), so a net routing on one needs
+    its own raise?"""
+    return (config is not None and getattr(config, 'scoped_pad_floor', False)
+            and getattr(config, 'scoped_clearance', None) is not None
+            and getattr(config, 'area_clearance', None) is None
+            and not float(getattr(config, 'edge_extra_clearance', 0.0) or 0.0))
+
+
+def _scoped_raise_pads(pcb_data, net_ids, config):
+    """[(pad, value)]: every pad of another net whose scoped requirement for
+    one of `net_ids` is above the floor it is stamped at."""
+    from routing_config import net_tie_pad_keys
+    s = config.scoped_clearance
+    board = pcb_data
+    if getattr(config, 'via_span', None):
+        from via_span import obstacle_board
+        board = obstacle_board(pcb_data, config)
+    own = {int(n or 0) for n in net_ids}
+    ties = net_tie_pad_keys(pcb_data)
+    out = []
+    for nid, pads in board.pads_by_net.items():
+        if int(nid or 0) in own:
+            continue
+        for pad in pads:
+            if (getattr(pad, 'component_ref', None), getattr(pad, 'pad_number', None)) in ties:
+                continue
+            key = config.scoped_pad_key(pad)
+            vals = [v for v in (s.pad_raise(n, nid, key, config) for n in own)
+                    if v is not None]
+            if vals:
+                out.append((pad, max(vals)))
+    return out
+
+
+def _scoped_raise_rows(pcb_data, net_ids, config, via_geom=None):
+    """(track cells (N, 3), via cells (M, 2)) of `_scoped_raise_pads`, each
+    pad stamped whole at its value as the base map stamps a pad, at the
+    config's via or at ``via_geom`` = (size, drill). Cached on pcb_data per
+    install, nets, geometry and clip."""
+    from obstacle_map import _add_pad_obstacle
+    from routing_config import GridCoord
+    from routing_utils import build_layer_map
+    s = config.scoped_clearance
+    geom = via_geom or (config.via_size, config.via_drill)
+    key = (id(s), tuple(sorted(int(n or 0) for n in net_ids)), config.grid_step,
+           config.track_width, config.clearance, geom, tuple(config.layers),
+           getattr(config, 'via_span', None) is not None,
+           getattr(pcb_data.board_info, 'board_bounds', None))
+    cache: Dict = pcb_data.__dict__.setdefault('_scoped_raise_cells', {})
+    got = cache.get(key)
+    if got is not None and got[0] is s and got[1] is config.net_clearances:
+        return got[2]
+    from dataclasses import replace
+    cfg = config if via_geom is None else replace(config, via_size=geom[0],
+                                                   via_drill=geom[1])
+    rec = _Recorder()
+    coord = GridCoord(cfg.grid_step)
+    layer_map = build_layer_map(cfg.layers)
+    for pad, v in _scoped_raise_pads(pcb_data, net_ids, cfg):
+        _add_pad_obstacle(rec, pad, coord, layer_map, cfg, 0.0, clearance_override=v)
+    cells = (np.unique(np.concatenate(rec.cells), axis=0) if rec.cells
+             else np.empty((0, 3), dtype=np.int32))
+    vias = (np.unique(np.concatenate(rec.vias), axis=0) if rec.vias
+            else np.empty((0, 2), dtype=np.int32))
+    cache[key] = (s, config.net_clearances, (cells, vias))
+    return cells, vias
+
+
+def _block_scoped_pads(obstacles, pcb_data, net_ids, config):
+    """The raise `_scoped_raise_rows` names for `net_ids`, added to
+    `obstacles` (the via cells to every via rung, as `_block_regions` adds a
+    region's); returns the call that removes exactly what was added."""
+    if obstacles is None or not _scoped_raise_armed(config):
+        return lambda: None
+    net_ids = tuple(n for n in net_ids if n)
+    if not net_ids:
+        return lambda: None
+    cells, vias = _scoped_raise_rows(pcb_data, net_ids, config)
+    if not len(cells) and not len(vias):
+        return lambda: None
+    from obstacle_map import (_rung_small_armed, _stamp_rungs_at_own_via,
+                              populated_via_rungs)
+    small = (_rung_small_armed() and hasattr(obstacles, 'add_blocked_vias_small_batch')
+             and 1 in populated_via_rungs(obstacles))
+    rungs = len(vias) and hasattr(obstacles, 'rung_count')
+
+    def at_rung(sink, cfg):
+        rows = _scoped_raise_rows(pcb_data, net_ids, config,
+                                  (cfg.via_size, cfg.via_drill))[1]
+        if len(rows):
+            sink.add_blocked_vias_batch(rows)
+    if len(cells):
+        obstacles.add_blocked_cells_batch(cells)
+    if len(vias):
+        obstacles.add_blocked_vias_batch(vias)
+        if small:
+            obstacles.add_blocked_vias_small_batch(vias)
+    if rungs:
+        _stamp_rungs_at_own_via(obstacles, config, at_rung)
+
+    def remove():
+        if len(cells):
+            obstacles.remove_blocked_cells_batch(cells)
+        if len(vias):
+            obstacles.remove_blocked_vias_batch(vias)
+            if small:
+                obstacles.remove_blocked_vias_small_batch(vias)
+        if rungs:
+            _stamp_rungs_at_own_via(obstacles, config, at_rung, remove=True)
+    return remove
+
+
 def block(obstacles, pcb_data, net_ids: Iterable[int], config):
+    """Block the keep-outs binding any of `net_ids` in `obstacles`, and the
+    scoped-rule pads they need above the floor (`_block_scoped_pads`);
+    returns the call that removes exactly what was added (`stamp`)."""
+    net_ids = tuple(net_ids)
+    regions = _block_regions(obstacles, pcb_data, net_ids, config)
+    pads = _block_scoped_pads(obstacles, pcb_data, net_ids, config)
+
+    def remove():
+        pads()
+        regions()
+    return remove
+
+
+def _block_regions(obstacles, pcb_data, net_ids: Iterable[int], config):
     """Block the keep-outs binding any of `net_ids` in `obstacles`; returns
     the call that removes exactly what was added (`stamp`). A map built for
     those nets alone (the plane finalize's base map) keeps them for good.
@@ -696,7 +824,9 @@ def stamping(net_ids_of, maps_of, centerline: bool = False):
         def run(*args, **kwargs):
             pcb_data = args[0] if args else kwargs.get('pcb_data')
             if not getattr(pcb_data, '_net_keepouts', None):
-                return run.__wrapped__(*args, **kwargs)
+                bound = sig.bind(*args, **kwargs)
+                if not _scoped_raise_armed(bound.arguments.get('config')):
+                    return run.__wrapped__(*args, **kwargs)
             bound = sig.bind(*args, **kwargs)
             a = bound.arguments
             nets, seen = tuple(net_ids_of(a)), []

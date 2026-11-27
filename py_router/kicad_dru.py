@@ -1863,6 +1863,88 @@ class ScopedClearanceInstall:
                     self._held.add((name, (self.sc._sig(net_id), pad_type)))
         return max(rule_max, cp)
 
+    def group_value(self, routed_net: int, net_id: int, pad_type, config
+                    ) -> Optional[float]:
+        """What `routed_net`'s tracks and vias need from a pad of `net_id`
+        and `pad_type`: `stamp` for that net alone. None when no scoped rule
+        binds the pair."""
+        clr = config.clearance
+        nc = config.net_clearances or {}
+        vals, unmatched = [], False
+        for rt in _ROUTED_TYPES:
+            got = self.sc.pair_value(routed_net, rt, net_id, 'pad', None, pad_type,
+                                     stamp=True)
+            if got is None:
+                unmatched = True
+            else:
+                vals.append(max(got[0], self.fab_floor))
+        if not vals:
+            return None
+        if unmatched:
+            vals.append(max(clr, nc.get(int(net_id or 0), clr),
+                            nc.get(int(routed_net or 0), clr)))
+        return max(vals)
+
+    def _board_groups(self, config):
+        """{(signature, class value): nets} over every named net of the
+        board, for `config`'s class map."""
+        nc = config.net_clearances or {}
+        got = getattr(self, '_groups_memo', None)
+        if got is not None and got[0] is nc:
+            return got[1]
+        groups: Dict[tuple, list] = {}
+        for nid, name in sorted(self.sc.dr.net_names.items()):
+            if nid and name:
+                groups.setdefault((self.sc._sig(nid), nc.get(nid)), []).append(nid)
+        self._groups_memo = (nc, groups)
+        self._floor_memo = {}
+        return groups
+
+    def pad_floor(self, net_id: int, pad_type, config) -> Optional[float]:
+        """The lowest `group_value` any other net of the board has for a pad
+        of `net_id` and `pad_type`: a value of the board and its rules, not
+        of the routed set. None when no scoped rule binds such a pad against
+        any net, so the caller keeps its own value."""
+        groups = self._board_groups(config)
+        nid = int(net_id or 0)
+        own = (self.sc._sig(nid), (config.net_clearances or {}).get(nid))
+        key = (own, pad_type, config.clearance, groups.get(own) == [nid])
+        if key in self._floor_memo:
+            return self._floor_memo[key]
+        vals, bound = [], False
+        clr = config.clearance
+        nc = config.net_clearances or {}
+        for members in groups.values():
+            if members == [nid]:
+                continue
+            rep = members[0] if members[0] != nid else members[1]
+            v = self.group_value(rep, nid, pad_type, config)
+            if v is None:
+                v = max(clr, nc.get(nid, clr), nc.get(rep, clr))
+            else:
+                bound = True
+            vals.append(v)
+        out = min(vals) if bound and vals else None
+        self._floor_memo[key] = out
+        return out
+
+    def pad_raise(self, routed_net: int, net_id: int, pad_type, config
+                  ) -> Optional[float]:
+        """`group_value` where it exceeds `pad_floor`: the value a map whose
+        pads stand at the floor must add for `routed_net` while it routes;
+        None when the floor already holds it."""
+        if int(routed_net or 0) == int(net_id or 0):
+            return None
+        floor = self.pad_floor(net_id, pad_type, config)
+        if floor is None:
+            return None
+        clr = config.clearance
+        nc = config.net_clearances or {}
+        v = self.group_value(routed_net, net_id, pad_type, config)
+        if v is None:
+            v = max(clr, nc.get(int(net_id or 0), clr), nc.get(int(routed_net or 0), clr))
+        return v if v > floor + 1e-9 else None
+
     @property
     def max_value(self) -> float:
         """The widest value any scoped rule can price a pair at."""
