@@ -121,6 +121,9 @@ class AreaClearance:
                  layer_orders=None, split_reach: float = 0.0, extensions=None,
                  via_reach: float = 0.0):
         self.regions = list(regions)
+        #: region indices in the file order of their clearance rules: where
+        #: two bind one item or one pair, the later rule's region stands
+        self._by_order = sorted(range(len(self.regions)), key=lambda i: self.regions[i].order)
         self.copper = list(copper_layers)
         self.skipped = list(skipped)
         #: {layer: file position of the rule its layer clearance comes from}
@@ -447,7 +450,8 @@ class AreaClearance:
         # a zero-length probe is a via: it touches within its own reach
         reach = self.via_reach if (x1, y1) == (x2, y2) else self.split_reach
         geom = None
-        for i, r in enumerate(self.regions):
+        for i in self._by_order:
+            r = self.regions[i]
             if layer not in r.layers or r.value is None:
                 continue
             bx0, by0, bx1, by1 = r.bounds
@@ -497,7 +501,8 @@ class AreaClearance:
         n = len(ax)
         out = np.full(n, -1, dtype=np.int64)
         import shapely
-        for i, r in enumerate(self.regions):
+        for i in self._by_order:
+            r = self.regions[i]
             if layer not in r.layers or n == 0 or r.value is None:
                 continue
             x0, y0, x1, y1 = r.bounds
@@ -540,7 +545,8 @@ class AreaClearance:
     def _item_index(self, x1, y1, x2, y2, hw, layer) -> int:
         found = -1
         geom = None
-        for i, r in enumerate(self.regions):
+        for i in self._by_order:
+            r = self.regions[i]
             if layer not in r.layers or r.value is None:
                 continue
             bx0, by0, bx1, by1 = r.bounds
@@ -556,7 +562,7 @@ class AreaClearance:
     def pair_value(self, own: int, row: int, default: float, layer) -> float:
         """`pair_excess` for one pair, as a clearance: the region's value
         where one binds it, else ``default``."""
-        i = max(own, row)
+        i = self.later(own, row)
         if i < 0:
             return default
         r = self.regions[i]
@@ -564,18 +570,35 @@ class AreaClearance:
             return default
         return r.value
 
-    def via_value(self, x, y, need: float, layers, row) -> float:
+    def later(self, a: int, b: int) -> int:
+        """Of two region indices (-1: none), the one whose clearance rule
+        comes later in the file."""
+        if a < 0 or b < 0:
+            return max(a, b)
+        oa, ob = self.regions[a].order, self.regions[b].order
+        return a if oa > ob else b if ob > oa else max(a, b)
+
+    def later_rows(self, own: int, rows) -> np.ndarray:
+        """`later` of ``own`` and each of ``rows``."""
+        rows = np.asarray(rows)
+        oo, orow = self.order_of(own), self.order_of(rows)
+        return np.where(orow > oo, rows, np.where(orow < oo, own, np.maximum(rows, own)))
+
+    def via_value(self, x, y, need: float, layers, row, after: int = -1) -> float:
         """The clearance a via at (x, y) is held to against one item it meets
         on ``layers``: ``need`` where no region binds the pair on any of
         them, else the largest `pair_value` over those layers. ``row(layer)``
-        is the item's region index there (`item_index`, `pad_index`)."""
+        is the item's region index there (`item_index`, `pad_index`).
+        ``after``: the file position of a scoped rule binding the pair
+        (`scoped_order`); a region whose rule comes before it leaves ``need``."""
         got = None
         for L in layers:
             own_i = self.own_index(x, y, x, y, L)
             r = row(L)
-            if max(own_i, r) < 0:
+            i = self.later(own_i, r)
+            if i < 0:
                 continue
-            v = self.pair_value(own_i, r, need, L)
+            v = need if after > self.regions[i].order else self.pair_value(own_i, r, need, L)
             got = v if got is None else max(got, v)
         return need if got is None else got
 
@@ -590,7 +613,8 @@ class AreaClearance:
         hx, hy = pad.size_x / 2.0, pad.size_y / 2.0
         if getattr(pad, 'rect_rotation', 0.0):
             hx = hy = math.hypot(hx, hy)
-        for i, r in enumerate(self.regions):
+        for i in self._by_order:
+            r = self.regions[i]
             if layer not in r.layers or r.value is None:
                 continue
             if r.tight:
@@ -607,7 +631,7 @@ class AreaClearance:
         is a `rows_index` slice. A layer rule later in the file than the
         region's rule replaces it there (NaN: the caller's own value)."""
         rows = np.asarray(rows)
-        pair = np.maximum(rows, own)
+        pair = self.later_rows(own, rows)
         out = np.full(len(rows), np.nan)
         lo = self.layer_orders.get(layer, -1)
         for i in np.unique(pair[pair >= 0]):
@@ -630,7 +654,8 @@ class AreaClearance:
         ``kind`` 'clearance' / 'width' reads only the regions that set one."""
         geom = _line(x1, y1, x2, y2)
         found = None
-        for i, r in enumerate(self.regions):
+        for i in (self._by_order if kind == 'clearance' else range(len(self.regions))):
+            r = self.regions[i]
             if kind == 'clearance' and r.value is None:
                 continue
             if kind == 'width' and r.width is None:
@@ -939,6 +964,25 @@ def compose_route_stamp(fn, obstacles, config, layers, clearance, **kwargs):
         fn(area.inside(obstacles, fcfg, i),
            clearance=clearance if r.value is None else r.value,
            config=area.region_config(config, i), **kwargs)
+
+
+def scoped_order(config, own_nid, own_type, nid, foreign_type, pad=None, layers=()) -> int:
+    """The file position of the last scoped `.kicad_dru` clearance rule that
+    binds an item of ``own_nid`` / ``own_type`` against one of ``nid`` /
+    ``foreign_type`` (``pad``: that pad; its `(layer ...)` rules on ``layers``
+    too), or -1."""
+    s = getattr(config, 'scoped_clearance', None) if config is not None else None
+    if s is None or own_nid == nid:
+        return -1
+    pad_type = s.sc.pad_key(pad) if pad is not None else None
+    got = s.sc.pair_value(own_nid, own_type, nid, foreign_type, None, pad_type)
+    out = got[2] if got is not None else -1
+    for L in layers:
+        if L in s.sc.layered_layers:
+            g = s.sc.layer_pair_value(own_nid, own_type, nid, foreign_type, None, pad_type, L)
+            if g is not None:
+                out = max(out, g[2])
+    return out
 
 
 def compose_via_placement(area, config, layers, outer, inner):

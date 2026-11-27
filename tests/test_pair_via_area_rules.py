@@ -7,6 +7,14 @@ over both, over the foreign item only, on F.Cu only, or not at all. The
 oracle is kicad-cli DRC on the same board; `_pair_via_refusal` must refuse
 exactly the sites kicad-cli reports.
 
+A second row of sites holds a D_P via against one foreign item (gaps 4 um
+either side of each value in play) where another rule meets the area's: a
+pad with its own clearance above or below the area's, a net rule later or
+earlier in the file than the area's, two areas whose rules come in the file
+in the opposite order to the regions the router builds for them (a width
+rule on the second area comes first), and an area rule below a net class's
+clearance.
+
     python3 tests/test_pair_via_area_rules.py
 """
 import json
@@ -40,10 +48,10 @@ def check(label, ok, detail=''):
         failures.append(label)
 
 
-def room(b, layers, x0, y0, x1, y1):
+def room(b, layers, x0, y0, x1, y1, name='ROOM'):
     lay = ' '.join(f'"{l}"' for l in layers)
     b.items.append(
-        f'  (zone (net 0) (net_name "") (layers {lay}) (uuid "{b._uid()}") (name "ROOM") '
+        f'  (zone (net 0) (net_name "") (layers {lay}) (uuid "{b._uid()}") (name "{name}") '
         f'(hatch edge 0.5) (connect_pads (clearance 0)) (min_thickness 0.25)\n'
         f'    (keepout (tracks allowed) (vias allowed) (pads allowed) '
         f'(copperpour allowed) (footprints allowed))\n'
@@ -51,8 +59,53 @@ def room(b, layers, x0, y0, x1, y1):
         f'    (polygon (pts (xy {x0} {y0}) (xy {x1} {y0}) (xy {x1} {y1}) (xy {x0} {y1}))))')
 
 
+RULES = (('wb', 'track_width (min 0.15mm) (opt 0.15mm)', "A.insideArea('RB')"),
+         ('early', 'clearance (min 0.5mm)', "A.NetName == 'EARLY'"),
+         ('room', f'clearance (min {AREA}mm)', "A.insideArea('ROOM')"),
+         ('late', 'clearance (min 0.5mm)', "A.NetName == 'LATE'"),
+         ('ra', 'clearance (min 0.25mm)', "A.insideArea('RA')"),
+         ('rb', 'clearance (min 0.4mm)', "A.insideArea('RB')"),
+         ('relax', 'clearance (min 0.2mm)', "A.insideArea('RELAX')"))
+#: scenario -> (foreign net, its pad clearance or None for a via, the area over
+#: both items, the area over the foreign item only, the values in play)
+SCENARIOS = {'pad_override_high': ('AGND', 0.5, 'ROOM', None, (AREA, 0.5)),
+             'pad_override_low': ('AGND', 0.2, 'ROOM', None, (0.2, AREA)),
+             'later_net_rule': ('LATE', None, 'ROOM', None, (AREA, 0.5)),
+             'earlier_net_rule': ('EARLY', None, 'ROOM', None, (AREA, 0.5)),
+             'two_areas': ('AGND', None, 'RA', 'RB', (0.25, 0.4)),
+             'relaxing_area': ('WIDE', None, 'RELAX', None, (0.2, 0.4))}
+
+
+def scenario_sites(b, y, sites):
+    k = 0
+    for name, (net, pad_clr, over, beside, values) in SCENARIOS.items():
+        for value in values:
+            for delta in DELTAS:
+                x, gap = 5.0 + 6.0 * k, value + delta
+                k += 1
+                if pad_clr is None:
+                    fy = y - VIA / 2 - gap - VIA / 2
+                    b.via(x, fy, net, size=VIA, drill=DRILL, locked=True)
+                    box = (x - VIA / 2, fy - VIA / 2, x + VIA / 2, fy + VIA / 2)
+                else:
+                    fy = y - VIA / 2 - gap - PAD / 2
+                    b.pad(f'K{k}', x, fy, net, sx=PAD, sy=PAD)
+                    b.items[-1] = b.items[-1].replace('(net ', f'(clearance {pad_clr}) (net ', 1)
+                    box = (x - PAD / 2, fy - PAD / 2, x + PAD / 2, fy + PAD / 2)
+                if beside is None:
+                    room(b, ('F.Cu', 'B.Cu'), x - 2.0, box[1] - 0.1, x + 2.0, y + 1.0, over)
+                else:
+                    room(b, ('F.Cu', 'B.Cu'), x - 2.0, y - VIA / 2 - 0.05, x + 2.0, y + 1.0, over)
+                    room(b, ('F.Cu', 'B.Cu'), box[0] - 0.05, box[1] - 0.05, box[2] + 0.05,
+                         box[3] + 0.05, beside)
+                b.via(x, y, 'D_P', size=VIA, drill=DRILL)
+                sites[(name, f'{value:g}', delta)] = (x, y)
+    return k
+
+
 def site_board(d):
-    b = RoutingBoard(w=10 + 6 * len(KINDS) * len(DELTAS), h=8 + 6 * len(MODES))
+    n = sum(len(v[4]) for v in SCENARIOS.values()) * len(DELTAS)
+    b = RoutingBoard(w=10 + 6 * max(len(KINDS) * len(DELTAS), n), h=14 + 6 * len(MODES))
     sites = {}
     for r, (mode, (layers, covers)) in enumerate(MODES.items()):
         for k, kind in enumerate(KINDS):
@@ -79,6 +132,7 @@ def site_board(d):
                         room(b, layers, box[0] - 0.1, box[1] - 0.1, box[2] + 0.1, box[3] + 0.1)
                 b.via(x, y, 'D_P', size=VIA, drill=DRILL)
                 sites[(mode, kind, delta)] = (x, y)
+    scenario_sites(b, 6.0 + 6.0 * len(MODES), sites)
     os.makedirs(d)
     pcb = os.path.join(d, 'in.kicad_pcb')
     with open(pcb, 'w', encoding='utf-8') as fh:
@@ -91,13 +145,17 @@ def site_board(d):
            'meta': {'filename': 'in.kicad_pro', 'version': 3},
            'net_settings': {'classes': [{'name': 'Default', 'clearance': CLR,
                                          'track_width': 0.15, 'via_diameter': VIA,
+                                         'via_drill': DRILL},
+                                        {'name': 'Wide', 'clearance': 0.4,
+                                         'track_width': 0.15, 'via_diameter': VIA,
                                          'via_drill': DRILL}],
+                            'netclass_patterns': [{'netclass': 'Wide', 'pattern': 'WIDE'}],
                             'meta': {'version': 4}}}
     with open(os.path.join(d, 'in.kicad_pro'), 'w', encoding='utf-8') as fh:
         json.dump(pro, fh)
     with open(os.path.join(d, 'in.kicad_dru'), 'w', encoding='utf-8') as fh:
-        fh.write(f"(version 1)\n(rule \"room\"\n  (constraint clearance (min {AREA}mm))\n"
-                 f"  (condition \"A.insideArea('ROOM')\"))\n")
+        fh.write('(version 1)\n' + ''.join(
+            f'(rule "{n}"\n  (constraint {c})\n  (condition "{w}"))\n' for n, c, w in RULES))
     return pcb, sites
 
 
@@ -122,8 +180,9 @@ def main():
     td = tempfile.mkdtemp(prefix='krt_pairvia_area_')
     try:
         from diff_pair_routing import _pair_via_refusal
-        from kicad_dru import install_layer_clearances
+        from kicad_dru import install_layer_clearances, install_track_clearances
         from kicad_parser import parse_kicad_pcb
+        from list_nets import net_clearance_map_by_id
         from routing_config import GridRouteConfig
         pcb, sites = site_board(os.path.join(td, 'sites'))
         rep = kicad_drc(pcb)
@@ -137,7 +196,11 @@ def main():
         cfg = GridRouteConfig(clearance=CLR, track_width=0.15, via_size=VIA, via_drill=DRILL,
                               hole_to_hole_clearance=0.25, board_edge_clearance=0.3,
                               grid_step=GRID, layers=['F.Cu', 'B.Cu'])
+        names = {nid: n.name for nid, n in board.nets.items() if n.name}
+        routed = [next(n for n, v in board.nets.items() if v.name == 'D_P')]
+        cfg.set_net_clearances(net_clearance_map_by_id(pcb, names), routed_net_ids=routed)
         install_layer_clearances(cfg, None, pcb, board)
+        install_track_clearances(cfg, None, pcb, board, routed_net_ids=routed)
         check('the ROOM rule is installed', getattr(cfg, 'area_clearance', None) is not None)
         net = next(n for n, v in board.nets.items() if v.name == 'D_P')
         board.vias = [v for v in board.vias if v.net_id != net]

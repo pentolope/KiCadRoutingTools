@@ -475,7 +475,7 @@ def _area_excess(config, pcb_data, net_id, x1, y1, x2, y2, layer, kind, arrays,
         orders = np.full(len(nids), -1, dtype=np.int64)
         _scoped_excess(config, net_id, nids, foreign_type, base_clearance, layer,
                        pad_types=pad_types, own_type=own_type, orders=orders)
-        pair = np.maximum(rows, own)
+        pair = area.later_rows(own, rows)
         ax = np.where(orders > area.order_of(pair), np.nan, ax)
     if plc is not None:
         ax = np.where(bound & (plc > 0), plc - base_clearance, ax)
