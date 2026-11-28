@@ -4029,8 +4029,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     # written file; a net whose replan lands NO new copper gets them restored
     # (identity-preserved) before the freeze -- see the custody block ahead of
     # the #209 gate. Protection follows the rip-up rules exactly (#521):
-    # matched groups / diff pairs are skipped unless named EXACTLY (no glob) in
-    # --nets, KiCad-locked copper is never stripped, and plane (zone-owning)
+    # matched groups / diff pairs are skipped unless named EXACTLY in --nets (a
+    # name, or a pattern with no wildcard or negated class that selects one
+    # net), KiCad-locked copper is never stripped, and plane (zone-owning)
     # nets belong to route_planes.
     force_ripped: Dict[int, Tuple[list, list]] = {}
     if force_reroute and not net_names:
@@ -4064,11 +4065,15 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     _pad_contact_rips = []
     if final_reconcile and not skip_routing:
         from pad_contact import rip_pad_contacts
+        from protected_nets import board_net_names, exact_names
+        _board_names = board_net_names(pcb_data)
         _pad_contact_rips = rip_pad_contacts(
             pcb_data, {nid for _name, nid in net_ids}, input_file,
-            overrides=(list(rip_existing_nets or [])
-                       + list(net_name_patterns if net_name_patterns is not None
-                              else (net_names or []))))
+            overrides=sorted(
+                exact_names(rip_existing_nets, _board_names)
+                | exact_names(net_name_patterns if net_name_patterns is not None
+                              else (net_names or []),
+                              _board_names if force_reroute else None)))
         if _pad_contact_rips:
             print(f"Pad contacts: {len(_pad_contact_rips)} via(s)/track(s) of "
                   f"this step's nets lie on another net's pad; taken out to "
@@ -11117,7 +11122,9 @@ For differential pair routing, use route_diff.py:
                              "manual recipe, automated; PR #533). Requires an "
                              "explicit --nets scope. Protected nets (length-matched "
                              "groups, routed diff pairs) are skipped unless named "
-                             "EXACTLY in --nets; KiCad-locked copper is never "
+                             "EXACTLY in --nets (a name, or a pattern with no "
+                             "wildcard or negated class that selects one net); "
+                             "KiCad-locked copper is never "
                              "ripped; plane (zone-owning) nets are skipped -- use "
                              "route_planes for those. If the re-route fails "
                              "outright, the original copper is restored.")

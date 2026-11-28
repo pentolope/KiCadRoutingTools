@@ -713,8 +713,9 @@ def select_force_reroute_nets(pcb_data: PCBData, net_ids, overrides,
     ``overrides`` the ``--nets`` patterns, which are the #521 exact-name
     override. A net with no copper routes normally anyway; a plane
     (zone-owning) net belongs to route_planes; a protected net (length-matched
-    group, routed diff pair) is skipped unless named EXACTLY (no glob) in
-    ``overrides``; KiCad-locked or held copper is never stripped. The exact-name
+    group, routed diff pair) is skipped unless named EXACTLY in ``overrides``
+    (a name, or a pattern with no wildcard or negated class that selects one
+    net: `protected_nets.exact_names`); KiCad-locked or held copper is never stripped. The exact-name
     overrides are stashed on ``pcb_data`` so the in-run ladders honour the
     ones this pre-run filter did (run-6 z2).
 

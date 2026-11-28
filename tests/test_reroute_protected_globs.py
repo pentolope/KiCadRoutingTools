@@ -5,15 +5,20 @@ route_diff records the pair it routes as protected in the sibling
 --force-reroute strip it. autoroute names every net by a literal glob
 (`autoroute._glob`: 'D_P' -> 'D_[P/]'), which selects that one net and
 nothing else, so it must lift that net the way the exact name does, and no
-other: a wildcard, a negated class, a '!' exclusion or a class that selects
-several nets ('D_[PN]', 'SIG[0-7]') still lifts nothing. A net is stripped
-when none of its input tracks (by uuid) is left on the output board.
+other: a wildcard, a negated class or a '!' exclusion, even one that selects
+a single net ('D_N*', 'D_?X', 'D_[!PX]', '!RS[T/]'), or a class that selects
+several nets ('D_[PN]', 'SIG[0-7]') still lifts nothing; a bracketed '*' is
+the character ('A[*][B/]' names 'A*B'). A net is stripped when none of its
+input tracks (by uuid) is left on the output board.
 
 In plain --nets only an exact name lifts protection (#521): a class-tier
 call of autoroute (its nets by literal glob, an uncoupled pair in
 --rip-existing-nets, the in-run rip of pre-existing copper on) leaves a
 protected pair in its --nets as it is, though the pair walls a net of the
 call in, while the same call naming the nets exactly rips the pair to free it.
+So too where route.py takes this step's copper off a foreign pad: a
+protected net over another net's pad keeps its copper under a glob in plain
+--nets and loses it under its exact name.
 
     python3 tests/test_reroute_protected_globs.py
 """
@@ -51,7 +56,7 @@ def stage(d):
     b.pad('J5', 4, 15, 'D_PX', sx=0.6, sy=0.6)
     b.pad('J6', 26, 15, 'D_PX', sx=0.6, sy=0.6)
     b.seg(4, 15, 26, 15, 'D_PX', w=0.2)
-    for k, n in enumerate(('SIG0', 'SIG1', 'SIG5')):
+    for k, n in enumerate(('SIG0', 'SIG1', 'SIG5', 'A*B', '!RST')):
         b.pad(f'S{k}', 4 + 3 * k, 18, n, sx=0.6, sy=0.6)
     os.makedirs(d)
     pcb = os.path.join(d, 'in.kicad_pcb')
@@ -84,6 +89,24 @@ def copper(path, name):
 
 def stripped(base, out, names):
     return all(copper(out, n) and not set(copper(out, n)) & set(base[n]) for n in names)
+
+
+def pad_board(d):
+    """Protected D_P's track runs over net Y's pad K1."""
+    b = RoutingBoard(w=30, h=20)
+    for ref, x, y, n in (('J1', 5, 10, 'D_P'), ('J2', 25, 10, 'D_P'), ('J3', 5, 11, 'D_N'),
+                         ('J4', 25, 11, 'D_N'), ('K1', 15, 10, 'Y'), ('K2', 15, 16, 'Y')):
+        b.pad(ref, x, y, n, sx=0.6, sy=0.6)
+    b.seg(5, 10, 25, 10, 'D_P', w=0.2)
+    b.seg(5, 11, 25, 11, 'D_N', w=0.2)
+    os.makedirs(d)
+    pcb = os.path.join(d, 'in.kicad_pcb')
+    with open(pcb, 'w', encoding='utf-8') as fh:
+        fh.write(b.text())
+    with open(os.path.join(d, 'in.kicad_pro'), 'w', encoding='utf-8') as fh:
+        json.dump({'kicad_routing_tools': {'protected_nets': {
+            'D_P': 'diff-pair', 'D_N': 'diff-pair'}}}, fh)
+    return pcb
 
 
 def tier_board(d):
@@ -183,10 +206,12 @@ def main():
         print('4. the stashed overrides are the nets the literal globs name, no other')
         board = parse_kicad_pcb(routed)
         stash_rip_overrides(board, [_glob('D_P'), 'D_?', 'D_[!X]', '!' + _glob('D_N'),
-                                    'D_[PN]*', 'D_[PN]', 'SIG[0-7]'])
+                                    'D_[PN]*', 'D_[PN]', 'SIG[0-7]', 'D_N*', 'D_?X',
+                                    'D_[!PX]', '!RS[T/]', _glob('A*B')])
         got = rip_override_names(board)
-        check("only D_P ('D_?', a negated class, an exclusion, a wildcard and the "
-              "classes 'D_[PN]' and 'SIG[0-7]' lift none)", got == {'D_P'}, str(sorted(got)))
+        check("only D_P and A*B (wildcards, negated classes and exclusions, one-net "
+              "ones too, and the classes 'D_[PN]' and 'SIG[0-7]' lift none)",
+              got == {'D_P', 'A*B'}, str(sorted(got)))
 
         print('5. a class-tier call: --nets by literal glob, --rip-existing-nets the '
               'uncoupled pair, KICAD_RIP_PREEXISTING=1')
@@ -203,6 +228,20 @@ def main():
         check('the protected pair is ripped', copper(tout, 'D_P') != copper(tb, 'D_P'),
               str(copper(tout, 'D_P')))
         check('and X routes', bool(copper(tout, 'X')), str(copper(tout, 'X')))
+
+        print('7. a protected net over a foreign pad, plain --nets (pad contact)')
+        pb = pad_board(os.path.join(td, 'pad'))
+        for tag, nets, kept in (('glob', [_glob('D_P')], True), ('exact', ['D_P'], False)):
+            pout = os.path.join(td, 'pad', f'{tag}.kicad_pcb')
+            rc, log = run([os.path.join(REPO, 'py_router', 'route.py'), pb, pout, '--nets',
+                           *nets, '--clearance', '0.15', '--track-width', '0.2'])
+            if rc != 0:
+                raise AssertionError(f'BROKEN TEST: route.py pad {tag} exited {rc}\n'
+                                     f'{log[-2000:]}')
+            same = copper(run_utils.evidence(pout, 'the pad board'), 'D_P') == copper(pb, 'D_P')
+            check(f'--nets {" ".join(nets)}: D_P '
+                  + ('keeps every track' if kept else 'loses its track off the pad'),
+                  same == kept, str(copper(pout, 'D_P')))
     finally:
         shutil.rmtree(td, ignore_errors=True)
     if failures:
