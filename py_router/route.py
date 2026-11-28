@@ -4604,28 +4604,31 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         # KiCad-LOCKED copper are excluded unconditionally (no override).
         if existing_rippable:
             from protected_nets import (protection_map, filter_rippable_names,
-                                        stash_rip_overrides, rip_override_names)
+                                        stash_rip_overrides, rip_override_names,
+                                        exact_names, board_net_names)
             _prot = protection_map(pcb_data, input_file)
             # Override source: the RAW --nets patterns when main() passed
             # them -- expansion turns a glob into exact names, which made
             # any glob-selected protected net "exactly named" here (#521's
             # override is deliberately no-glob; found by the force-reroute
             # test). rip_existing_nets is never expanded, so it stays as-is.
-            _rip_overrides = (list(rip_existing_nets)
-                              + list(net_name_patterns
-                                     if net_name_patterns is not None
-                                     else (net_names or []))
-                              # #1395: overrides an enclosing step stashed on
-                              # this pcb_data (a nested sub-run is passed none
-                              # of the patterns itself)
-                              + sorted(rip_override_names(pcb_data)))
+            # A glob in --rip-existing-nets that names one net alone names
+            # it exactly; in --nets only a name does.
+            _board_names = board_net_names(pcb_data)
+            _rip_overrides = sorted(
+                exact_names(rip_existing_nets, _board_names)
+                | exact_names(net_name_patterns if net_name_patterns is not None
+                              else (net_names or []))
+                # #1395: overrides an enclosing step stashed on this
+                # pcb_data (a nested sub-run is passed none of the patterns)
+                | rip_override_names(pcb_data))
             # Run-6 z2 fix: stash for the in-run ladders too.
             stash_rip_overrides(pcb_data, _rip_overrides)
             if _prot:
                 _keep = set(filter_rippable_names(
                     [pcb_data.nets[n].name for n in existing_rippable], _prot,
                     override_patterns=_rip_overrides,
-                    context="--rip-existing-nets"))
+                    context="--rip-existing-nets", net_names=_board_names))
                 existing_rippable = [n for n in existing_rippable
                                      if pcb_data.nets[n].name in _keep]
         if existing_rippable:
@@ -4775,7 +4778,8 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             _pe_auto.append(_nid)
         if _pe_auto:
             from protected_nets import (protection_map, filter_rippable_names,
-                                        rip_override_names)
+                                        rip_override_names, exact_names,
+                                        board_net_names)
             _pe_prot = protection_map(pcb_data, input_file)
             if _pe_prot:
                 # + the overrides an enclosing step stashed on this pcb_data
@@ -4784,10 +4788,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 # which nets the operator named exactly.
                 _pe_keep = set(filter_rippable_names(
                     [pcb_data.nets[n].name for n in _pe_auto], _pe_prot,
-                    override_patterns=(list(rip_existing_nets or [])
-                                       + _pe_caller_pats
-                                       + sorted(rip_override_names(pcb_data))),
-                    context="pre-existing rip candidacy"))
+                    override_patterns=sorted(
+                        exact_names(rip_existing_nets, board_net_names(pcb_data))
+                        | exact_names(_pe_caller_pats)
+                        | rip_override_names(pcb_data)),
+                    context="pre-existing rip candidacy",
+                    net_names=board_net_names(pcb_data)))
                 _pe_auto = [n for n in _pe_auto
                             if pcb_data.nets[n].name in _pe_keep]
         if _pe_auto and net_clearances:

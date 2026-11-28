@@ -162,12 +162,13 @@ def rip_pad_contacts(pcb, scope_ids: Set[int], input_file=None,
     rows = pad_contacts(pcb)
     if not rows:
         return []
-    from protected_nets import filter_rippable_names, protection_map
+    from protected_nets import board_net_names, filter_rippable_names, protection_map
     prot = protection_map(pcb, input_file)
     names = sorted({r['net'] for r in rows if r['net_id'] in scope_ids})
     keep = set(filter_rippable_names(names, prot,
                                      override_patterns=list(overrides or ()),
-                                     context='pad contact')) if prot else set(names)
+                                     context='pad contact',
+                                     net_names=board_net_names(pcb))) if prot else set(names)
     parted = []
     removed_v, removed_s = set(), set()
     for r in rows:

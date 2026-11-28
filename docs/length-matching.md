@@ -208,7 +208,7 @@ Matching is a per-step feature but chains are multi-step: a later retry that run
 
 - `route.py --rip-existing-nets` **excludes protected nets from collateral rips** (a printed line lists the exclusions);
 - `repair_planes.py --rip-blocker-nets` never selects a protected net as a blocker to rip;
-- **override**: naming a net *exactly* (no glob) in `--nets` or `--rip-existing-nets` is the deliberate signal and lifts its protection for that step. There is no flag; to remove entries permanently, edit the copy readers take: the `.kicad_pro`, or the board's `kicad_routing_tools` property when that carries the higher `records_rev` (after a GUI session and a KiCad save).
+- **override**: naming a net *exactly* (no glob) in `--nets` or `--rip-existing-nets` is the deliberate signal and lifts its protection for that step. In `--rip-existing-nets`, and in `--nets` with `--force-reroute`, a pattern with no `*`, `?` or negated class that selects one net alone (autoroute's `GN[D/]` for `GND`) counts as its exact name. There is no flag; to remove entries permanently, edit the copy readers take: the `.kicad_pro`, or the board's `kicad_routing_tools` property when that carries the higher `records_rev` (after a GUI session and a KiCad save).
 - **KiCad-locked copper**: a net with any `(locked yes)` segment or via is never rip-eligible, **with no override** — locked means never. This is read straight from the board (both parse paths), not from the `.kicad_pro`.
 
 The GUI inherits the same behavior (engine-side reads via the board's sibling project file; the AI-plan executor and per-step floor updates persist new entries).
