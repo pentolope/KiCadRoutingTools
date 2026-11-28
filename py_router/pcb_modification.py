@@ -7733,34 +7733,34 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
                 return True
         return False
 
-    def _area_need(need, x, y, kind, obj):
+    def _area_need(need, x, y, kind, obj, own_nid):
         """#1843: `need` (the pair's clearance) where no rule area binds
-        the via at (x, y) or `obj`, else the area's value -- per layer, the
-        largest over the layers the pair meets on."""
+        the via at (x, y) or `obj`, or a scoped rule binding the pair comes
+        later in the file, else the area's value -- per layer, the largest
+        over the layers the pair meets on."""
         if _area is None:
             return need
         if kind == 'track':
             lays = [obj.layer]
+
+            def row(L):
+                return _area.item_index(obj.start_x, obj.start_y, obj.end_x, obj.end_y,
+                                        obj.width / 2.0, L)
         elif kind == 'via':
             lays = list(copper_layers)
+
+            def row(L):
+                return _area.item_index(obj.x, obj.y, obj.x, obj.y, obj.size / 2.0, L)
         else:
             from net_queries import expand_pad_layers
             lays = [l for l in expand_pad_layers(obj.layers, list(copper_layers))]
-        got = None
-        for L in lays:
-            own_i = _area.own_index(x, y, x, y, L)
-            if kind == 'track':
-                row = _area.item_index(obj.start_x, obj.start_y, obj.end_x, obj.end_y,
-                                       obj.width / 2.0, L)
-            elif kind == 'via':
-                row = _area.item_index(obj.x, obj.y, obj.x, obj.y, obj.size / 2.0, L)
-            else:
-                row = _area.pad_index(obj, L)
-            if max(own_i, row) < 0:
-                continue
-            v_ = _area.pair_value(own_i, row, need, L)
-            got = v_ if got is None else max(got, v_)
-        return need if got is None else got
+
+            def row(L):
+                return _area.pad_index(obj, L)
+        from area_clearance import scoped_orders
+        ftype = 'graphic' if kind == 'track' and getattr(obj, 'graphic', False) else kind
+        return _area.via_value(x, y, need, lays, row, scoped_orders(
+            config, own_nid, 'via', obj.net_id, ftype, obj if kind == 'pad' else None, lays))
 
     def hole_flagged(v):
         vd = (getattr(v, 'drill', 0) or 0) / 2.0
@@ -7879,13 +7879,14 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
             d, t = _pt_seg_dist_t(x, y, s)
             consider(d - (r + s.width / 2.0 + _area_need(
                          pair_clr(own, s.net_id, v.net_id, 'track',
-                                  layers=(s.layer,)), x, y, 'track', s)),
+                                  layers=(s.layer,)), x, y, 'track', s, v.net_id)),
                      s.start_x + t * (s.end_x - s.start_x),
                      s.start_y + t * (s.end_y - s.start_y))
         for o in near_vias:
             d = math.hypot(x - o.x, y - o.y)
             consider(d - (r + o.size / 2.0 + _area_need(
-                         pair_clr(own, o.net_id, v.net_id, 'via'), x, y, 'via', o)),
+                         pair_clr(own, o.net_id, v.net_id, 'via'), x, y, 'via', o,
+                         v.net_id)),
                      o.x, o.y)
         for p in near_pads:
             if getattr(p, 'source', None) is not None:     # #962 paste opening
@@ -7903,7 +7904,7 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
                                                 _scoped.sc.pad_key(p) if _scoped is not None
                                                 else getattr(p, 'pad_type', None) or 'smd',
                                                 layers=_pad_layers1897(p)),
-                                       x, y, 'pad', p),
+                                       x, y, 'pad', p, v.net_id),
                             getattr(p, 'local_clearance', 0.0) or 0.0)
             consider(g - (r + _need), tp[0], tp[1])
         if vd > 0:
