@@ -7757,9 +7757,10 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
 
             def row(L):
                 return _area.pad_index(obj, L)
-        from area_clearance import scoped_order
-        return _area.via_value(x, y, need, lays, row, scoped_order(
-            config, own_nid, 'via', obj.net_id, kind, obj if kind == 'pad' else None, lays))
+        from area_clearance import scoped_orders
+        ftype = 'graphic' if kind == 'track' and getattr(obj, 'graphic', False) else kind
+        return _area.via_value(x, y, need, lays, row, scoped_orders(
+            config, own_nid, 'via', obj.net_id, ftype, obj if kind == 'pad' else None, lays))
 
     def hole_flagged(v):
         vd = (getattr(v, 'drill', 0) or 0) / 2.0

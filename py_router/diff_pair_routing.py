@@ -6953,13 +6953,13 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
                   or config.layers)
 
     if area is not None:
-        from area_clearance import scoped_order
+        from area_clearance import scoped_orders
 
     def held(need, layers, row, ftype, nid, pad=None):
         if area is None:
             return need
         return area.via_value(x, y, need, layers, row,
-                              scoped_order(config, net_id, 'via', nid, ftype, pad, layers))
+                              scoped_orders(config, net_id, 'via', nid, ftype, pad, layers))
     for seg in getattr(pcb_data, 'segments', None) or ():
         if seg.net_id == net_id or not via_on_layer(probe, seg.layer):
             continue
@@ -6973,7 +6973,8 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
                 if getattr(seg, 'graphic', False) else
                 config.pair_clearance(net_id, seg.net_id, seg.layer, types=(('via',), ('track',))))
         need = held(need, [seg.layer], lambda L, s=seg, w=w: area.item_index(
-            s.start_x, s.start_y, s.end_x, s.end_y, w / 2, L), 'track', seg.net_id)
+            s.start_x, s.start_y, s.end_x, s.end_y, w / 2, L),
+            'graphic' if getattr(seg, 'graphic', False) else 'track', seg.net_id)
         if gap < need - _VIA_SITE_EPS:
             return (f"its copper would sit {gap:.4f}mm from a {_net_label(pcb_data, seg.net_id)} "
                     f"track on {seg.layer} (clearance {need:g}mm)")

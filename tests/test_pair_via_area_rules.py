@@ -12,8 +12,10 @@ either side of each value in play) where another rule meets the area's: a
 pad with its own clearance above or below the area's, a net rule later or
 earlier in the file than the area's, two areas whose rules come in the file
 in the opposite order to the regions the router builds for them (a width
-rule on the second area comes first), and an area rule below a net class's
-clearance.
+rule on the second area comes first), an area rule below a net class's
+clearance, a later net rule with a `(layer "F.Cu")` clause (the area's rule
+still holds B.Cu), and a later rule on `B.Type == 'Track'` beside copper
+graphic (KiCad types it `Graphic`, so the area's rule holds it).
 
     python3 tests/test_pair_via_area_rules.py
 """
@@ -65,20 +67,25 @@ RULES = (('wb', 'track_width (min 0.15mm) (opt 0.15mm)', "A.insideArea('RB')"),
          ('late', 'clearance (min 0.5mm)', "A.NetName == 'LATE'"),
          ('ra', 'clearance (min 0.25mm)', "A.insideArea('RA')"),
          ('rb', 'clearance (min 0.4mm)', "A.insideArea('RB')"),
-         ('relax', 'clearance (min 0.2mm)', "A.insideArea('RELAX')"))
-#: scenario -> (foreign net, its pad clearance or None for a via, the area over
-#: both items, the area over the foreign item only, the values in play)
-SCENARIOS = {'pad_override_high': ('AGND', 0.5, 'ROOM', None, (AREA, 0.5)),
-             'pad_override_low': ('AGND', 0.2, 'ROOM', None, (0.2, AREA)),
-             'later_net_rule': ('LATE', None, 'ROOM', None, (AREA, 0.5)),
-             'earlier_net_rule': ('EARLY', None, 'ROOM', None, (AREA, 0.5)),
-             'two_areas': ('AGND', None, 'RA', 'RB', (0.25, 0.4)),
-             'relaxing_area': ('WIDE', None, 'RELAX', None, (0.2, 0.4))}
+         ('relax', 'clearance (min 0.2mm)', "A.insideArea('RELAX')"),
+         ('lay', 'clearance (min 0.1mm)', "A.NetName == 'LAYR'", 'F.Cu'),
+         ('trk', 'clearance (min 0.1mm)', "A.NetName == 'D_Q' && B.Type == 'Track'"))
+#: scenario -> (foreign net, its pad clearance, None for a via or 'graphic' for
+#: an F.Cu gr_line, the area over both items, the area over the foreign item
+#: only, the values in play, the net of the landing via)
+SCENARIOS = {'pad_override_high': ('AGND', 0.5, 'ROOM', None, (AREA, 0.5), 'D_P'),
+             'pad_override_low': ('AGND', 0.2, 'ROOM', None, (0.2, AREA), 'D_P'),
+             'later_net_rule': ('LATE', None, 'ROOM', None, (AREA, 0.5), 'D_P'),
+             'earlier_net_rule': ('EARLY', None, 'ROOM', None, (AREA, 0.5), 'D_P'),
+             'two_areas': ('AGND', None, 'RA', 'RB', (0.25, 0.4), 'D_P'),
+             'relaxing_area': ('WIDE', None, 'RELAX', None, (0.2, 0.4), 'D_P'),
+             'later_layer_rule': ('LAYR', None, 'ROOM', None, (CLR, AREA), 'D_P'),
+             'graphic_later_track_rule': ('', 'graphic', 'ROOM', None, (0.1, AREA), 'D_Q')}
 
 
 def scenario_sites(b, y, sites):
     k = 0
-    for name, (net, pad_clr, over, beside, values) in SCENARIOS.items():
+    for name, (net, pad_clr, over, beside, values, mover) in SCENARIOS.items():
         for value in values:
             for delta in DELTAS:
                 x, gap = 5.0 + 6.0 * k, value + delta
@@ -87,6 +94,12 @@ def scenario_sites(b, y, sites):
                     fy = y - VIA / 2 - gap - VIA / 2
                     b.via(x, fy, net, size=VIA, drill=DRILL, locked=True)
                     box = (x - VIA / 2, fy - VIA / 2, x + VIA / 2, fy + VIA / 2)
+                elif pad_clr == 'graphic':
+                    fy = y - VIA / 2 - gap - TRACK_W / 2
+                    b.items.append(f'  (gr_line (start {x - 1.5} {fy}) (end {x + 1.5} {fy}) '
+                                   f'(stroke (width {TRACK_W}) (type solid)) (layer "F.Cu") '
+                                   f'(uuid "{b._uid()}"))')
+                    box = (x - 1.5, fy - TRACK_W / 2, x + 1.5, fy + TRACK_W / 2)
                 else:
                     fy = y - VIA / 2 - gap - PAD / 2
                     b.pad(f'K{k}', x, fy, net, sx=PAD, sy=PAD)
@@ -98,8 +111,8 @@ def scenario_sites(b, y, sites):
                     room(b, ('F.Cu', 'B.Cu'), x - 2.0, y - VIA / 2 - 0.05, x + 2.0, y + 1.0, over)
                     room(b, ('F.Cu', 'B.Cu'), box[0] - 0.05, box[1] - 0.05, box[2] + 0.05,
                          box[3] + 0.05, beside)
-                b.via(x, y, 'D_P', size=VIA, drill=DRILL)
-                sites[(name, f'{value:g}', delta)] = (x, y)
+                b.via(x, y, mover, size=VIA, drill=DRILL)
+                sites[(name, f'{value:g}', delta)] = (x, y, mover)
     return k
 
 
@@ -131,7 +144,7 @@ def site_board(d):
                     else:
                         room(b, layers, box[0] - 0.1, box[1] - 0.1, box[2] + 0.1, box[3] + 0.1)
                 b.via(x, y, 'D_P', size=VIA, drill=DRILL)
-                sites[(mode, kind, delta)] = (x, y)
+                sites[(mode, kind, delta)] = (x, y, 'D_P')
     scenario_sites(b, 6.0 + 6.0 * len(MODES), sites)
     os.makedirs(d)
     pcb = os.path.join(d, 'in.kicad_pcb')
@@ -155,7 +168,8 @@ def site_board(d):
         json.dump(pro, fh)
     with open(os.path.join(d, 'in.kicad_dru'), 'w', encoding='utf-8') as fh:
         fh.write('(version 1)\n' + ''.join(
-            f'(rule "{n}"\n  (constraint {c})\n  (condition "{w}"))\n' for n, c, w in RULES))
+            f'(rule "{r[0]}"\n' + (f'  (layer "{r[3]}")\n' if len(r) > 3 else '')
+            + f'  (constraint {r[1]})\n  (condition "{r[2]}"))\n' for r in RULES))
     return pcb, sites
 
 
@@ -189,7 +203,7 @@ def main():
         hits = {}
         for v in rep.get('violations', []):
             for it in v['items']:
-                if 'D_P' in it['description']:
+                if 'D_P' in it['description'] or 'D_Q' in it['description']:
                     key = (round(it['pos']['x'], 3), round(it['pos']['y'], 3))
                     hits.setdefault(key, set()).add(v['type'])
         board = parse_kicad_pcb(pcb)
@@ -197,15 +211,16 @@ def main():
                               hole_to_hole_clearance=0.25, board_edge_clearance=0.3,
                               grid_step=GRID, layers=['F.Cu', 'B.Cu'])
         names = {nid: n.name for nid, n in board.nets.items() if n.name}
-        routed = [next(n for n, v in board.nets.items() if v.name == 'D_P')]
+        ids = {v.name: n for n, v in board.nets.items()}
+        routed = [ids['D_P'], ids['D_Q']]
         cfg.set_net_clearances(net_clearance_map_by_id(pcb, names), routed_net_ids=routed)
         install_layer_clearances(cfg, None, pcb, board)
         install_track_clearances(cfg, None, pcb, board, routed_net_ids=routed)
         check('the ROOM rule is installed', getattr(cfg, 'area_clearance', None) is not None)
-        net = next(n for n, v in board.nets.items() if v.name == 'D_P')
-        board.vias = [v for v in board.vias if v.net_id != net]
+        board.vias = [v for v in board.vias if v.net_id not in routed]
         reported = 0
-        for (mode, kind, delta), (x, y) in sites.items():
+        for (mode, kind, delta), (x, y, mover) in sites.items():
+            net = ids[mover]
             got = hits.get((round(x, 3), round(y, 3)), set())
             bad = 'clearance' in got
             reported += bad

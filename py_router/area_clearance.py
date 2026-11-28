@@ -96,7 +96,7 @@ class Region:
         self.rule, self.area, self.value = rule, area, value
         self.polygon, self.layers, self.ring = polygon, layers, ring
         self.width = width
-        self.order = order        # the clearance rule's position in the file
+        self.order = order        # its clearance rule's file position (else its width rule's)
         self.zone = None          # the split zone (tight regions)
         self.bounds = polygon.bounds
 
@@ -121,9 +121,12 @@ class AreaClearance:
                  layer_orders=None, split_reach: float = 0.0, extensions=None,
                  via_reach: float = 0.0):
         self.regions = list(regions)
-        #: region indices in the file order of their clearance rules: where
-        #: two bind one item or one pair, the later rule's region stands
-        self._by_order = sorted(range(len(self.regions)), key=lambda i: self.regions[i].order)
+        #: region indices in the file order of their rules, a region that sets
+        #: a clearance after every one that sets none: where two bind one
+        #: item, pair or cell, the later rule's region stands
+        self._by_order = sorted(range(len(self.regions)),
+                                key=lambda i: (self.regions[i].value is not None,
+                                               self.regions[i].order))
         self.copper = list(copper_layers)
         self.skipped = list(skipped)
         #: {layer: file position of the rule its layer clearance comes from}
@@ -178,7 +181,8 @@ class AreaClearance:
         n = len(gx)
         owner = np.full(n, -1, dtype=np.int32)
         masks = self._region_masks(step)
-        for i, r in enumerate(self.regions):
+        for i in self._by_order:
+            r = self.regions[i]
             on = self._on_layers(r, layer_idx, layers, n, core=True)
             if on is None:
                 continue
@@ -584,13 +588,15 @@ class AreaClearance:
         oo, orow = self.order_of(own), self.order_of(rows)
         return np.where(orow > oo, rows, np.where(orow < oo, own, np.maximum(rows, own)))
 
-    def via_value(self, x, y, need: float, layers, row, after: int = -1) -> float:
+    def via_value(self, x, y, need: float, layers, row, after=None) -> float:
         """The clearance a via at (x, y) is held to against one item it meets
         on ``layers``: ``need`` where no region binds the pair on any of
         them, else the largest `pair_value` over those layers. ``row(layer)``
         is the item's region index there (`item_index`, `pad_index`).
-        ``after``: the file position of a scoped rule binding the pair
-        (`scoped_order`); a region whose rule comes before it leaves ``need``."""
+        ``after``: {layer: the file position of a scoped rule binding the pair
+        there} (`scoped_orders`); a region whose rule comes before it leaves
+        ``need`` on that layer."""
+        after = after or {}
         got = None
         for L in layers:
             own_i = self.own_index(x, y, x, y, L)
@@ -598,7 +604,8 @@ class AreaClearance:
             i = self.later(own_i, r)
             if i < 0:
                 continue
-            v = need if after > self.regions[i].order else self.pair_value(own_i, r, need, L)
+            v = (need if after.get(L, -1) > self.regions[i].order
+                 else self.pair_value(own_i, r, need, L))
             got = v if got is None else max(got, v)
         return need if got is None else got
 
@@ -966,22 +973,27 @@ def compose_route_stamp(fn, obstacles, config, layers, clearance, **kwargs):
            config=area.region_config(config, i), **kwargs)
 
 
-def scoped_order(config, own_nid, own_type, nid, foreign_type, pad=None, layers=()) -> int:
-    """The file position of the last scoped `.kicad_dru` clearance rule that
-    binds an item of ``own_nid`` / ``own_type`` against one of ``nid`` /
-    ``foreign_type`` (``pad``: that pad; its `(layer ...)` rules on ``layers``
-    too), or -1."""
+def scoped_orders(config, own_nid, own_type, nid, foreign_type, pad=None,
+                  layers=()) -> Dict[str, int]:
+    """{layer: the file position of the last scoped `.kicad_dru` clearance
+    rule that binds an item of ``own_nid`` / ``own_type`` against one of
+    ``nid`` / ``foreign_type`` there (``pad``: that pad), a `(layer ...)` rule
+    on the layer it names only}, for each of ``layers`` a rule binds on."""
     s = getattr(config, 'scoped_clearance', None) if config is not None else None
     if s is None or own_nid == nid:
-        return -1
+        return {}
     pad_type = s.sc.pad_key(pad) if pad is not None else None
     got = s.sc.pair_value(own_nid, own_type, nid, foreign_type, None, pad_type)
-    out = got[2] if got is not None else -1
+    base = got[2] if got is not None else -1
+    out = {}
     for L in layers:
+        o = base
         if L in s.sc.layered_layers:
             g = s.sc.layer_pair_value(own_nid, own_type, nid, foreign_type, None, pad_type, L)
             if g is not None:
-                out = max(out, g[2])
+                o = max(o, g[2])
+        if o >= 0:
+            out[L] = o
     return out
 
 
@@ -1423,6 +1435,8 @@ def derive(rules, pcb_data, config) -> Optional[AreaClearance]:
                             if value > base + 1e-9 else 0.0)
             else:
                 reg.width = value
+                if reg.value is None:
+                    reg.order = r.order
     if not found and not skipped:
         return None
     regions = list(found.values())
