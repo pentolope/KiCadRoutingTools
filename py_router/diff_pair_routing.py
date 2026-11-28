@@ -6935,6 +6935,15 @@ def _resolved_hole_clearance(pcb_data, config):
     return resolve_hole_clearance(pcb_data, config)
 
 
+def _pad_bound_box(pad):
+    """A box that holds the pad's copper at any rotation."""
+    from shapely.geometry import box
+    hx, hy = (pad.size_x or 0.0) / 2.0, (pad.size_y or 0.0) / 2.0
+    if getattr(pad, 'rect_rotation', 0.0) or getattr(pad, 'polygons', None):
+        hx = hy = math.hypot(hx, hy)
+    return box(pad.global_x - hx, pad.global_y - hy, pad.global_x + hx, pad.global_y + hy)
+
+
 def _pair_via_refusal(x, y, net_id, pcb_data, config):
     if pcb_data is None:
         return ''
@@ -6953,13 +6962,16 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
                   or config.layers)
 
     if area is not None:
+        from shapely.geometry import LineString, Point
         from area_clearance import scoped_orders
+        disc = Point(x, y).buffer(r)
 
-    def held(need, layers, row, ftype, nid, pad=None):
+    def held(need, layers, row, ftype, nid, pad=None, shape=None):
         if area is None:
             return need
         return area.via_value(x, y, need, layers, row,
-                              scoped_orders(config, net_id, 'via', nid, ftype, pad, layers))
+                              scoped_orders(config, net_id, 'via', nid, ftype, pad, layers),
+                              lambda L: area.touching((disc, shape), L))
     for seg in getattr(pcb_data, 'segments', None) or ():
         if seg.net_id == net_id or not via_on_layer(probe, seg.layer):
             continue
@@ -6974,7 +6986,9 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
                 config.pair_clearance(net_id, seg.net_id, seg.layer, types=(('via',), ('track',))))
         need = held(need, [seg.layer], lambda L, s=seg, w=w: area.item_index(
             s.start_x, s.start_y, s.end_x, s.end_y, w / 2, L),
-            'graphic' if getattr(seg, 'graphic', False) else 'track', seg.net_id)
+            'graphic' if getattr(seg, 'graphic', False) else 'track', seg.net_id,
+            shape=None if area is None else LineString(
+                [(seg.start_x, seg.start_y), (seg.end_x, seg.end_y)]).buffer(w / 2))
         if gap < need - _VIA_SITE_EPS:
             return (f"its copper would sit {gap:.4f}mm from a {_net_label(pcb_data, seg.net_id)} "
                     f"track on {seg.layer} (clearance {need:g}mm)")
@@ -6990,7 +7004,8 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
         gap = d - r - v.size / 2
         need = held(config.pair_clearance(net_id, v.net_id, kind='stack'), shared,
                     lambda L, v=v: area.item_index(v.x, v.y, v.x, v.y, v.size / 2, L),
-                    'via', v.net_id)
+                    'via', v.net_id,
+                    shape=None if area is None else Point(v.x, v.y).buffer(v.size / 2))
         if gap < need - _VIA_SITE_EPS:
             return (f"its copper would sit {gap:.4f}mm from the {_net_label(pcb_data, v.net_id)} "
                     f"via at ({v.x:.4f},{v.y:.4f}) (clearance {need:g}mm)")
@@ -7022,7 +7037,8 @@ def _pair_via_refusal(x, y, net_id, pcb_data, config):
             # the pad's own clearance replaces every rule's (KiCad, measured)
             need = config.pad_override_clearance(held(
                 config.pad_pair_clearance_before_override(pad, net_id, other_type='via'),
-                shared, lambda L, pad=pad: area.pad_index(pad, L), 'pad', pnid, pad), pad)
+                shared, lambda L, pad=pad: area.pad_index(pad, L), 'pad', pnid, pad,
+                shape=None if area is None else _pad_bound_box(pad)), pad)
             if gap < need - _VIA_SITE_EPS:
                 return (f"its copper would sit {gap:.4f}mm from {_net_label(pcb_data, pnid)} pad "
                         f"{pad.component_ref}.{pad.pad_number} (clearance {need:g}mm)")

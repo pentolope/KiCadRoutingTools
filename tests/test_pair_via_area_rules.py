@@ -14,8 +14,10 @@ earlier in the file than the area's, two areas whose rules come in the file
 in the opposite order to the regions the router builds for them (a width
 rule on the second area comes first), an area rule below a net class's
 clearance, a later net rule with a `(layer "F.Cu")` clause (the area's rule
-still holds B.Cu), and a later rule on `B.Type == 'Track'` beside copper
-graphic (KiCad types it `Graphic`, so the area's rule holds it).
+still holds B.Cu), a later rule on `B.Type == 'Track'` beside copper
+graphic (KiCad types it `Graphic`, so the area's rule holds it), and two
+relaxing areas, the via's centre in the earlier one and its copper reaching
+into the later one (whose rule holds).
 
     python3 tests/test_pair_via_area_rules.py
 """
@@ -69,10 +71,13 @@ RULES = (('wb', 'track_width (min 0.15mm) (opt 0.15mm)', "A.insideArea('RB')"),
          ('rb', 'clearance (min 0.4mm)', "A.insideArea('RB')"),
          ('relax', 'clearance (min 0.2mm)', "A.insideArea('RELAX')"),
          ('lay', 'clearance (min 0.1mm)', "A.NetName == 'LAYR'", 'F.Cu'),
-         ('trk', 'clearance (min 0.1mm)', "A.NetName == 'D_Q' && B.Type == 'Track'"))
+         ('trk', 'clearance (min 0.1mm)', "A.NetName == 'D_Q' && B.Type == 'Track'"),
+         ('r1', 'clearance (min 0.13mm)', "A.insideArea('R1')"),
+         ('r2', 'clearance (min 0.14mm)', "A.insideArea('R2')"))
 #: scenario -> (foreign net, its pad clearance, None for a via or 'graphic' for
 #: an F.Cu gr_line, the area over both items, the area over the foreign item
-#: only, the values in play, the net of the landing via)
+#: only ('+NAME': an area over the via's far edge only, not its centre), the
+#: values in play, the net of the landing via)
 SCENARIOS = {'pad_override_high': ('AGND', 0.5, 'ROOM', None, (AREA, 0.5), 'D_P'),
              'pad_override_low': ('AGND', 0.2, 'ROOM', None, (0.2, AREA), 'D_P'),
              'later_net_rule': ('LATE', None, 'ROOM', None, (AREA, 0.5), 'D_P'),
@@ -80,7 +85,8 @@ SCENARIOS = {'pad_override_high': ('AGND', 0.5, 'ROOM', None, (AREA, 0.5), 'D_P'
              'two_areas': ('AGND', None, 'RA', 'RB', (0.25, 0.4), 'D_P'),
              'relaxing_area': ('WIDE', None, 'RELAX', None, (0.2, 0.4), 'D_P'),
              'later_layer_rule': ('LAYR', None, 'ROOM', None, (CLR, AREA), 'D_P'),
-             'graphic_later_track_rule': ('', 'graphic', 'ROOM', None, (0.1, AREA), 'D_Q')}
+             'graphic_later_track_rule': ('', 'graphic', 'ROOM', None, (0.1, AREA), 'D_Q'),
+             'two_relaxing_areas': ('AGND', None, 'R1', '+R2', (0.13, 0.14), 'D_P')}
 
 
 def scenario_sites(b, y, sites):
@@ -105,8 +111,10 @@ def scenario_sites(b, y, sites):
                     b.pad(f'K{k}', x, fy, net, sx=PAD, sy=PAD)
                     b.items[-1] = b.items[-1].replace('(net ', f'(clearance {pad_clr}) (net ', 1)
                     box = (x - PAD / 2, fy - PAD / 2, x + PAD / 2, fy + PAD / 2)
-                if beside is None:
+                if beside is None or beside.startswith('+'):
                     room(b, ('F.Cu', 'B.Cu'), x - 2.0, box[1] - 0.1, x + 2.0, y + 1.0, over)
+                    if beside is not None:
+                        room(b, ('F.Cu', 'B.Cu'), x - 2.0, y + 0.1, x + 2.0, y + 1.0, beside[1:])
                 else:
                     room(b, ('F.Cu', 'B.Cu'), x - 2.0, y - VIA / 2 - 0.05, x + 2.0, y + 1.0, over)
                     room(b, ('F.Cu', 'B.Cu'), box[0] - 0.05, box[1] - 0.05, box[2] + 0.05,

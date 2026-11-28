@@ -588,14 +588,16 @@ class AreaClearance:
         oo, orow = self.order_of(own), self.order_of(rows)
         return np.where(orow > oo, rows, np.where(orow < oo, own, np.maximum(rows, own)))
 
-    def via_value(self, x, y, need: float, layers, row, after=None) -> float:
+    def via_value(self, x, y, need: float, layers, row, after=None, touch=None) -> float:
         """The clearance a via at (x, y) is held to against one item it meets
         on ``layers``: ``need`` where no region binds the pair on any of
         them, else the largest `pair_value` over those layers. ``row(layer)``
         is the item's region index there (`item_index`, `pad_index`).
         ``after``: {layer: the file position of a scoped rule binding the pair
         there} (`scoped_orders`); a region whose rule comes before it leaves
-        ``need`` on that layer."""
+        ``need`` on that layer. ``touch(layer)``: the regions either item's
+        copper may meet there (`touching`); a RELAXING region read by centre
+        then gives way to the value of any of them whose rule comes later."""
         after = after or {}
         got = None
         for L in layers:
@@ -606,8 +608,18 @@ class AreaClearance:
                 continue
             v = (need if after.get(L, -1) > self.regions[i].order
                  else self.pair_value(own_i, r, need, L))
+            if touch is not None and not self.regions[i].tight:
+                v = max([v] + [self.regions[j].value for j in touch(L)
+                               if self.regions[j].order > self.regions[i].order])
             got = v if got is None else max(got, v)
         return need if got is None else got
+
+    def touching(self, geoms, layer) -> List[int]:
+        """The regions setting a clearance on ``layer`` whose area meets any
+        of the shapely ``geoms``."""
+        return [i for i, r in enumerate(self.regions)
+                if r.value is not None and layer in r.layers
+                and any(r.polygon.intersects(g) for g in geoms)]
 
     def max_value(self) -> float:
         """The largest clearance any region sets (0 when none sets one)."""
