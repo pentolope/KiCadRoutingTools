@@ -23,8 +23,9 @@ auto-read): protection guards against COLLATERAL damage. A net named EXACTLY
 (no glob metacharacters) in ``--nets`` or ``--rip-existing-nets`` is being
 deliberately targeted and stays rippable; glob matches over protected nets are
 filtered with a printed exclusion. In ``--rip-existing-nets``, and in
-``--nets`` with ``--force-reroute``, a glob that names one net alone counts as
-its exact name (``exact_names`` with the board's net names). Consumers:
+``--nets`` with ``--force-reroute``, a pattern with no wildcard or negated
+class that selects one net alone counts as its exact name (``exact_names``
+with the board's net names). Consumers:
 
   * route.py's ``--rip-existing-nets`` expansion (collateral rip of non-target
     nets) skips protected nets unless exactly named.
@@ -597,21 +598,27 @@ def effective_protection_map(pcb_data, input_file: Optional[str] = None
 
 
 def _literal_glob(pattern: str) -> bool:
-    """True when PATTERN spells names char by char: no '*' or '?', no
-    negated class, no leading '!' (an exclusion)."""
-    if pattern.startswith('!') or '*' in pattern or '?' in pattern:
+    """True when PATTERN spells names char by char, read as fnmatch reads it:
+    no '*' or '?' outside a class ('[*]' is the character), no negated class,
+    no leading '!' (an exclusion)."""
+    if pattern.startswith('!'):
         return False
-    i = pattern.find('[')
-    while i >= 0:
-        j = i + 1
-        if pattern[j:j + 1] == '!':
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c in '*?':
             return False
-        if pattern[j:j + 1] == ']':
-            j += 1
-        k = pattern.find(']', j)
-        if k < 0:
-            return True
-        i = pattern.find('[', k + 1)
+        if c == '[':
+            j = i + 1
+            if pattern[j:j + 1] == '!':
+                return False
+            if pattern[j:j + 1] == ']':
+                j += 1
+            k = pattern.find(']', j)
+            if k >= 0:
+                i = k + 1
+                continue
+        i += 1
     return True
 
 

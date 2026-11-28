@@ -812,7 +812,8 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
         force_reroute: Strip the copper of every selected pair that is already
             connected and route it again as a coupled pair. Protected pairs
             (#521: routed diff pairs, matched groups) are skipped unless both
-            members are named EXACTLY (no glob) in net_names; KiCad-locked
+            members are named EXACTLY in net_names (a name, or a pattern with
+            no wildcard or negated class that selects one net); KiCad-locked
             copper is never stripped; plane (zone-owning) nets are skipped. A
             pair whose re-route lands no copper gets its original back.
         net_name_patterns: The raw patterns net_names was expanded from (the
@@ -3842,7 +3843,9 @@ Examples:
                              "would de-pair them). Requires an explicit --nets "
                              "scope. Protected pairs (routed diff pairs, "
                              "length-matched groups) are skipped unless both "
-                             "members are named EXACTLY in --nets (no glob); "
+                             "members are named EXACTLY in --nets (a name, or "
+                             "a pattern with no wildcard or negated class that "
+                             "selects one net); "
                              "KiCad-locked copper is never ripped; plane "
                              "(zone-owning) nets are skipped. A pair whose "
                              "re-route lands no copper gets its original back.")
